@@ -1,0 +1,13 @@
+name: agent-trace
+version: "1.1.0"
+description: "Local LLM input/output tracer for Hermes — writes every API request, response and tool execution to the profile's traces/*.jsonl. Opt-in via `hermes plugins enable agent-trace`."
+author: agent-trace
+hooks:
+  - pre_api_request
+  - post_api_request
+  - api_request_error
+  - pre_llm_call
+  - post_llm_call
+  - post_tool_call
+  - on_session_start
+  - on_session_end

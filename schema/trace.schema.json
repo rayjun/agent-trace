@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/rayjun/agent-trace/schema/trace.schema.json",
+  "title": "agent-trace record",
+  "description": "One observed event from one coding agent. All three adapters (hermes/codex/pi) emit this shape so a single reader can query across them.",
+  "type": "object",
+  "required": ["v", "ts", "agent", "event"],
+  "additionalProperties": false,
+  "properties": {
+    "v": { "const": 1, "description": "record schema version" },
+
+    "ts": {
+      "type": "string",
+      "description": "RFC3339 UTC timestamp of when the event was observed by the adapter, not by the model"
+    },
+
+    "agent": {
+      "enum": ["hermes", "codex", "pi"],
+      "description": "which adapter produced this record"
+    },
+
+    "event": {
+      "enum": [
+        "session_start",
+        "session_end",
+        "user_prompt",
+        "llm_request",
+        "llm_response",
+        "llm_error",
+        "assistant_message",
+        "tool_call",
+        "tool_result",
+        "note"
+      ],
+      "description": "what was observed"
+    },
+
+    "session_id": { "type": "string" },
+    "turn_id": { "type": "string" },
+    "request_id": {
+      "type": "string",
+      "description": "stable id correlating an llm_request with its llm_response/llm_error"
+    },
+
+    "provider": { "type": "string" },
+    "model": { "type": "string" },
+    "api_mode": {
+      "type": "string",
+      "description": "wire protocol: chat_completions | responses | anthropic_messages | other"
+    },
+    "base_url": { "type": "string" },
+
+    "cwd": { "type": "string" },
+    "mode": {
+      "type": "string",
+      "description": "agent run mode when known (tui/rpc/json/print/exec/interactive)"
+    },
+
+    "request": {
+      "type": "object",
+      "description": "the LLM input. `messages` is role-tagged; the system prompt lives either in messages or in `system_prompt` depending on api_mode.",
+      "additionalProperties": true,
+      "properties": {
+        "messages": { "type": "array", "items": { "type": "object" } },
+        "system_prompt": { "type": ["string", "null"] },
+        "instructions": {
+          "type": ["string", "null"],
+          "description": "Responses/Codex API keeps the system prompt in `instructions`, not `system`"
+        },
+        "tools": {
+          "type": ["array", "null"],
+          "items": { "type": "object" },
+          "description": "tool schemas sent with the request; null when the adapter did not expose them"
+        },
+        "tool_count": { "type": ["integer", "null"] },
+        "message_count": { "type": ["integer", "null"] },
+        "char_count": { "type": ["integer", "null"] },
+        "approx_input_tokens": { "type": ["integer", "null"] },
+        "max_tokens": { "type": ["integer", "null"] }
+      }
+    },
+
+    "response": {
+      "type": "object",
+      "description": "the LLM output",
+      "additionalProperties": true,
+      "properties": {
+        "content": { "type": ["string", "null"] },
+        "reasoning": { "type": ["string", "null"] },
+        "tool_calls": { "type": ["array", "null"], "items": { "type": "object" } },
+        "finish_reason": { "type": ["string", "null"] },
+        "usage": {
+          "type": ["object", "null"],
+          "additionalProperties": true,
+          "properties": {
+            "input_tokens": { "type": ["integer", "null"] },
+            "output_tokens": { "type": ["integer", "null"] },
+            "cache_read_tokens": { "type": ["integer", "null"] },
+            "cache_write_tokens": { "type": ["integer", "null"] },
+            "reasoning_tokens": { "type": ["integer", "null"] }
+          }
+        }
+      }
+    },
+
+    "tool": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "name": { "type": "string" },
+        "call_id": { "type": "string" },
+        "args": { "type": ["object", "array", "string", "null"] },
+        "status": { "type": "string" }
+      }
+    },
+
+    "duration_ms": { "type": ["integer", "null"] },
+    "error": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "properties": {
+        "type": { "type": "string" },
+        "message": { "type": "string" },
+        "status_code": { "type": ["integer", "null"] },
+        "retryable": { "type": ["boolean", "null"] },
+        "retry_count": { "type": ["integer", "null"] }
+      }
+    },
+
+    "source_file": {
+      "type": "string",
+      "description": "for file-derived adapters (codex rollout jsonl, pi session jsonl): the file this was parsed from"
+    },
+
+    "note": { "type": "string", "description": "free text, used for adapter-specific metadata" }
+  }
+}
