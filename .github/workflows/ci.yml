@@ -24,6 +24,24 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      # The lockfile's `resolved` URLs are copied from whichever registry
+      # generated it. A private mirror (`http://mirrors.tencentyun.com/npm/…`)
+      # is unresolvable from GitHub's runners, so the failure surfaced as a 60 s
+      # `getaddrinfo ENOTFOUND` inside `npm ci` rather than as what it was.
+      #
+      # Canonical URLs are safe for everyone: npm's default
+      # `replace-registry-host=npmjs` rewrites registry.npmjs.org to whatever
+      # mirror a developer has configured, so a mirror user is not broken by it.
+      - name: lockfile resolves to the canonical npm registry
+        working-directory: pi
+        run: |
+          if grep '"resolved"' package-lock.json | grep -v 'https://registry.npmjs.org/'; then
+            echo "::error file=pi/package-lock.json::resolved URLs outside registry.npmjs.org"
+            echo "regenerate with: npm install --package-lock-only --registry=https://registry.npmjs.org"
+            exit 1
+          fi
+          echo "ok — registry.npmjs.org"
+
       - run: npm ci
         working-directory: pi
       - run: npm run typecheck
