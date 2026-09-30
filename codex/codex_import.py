@@ -272,7 +272,13 @@ def parse_rollout(path: Path, since_line: int = 0) -> tuple[int, list[dict], dic
             "request": {
                 "messages": [],
                 "system_prompt": _truncate(meta["system_prompt"]),
-                "instructions": _truncate(meta["system_prompt"]),
+                # No `instructions` here: it was assigned
+                # `meta["system_prompt"]` too, so it was a definitionally
+                # identical second copy of a multi-KB prompt in every codex
+                # record. `api_mode: "responses"` already records that Codex
+                # sends it as `instructions`, and every reader checks
+                # `system_prompt` first (see canonical_request / the panel's
+                # fallback chain), so dropping it loses nothing but bytes.
                 "message_count": None,
                 "tool_count": None,
             },

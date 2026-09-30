@@ -55,6 +55,33 @@ rewritten; `cache_hit_rate` clamps the rendered rate to 0-100).
 record, so reintroducing the exclusive reading fails loudly instead of
 producing another 2703% figure.
 
+#### The system prompt is stored once
+
+Where the system prompt lives was never agreed across adapters:
+
+| adapter | before | after |
+|---|---|---|
+| hermes | `messages[0]` **and** a separate `system_prompt` field | `messages[0]` only; the field is `null` |
+| codex | `system_prompt` **and** `instructions`, always the same string | `system_prompt` only |
+| pi | `messages` only | unchanged (0/351 records duplicated) |
+
+1812/1813 hermes records carried two byte-identical copies — 2.4 MB of
+duplicate prompt inside one profile's 105 MB of traces — and `agenttrace show`
+printed the same multi-KB block twice under two headings, which reads as two
+different prompts.
+
+Both fields stay in the schema and stay optional: a record writes
+`system_prompt` **when `messages` does not already carry it**, which is the
+codex shape and the shape any future adapter may produce. Readers must
+therefore keep their fallback chain (`system_prompt` -> `instructions` ->
+scan `messages` for `role: system`), because records written before this change
+and records written after it both exist on disk. `instructions` remains valid
+for an adapter that only knows the wire name; codex stopped writing it purely
+because it was assigned the identical string.
+
+No `v` bump: neither field is required, and removing a duplicate cannot make a
+new record unreadable to an old reader.
+
 #### `duration_ms` is an integer count of milliseconds
 
 Hermes hands its hooks `api_duration` as a **float number of seconds**. Writing

@@ -308,6 +308,23 @@ def on_pre_api_request(**kw) -> None:
 
     system_prompt = kw.get("system_prompt")
     instructions = body.get("instructions")
+    # Does the message list ALREADY carry the prompt? Hermes puts it in
+    # `messages` as role=system AND passes it separately as `system_prompt`, so
+    # writing both stored two byte-identical copies — measured on this machine:
+    # 1812/1813 records, 2.4 MB of duplicate prompt in one profile's 105 MB of
+    # traces, and `agenttrace show` rendered the same block twice under two
+    # headings, which read as two different prompts.
+    #
+    # The field is kept for the shape where `messages` does NOT carry it —
+    # which is exactly the case the panel's system-prompt fallback exists for
+    # — and is null otherwise, so the record's key set stays stable.
+    carries_system = any(
+        isinstance(m, dict)
+        and str(m.get("role", "")).lower() in ("system", "developer")
+        for m in (messages or [])
+    )
+    if carries_system:
+        system_prompt = None
     # Keep tool NAMES, not full schemas: 25 schemas are tens of KB per
     # request, and the panel's promise is `tools read, write, patch` — the
     # name list is what says what the model can call. schema/trace.schema

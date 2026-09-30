@@ -16,6 +16,7 @@ run "release version"         python3 test/release.test.py
 run "schema contract"          python3 test/schema.test.py
 run "trace index"              python3 test/index.test.py
 run "show request format"      python3 test/show-format.test.py
+run "system prompt stored once" python3 test/system-prompt-once.test.py
 run "cache hit rate <=100%"    python3 test/cache-rate.test.py
 run "pi adapter"            node    test/pi-adapter.test.mjs
 run "watch TUI (pty)"       python3 test/watch-tui.test.py
