@@ -252,6 +252,127 @@ def preview(rec: dict) -> str:
     return f"{ts} {agent:6s} {ev:16s} {model:28s} {rid:8s} " + " | ".join(b for b in bits if b)
 
 
+#: What each role means, printed beside it by `show`. The point is to say WHO
+#: wrote the text without the reader having to know the wire protocol's role
+#: vocabulary — the same annotation a hand-written request example carries.
+ROLE_NOTES = {
+    "system": "written by developer",
+    "developer": "written by developer",
+    "user": "user input",
+    "assistant": "model output",
+    "tool": "tool result",
+}
+
+#: Column the role annotations line up on, so a block of messages reads as one
+#: column of comments instead of a ragged edge.
+ROLE_NOTE_COL = 46
+
+
+def canonical_request(rec: dict) -> dict:
+    """The request as the classic `{model, messages: [{role, content}]}` shape.
+
+    The three adapters reach the same prompt three different ways:
+
+      hermes  system prompt in BOTH `messages[0]` and `system_prompt`
+      pi      system prompt in `messages[0]` only
+      codex   `messages: []`, system prompt in `system_prompt` + `instructions`
+
+    Printing `request` verbatim therefore showed the system prompt TWICE for
+    nearly every hermes record — two identical multi-KB blocks, one headed
+    `messages[0]` and one headed `system_prompt`, which reads like two
+    different prompts — while a codex record appeared to have no prompt at
+    all. Worse, `instructions: null` and friends were printed as noise.
+
+    The canonical view has exactly one system message, first, and no separate
+    `system_prompt`/`instructions` to disagree with it. Nothing is lost:
+    measured over the traces on this machine, 1812/1812 hermes records have
+    `system_prompt == messages[system].content` byte for byte, and codex sets
+    `instructions == system_prompt`.
+    """
+    raw = rec.get("request")
+    if isinstance(raw, list):
+        req: dict = {"messages": raw}
+    elif isinstance(raw, dict):
+        req = raw
+    else:
+        req = {}
+
+    messages = [dict(m) for m in (req.get("messages") or []) if isinstance(m, dict)]
+    separate = next((req[key] for key in ("system_prompt", "instructions")
+                     if isinstance(req.get(key), str) and req[key]), None)
+    has_system = any(str(m.get("role", "")).lower() in ("system", "developer")
+                     for m in messages)
+    if separate and not has_system:
+        # Codex-style record: the prompt only exists as a field, so promote it
+        # to messages[0] rather than rendering an empty conversation.
+        messages.insert(0, {"role": "system", "content": separate})
+
+    out: dict = {}
+    # `model` leads, exactly as it does in a real request payload; transport
+    # details (provider / api_mode / base_url) stay in `meta`, where they
+    # describe the record rather than the payload.
+    if rec.get("model") is not None:
+        out["model"] = rec["model"]
+    if messages:
+        out["messages"] = messages
+    if req.get("tools"):
+        out["tools"] = req["tools"]
+    for key in ("message_count", "tool_count", "char_count",
+                "approx_input_tokens", "max_tokens"):
+        if req.get(key) is not None:
+            out[key] = req[key]
+    return out
+
+
+def _render_messages(messages: list[dict]) -> str:
+    """`messages` as indented JSON, each `role` line annotated with its author.
+
+    The annotation goes on the line that actually carries the role, not on the
+    opening brace — `json.dumps` puts `{` first, and a comment there reads as
+    labelling the object rather than saying who wrote it.
+    """
+    chunks = []
+    for message in messages:
+        note = ROLE_NOTES.get(str(message.get("role", "")).lower())
+        lines = json.dumps(message, ensure_ascii=False, indent=2,
+                           default=str).splitlines()
+        role_line = next((i for i, ln in enumerate(lines) if '"role"' in ln), 0)
+        for i, line in enumerate(lines):
+            line = "    " + line
+            if i == role_line and note:
+                line += " " * max(2, ROLE_NOTE_COL - len(line))
+                line += f"// ← {note}"
+            lines[i] = line
+        chunks.append("\n".join(lines))
+    return ",\n".join(chunks)
+
+
+def _render_request(rec: dict) -> str:
+    """`canonical_request` as annotated JSON.
+
+    The `//` comments make the block unparseable by `json.loads`, on purpose:
+    `show` output already carries `=== block ===` headers so it was never a
+    bare JSON document, and the annotation is the entire point — it says who
+    wrote each message at a glance.
+    """
+    view = canonical_request(rec)
+    if not view:
+        return "{}"
+    blocks = []
+    for key, value in view.items():
+        if key == "messages":
+            body = ['  "messages": [', _render_messages(value), "  ]"]
+        elif isinstance(value, (dict, list)):
+            rendered = json.dumps(value, ensure_ascii=False, indent=2,
+                                  default=str).splitlines()
+            body = [f'  "{key}": {rendered[0]}'] + ["  " + ln
+                                                     for ln in rendered[1:]]
+        else:
+            body = [f'  "{key}": {json.dumps(value, ensure_ascii=False)}']
+        blocks.append("\n".join(body))
+    return "{\n" + ",\n".join(blocks) + "\n}"
+
+
 def print_full(rec: dict) -> None:
     def block(title, obj):
         if obj:
@@ -263,7 +384,12 @@ def print_full(rec: dict) -> None:
             "provider", "model", "api_mode", "base_url", "cwd", "duration_ms")
            if rec.get(k) is not None}
     block("meta", hdr)
-    block("request", rec.get("request"))
+    # Gated on the field, not on the rendered view: a response-only record has
+    # no `request` at all, and must not grow an empty request block just
+    # because `model` is on the record.
+    if "request" in rec:
+        print("\n=== request ===")
+        print(_render_request(rec))
     block("response", rec.get("response"))
     block("tool", rec.get("tool"))
     block("error", rec.get("error"))

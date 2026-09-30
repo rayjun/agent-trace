@@ -50,6 +50,35 @@ agenttrace sessions                # 按 session id 分组
 agenttrace stats                   # 按 agent / model 统计调用、token、错误
 ```
 
+`show` 打印的是模型真正收到的 prompt：system 消息永远在第一位，每条消息都标注
+了是谁写的 —— `written by developer` 即开发者写的 system 提示词，`user input`
+即用户输入。三个适配器对 system 提示词的存储方式并不一样（Hermes 同时写进
+`messages` 和独立的 `system_prompt` 字段，Pi 只写 `messages`，Codex 只写字段
+但 `messages` 为空），`show` 会把这三种都折叠成请求体本来的样子 —— 提示词只出
+现一份，也不会再冒出 `system_prompt` / `instructions` 这样的重复标题：
+
+```jsonc
+{
+  "model": "space-bunny-free",
+  "messages": [
+    {
+      "role": "system",                       // ← written by developer
+      "content": "You are a helpful coding assistant."
+    },
+    {
+      "role": "user",                         // ← user input
+      "content": "Hello, who are you?"
+    }
+  ],
+  "tools": [
+    "read",
+    "write"
+  ],
+  "message_count": 2,
+  "tool_count": 2
+}
+```
+
 所有命令都支持 `--agent`、`--model`、`--event`、`--session`、`--since`、
 `--contains`、`--limit`，以及可选的 trace 目录参数。
 

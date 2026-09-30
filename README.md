@@ -53,6 +53,36 @@ agenttrace sessions                # group by session id
 agenttrace stats                   # calls / tokens / errors per agent and model
 ```
 
+`show` prints the prompt as the model actually received it: one system message
+first, every message marked with who wrote it. The adapters store the system
+prompt differently (Hermes writes it into *both* `messages` and a separate
+`system_prompt` field, Pi into `messages` only, Codex into the field only with
+an empty `messages`), so `show` folds all three into the shape a request
+payload really has — one copy of the prompt, no `system_prompt` / `instructions`
+headings beside it:
+
+```jsonc
+{
+  "model": "space-bunny-free",
+  "messages": [
+    {
+      "role": "system",                       // ← written by developer
+      "content": "You are a helpful coding assistant."
+    },
+    {
+      "role": "user",                         // ← user input
+      "content": "Hello, who are you?"
+    }
+  ],
+  "tools": [
+    "read",
+    "write"
+  ],
+  "message_count": 2,
+  "tool_count": 2
+}
+```
+
 Every command accepts `--agent`, `--model`, `--event`, `--session`, `--since`,
 `--contains`, `--limit`, and optional trace directories.
 
