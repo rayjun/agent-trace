@@ -24,6 +24,61 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+// --------------------------------------------------------------------------
+// the Pi surface this adapter reads
+// --------------------------------------------------------------------------
+//
+// Pi's ExtensionAPI ships no type package and this extension is loaded as
+// live source rather than compiled against pi's own types, so every handler
+// parameter used to be `any`. Under `strict` that still type-checked a typo:
+// `event.toolNam` compiled fine and quietly emitted a record with
+// `name: undefined`, which the panel then rendered as `⚙ undefined`.
+//
+// These interfaces pin down ONLY what this file actually reads. Anything the
+// adapter does not touch stays out of them — inventing fields would make the
+// types a claim about Pi rather than a description of our own usage.
+
+interface SessionContext {
+	cwd?: string;
+	mode?: string;
+	model?: string | { id?: string; provider?: string; api?: string };
+	/** Present only in runner-launched contexts; see pickSessionId(). */
+	sessionManager?: {
+		getSessionFile?: () => string | undefined;
+		getSessionId?: () => string | undefined;
+	};
+	ui: { notify: (message: string, level?: string) => void };
+}
+
+/** The subset of each lifecycle event this adapter consumes. */
+interface ExtensionEvent {
+	/** session_start */
+	reason?: string;
+	/** before_provider_request — the exact outbound wire payload. */
+	payload?: any;
+	/** after_provider_response */
+	status?: number;
+	/** message_end */
+	message?: any;
+	/** tool_execution_start / tool_execution_end */
+	toolName?: string;
+	toolCallId?: string;
+	args?: unknown;
+	isError?: boolean;
+	durationMs?: number;
+}
+
+interface ExtensionHost {
+	on(event: string, handler: (event: ExtensionEvent, ctx: SessionContext) => void): void;
+	registerCommand(
+		name: string,
+		opts: {
+			description: string;
+			handler: (args: string, ctx: SessionContext) => Promise<void> | void;
+		},
+	): void;
+}
+
 const AGENT = "pi";
 const SCHEMA_V = 1;
 const MAX_CHARS = Number(process.env.AGENTTRACE_MAX_CHARS ?? 200_000);
@@ -128,10 +183,26 @@ function shapeUsage(u: unknown): Record<string, number> | null {
 	const put = (k: string, v: number | undefined) => {
 		if (v !== undefined) out[k] = v;
 	};
-	put("input_tokens", pick("input", "inputTokens", "input_tokens", "promptTokens"));
+	const input = pick("input", "inputTokens", "input_tokens", "promptTokens");
+	const cacheRead = pick("cacheRead", "cacheReadTokens", "cache_read_input_tokens");
+	const cacheWrite = pick("cacheWrite", "cacheWriteTokens", "cache_creation_input_tokens");
+
+	// pi-ai's `input` EXCLUDES the cache — every provider normalisation
+	// subtracts it (`input = promptTokens - cacheRead - cacheWrite` in
+	// openai-completions.js) and pi-ai's own total is
+	// `input + output + cacheRead + cacheWrite`. The shared trace schema's
+	// `input_tokens` means the opposite: hermes writes OpenAI's
+	// `prompt_tokens` through untouched, cache included.
+	//
+	// Mapping pi-ai's exclusive `input` straight onto `input_tokens` is what
+	// made `cache_read / input` exceed 100% — 7.7% of records on this machine
+	// read >100%, and the aggregate hit rate came out at 2703%. Report the
+	// TOTAL input so the field means the same thing whichever adapter wrote it
+	// (this also makes `tok in+out` equal pi-ai's `totalTokens`).
+	put("input_tokens", input === undefined ? undefined : input + (cacheRead ?? 0) + (cacheWrite ?? 0));
 	put("output_tokens", pick("output", "outputTokens", "output_tokens", "completionTokens"));
-	put("cache_read_tokens", pick("cacheRead", "cacheReadTokens", "cache_read_input_tokens"));
-	put("cache_write_tokens", pick("cacheWrite", "cacheWriteTokens", "cache_creation_input_tokens"));
+	put("cache_read_tokens", cacheRead);
+	put("cache_write_tokens", cacheWrite);
 	put("reasoning_tokens", pick("reasoningTokens", "reasoning_tokens"));
 	return Object.keys(out).length ? out : null;
 }
@@ -144,7 +215,7 @@ function shapeUsage(u: unknown): Record<string, number> | null {
  * getSessionFile()/getSessionId() return the session this run is writing.
  * env stays first for tests and for any future Pi that exports it.
  */
-function pickSessionId(ctx: any): string | undefined {
+function pickSessionId(ctx: SessionContext): string | undefined {
 	if (process.env.PI_SESSION_FILE) return process.env.PI_SESSION_FILE;
 	const sm = ctx?.sessionManager;
 	try {
@@ -166,13 +237,13 @@ function pickSessionId(ctx: any): string | undefined {
 	return undefined;
 }
 
-export default function agentTrace(pi: any) {
+export default function agentTrace(pi: ExtensionHost) {
 	let sessionFile: string | undefined = process.env.PI_SESSION_FILE || undefined;
 	let model: string | undefined;
 	let provider: string | undefined;
 	let apiMode: string | undefined;
 
-	pi.on("session_start", (event: any, ctx: any) => {
+	pi.on("session_start", (event, ctx) => {
 		sessionFile = pickSessionId(ctx);
 		emit({
 			event: "session_start",
@@ -183,18 +254,20 @@ export default function agentTrace(pi: any) {
 		});
 	});
 
-	pi.on("turn_start", (_event: any, ctx: any) => {
+	pi.on("turn_start", (_event, ctx) => {
 		const m = ctx?.model;
 		if (m) {
 			model = typeof m === "string" ? m : m.id;
-			provider = m?.provider ?? provider;
-			apiMode = m?.api ?? apiMode;
+			if (typeof m !== "string") {
+				provider = m.provider ?? provider;
+				apiMode = m.api ?? apiMode;
+			}
 		}
 	});
 
 	// The real request. `before_provider_request` carries the exact outbound
 	// payload for the active api (openai-completions | anthropic-messages | ...).
-	pi.on("before_provider_request", (event: any, ctx: any) => {
+	pi.on("before_provider_request", (event, ctx) => {
 		const payload: any = event?.payload;
 		const meta = captureMode() === "metadata";
 		// Anthropic keeps the system prompt in `system`; OpenAI keeps it as a
@@ -233,7 +306,7 @@ export default function agentTrace(pi: any) {
 		});
 	});
 
-	pi.on("after_provider_response", (event: any) => {
+	pi.on("after_provider_response", (event) => {
 		emit({
 			event: "note",
 			session_id: sessionFile,
@@ -245,7 +318,7 @@ export default function agentTrace(pi: any) {
 
 	// The real response. `message_end` fires once the assistant message is final,
 	// after all streamed deltas are assembled.
-	pi.on("message_end", (event: any, ctx: any) => {
+	pi.on("message_end", (event, ctx) => {
 		const msg: any = event?.message;
 		if (!msg) return;
 		const role = msg.role;
@@ -288,7 +361,7 @@ export default function agentTrace(pi: any) {
 	// chose (the ↳ decide line); this marks the ⚙ call itself so the panel
 	// can pair choice → execution → result. Payload per Pi 0.87.1:
 	// { type, toolCallId, toolName, args }.
-	pi.on("tool_execution_start", (event: any, ctx: any) => {
+	pi.on("tool_execution_start", (event, ctx) => {
 		emit({
 			event: "tool_call",
 			session_id: sessionFile,
@@ -302,7 +375,7 @@ export default function agentTrace(pi: any) {
 		});
 	});
 
-	pi.on("tool_execution_end", (event: any, ctx: any) => {
+	pi.on("tool_execution_end", (event, ctx) => {
 		emit({
 			event: "tool_result",
 			session_id: sessionFile,
@@ -317,7 +390,7 @@ export default function agentTrace(pi: any) {
 		});
 	});
 
-	pi.on("agent_end", (_event: any, ctx: any) => {
+	pi.on("agent_end", (_event, ctx) => {
 		emit({
 			event: "session_end",
 			session_id: sessionFile,
@@ -330,7 +403,7 @@ export default function agentTrace(pi: any) {
 	// `/agenttrace path` — show where records are being written.
 	pi.registerCommand("agenttrace", {
 		description: "Show the agent-trace output directory for this Pi session",
-		handler: async (_args: string, ctx: any) => {
+		handler: async (_args: string, ctx) => {
 			ctx.ui.notify(`agent-trace: ${traceDir()}${sessionFile ? `  session=${sessionFile}` : ""}`, "info");
 		},
 	});

@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  lint:
+    name: lint + typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install ruff mypy
+      - run: ruff check cli common codex hermes test
+      - run: mypy
+
+      # The Pi extension is TypeScript loaded as live source; `npm run
+      # typecheck` is `tsc --noEmit` under strict mode.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci
+        working-directory: pi
+      - run: npm run typecheck
+        working-directory: pi
+
+  test:
+    name: tests · python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.10 is the ruff target-version floor; 3.12 is what the adapters run
+        # on in practice. The shared module must not depend on either.
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # test/run-all.sh invokes `node test/pi-adapter.test.mjs`, and the file
+      # it imports is TypeScript — Node 22 is the first release line that
+      # strips types without a loader, so pin it rather than trusting the
+      # runner's default.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      # test/e2e-hermes.sh and test/e2e-pi.sh make real model calls and need a
+      # live hermes/pi install plus credentials; they are opt-in locally
+      # (`bash test/run-all.sh`) and cannot be guaranteed here.
+      - run: SKIP_E2E=1 bash test/run-all.sh

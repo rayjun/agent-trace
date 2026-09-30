@@ -98,6 +98,36 @@ for (const r of recs) {
 	assert.ok(r.event, "event name");
 }
 
+// Conformance against the PUBLISHED schema. The Python side runs the same
+// checks in test/schema.test.py, but this adapter is TypeScript and cannot
+// import agenttrace_common — so it proves the contract against the JSON itself
+// rather than against a copy of the enums that could drift.
+const schema = JSON.parse(
+	readFileSync(new URL("../schema/trace.schema.json", import.meta.url), "utf8"),
+);
+for (const r of recs) {
+	assert.ok(schema.properties.agent.enum.includes(r.agent),
+		`agent ${JSON.stringify(r.agent)} is not in schema agent.enum`);
+	assert.ok(schema.properties.event.enum.includes(r.event),
+		`event ${JSON.stringify(r.event)} is not in schema event.enum`);
+	assert.equal(r.v, schema.properties.v.const, "v matches schema const");
+	for (const key of schema.required) {
+		assert.ok(key in r, `record is missing required field ${key}`);
+	}
+	// The reader string-compares and sorts ts; anything else silently breaks
+	// `--since` and the newest-session lookup.
+	assert.match(r.ts, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
+		`ts must be RFC3339 UTC with ms, got ${JSON.stringify(r.ts)}`);
+	// The invariant the cache-rate bug violated: the shared `input_tokens` is
+	// the TOTAL prompt, so cache_read must be a subset of it.
+	const u = r.response?.usage;
+	if (u?.cache_read_tokens !== undefined && u.input_tokens !== undefined) {
+		assert.ok(u.cache_read_tokens <= u.input_tokens,
+			`cache_read ${u.cache_read_tokens} > input ${u.input_tokens}: `
+			+ "hit rate would exceed 100%");
+	}
+}
+
 // the real request record
 const req = recs.find((r) => r.event === "llm_request");
 assert.ok(req, "emitted an llm_request");
@@ -114,7 +144,19 @@ const res = recs.find((r) => r.event === "llm_response");
 assert.ok(res, "emitted an llm_response");
 assert.equal(res.duration_ms, 1520, "duration truncated to int ms");
 assert.equal(res.response.finish_reason, "tool_use");
-assert.equal(res.response.usage.input_tokens, 1200);
+// pi-ai's `usage.input` EXCLUDES the cache — every provider normalisation
+// does `input = promptTokens - cacheRead - cacheWrite`, and pi-ai's own
+// `totalTokens = input + output + cacheRead + cacheWrite`. The shared trace
+// schema's `input_tokens` means the TOTAL (hermes writes OpenAI's
+// `prompt_tokens` through untouched), so the adapter adds the cache back:
+// 1200 uncached + 900 cached = 2100 total. Getting this wrong is what made
+// `cache_read / input_tokens` exceed 100% — 7.7% of real records on this
+// machine read >100%, peaking at 2703% in aggregate.
+assert.equal(res.response.usage.input_tokens, 2100,
+	"input_tokens must be the TOTAL prompt (pi-ai's input + cache)");
+assert.equal(res.response.usage.cache_read_tokens, 900);
+assert.ok(res.response.usage.cache_read_tokens <= res.response.usage.input_tokens,
+	"cache_read must be a subset of input_tokens, or the hit rate exceeds 100%");
 assert.equal(res.response.usage.output_tokens, 340);
 assert.equal(res.response.usage.cache_read_tokens, 900);
 assert.equal(res.response.usage.reasoning_tokens, 120);

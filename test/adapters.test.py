@@ -450,7 +450,7 @@ def test_session_scoping():
             dirs=[tr], agent=None, model=None, event=None, session=None,
             since=None, contains=None, limit=40, reverse=False,
             history=0, follow=False, all_sessions=False)
-        for k, v in zip([a.lstrip("-").replace("-", "_") for a in extra], extra):
+        for k in (a.lstrip("-").replace("-", "_") for a in extra):
             setattr(ns, k, True)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -815,7 +815,6 @@ def test_key_decode():
 def test_tail_partial_line():
     sys.path.insert(0, str(ROOT / "cli"))
     import agenttrace_watch as W
-    from pathlib import Path as P
 
     d = Path(tempfile.mkdtemp())
     f = d / "x.jsonl"
@@ -856,7 +855,6 @@ def test_scroll_clamp():
              "agent": "hermes", "event": "user_prompt", "session_id": "s",
              "request": {"messages": [{"role": "user", "content": f"prompt {i} 修复 check"}]}}
             for i in range(60)]
-    total = len(W.render_view(recs, fmt, 4000, 20, 0))  # sanity: viewport full
     for scroll in (0, 5, 10 ** 6, 10 ** 9, -7):
         view = W.render_view(recs, fmt, 4000, 20, scroll)
         check(f"scroll={scroll} renders exactly one viewport",

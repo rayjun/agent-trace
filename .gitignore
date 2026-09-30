@@ -3,3 +3,9 @@ __pycache__/
 *.pyc
 .venv/
 *.bak-*
+
+# Tool caches. mypy and ruff each drop a self-ignoring .gitignore inside
+# their own cache dir, but that is their behaviour, not this repo's policy —
+# pin it here so a fresh checkout is clean regardless of tool version.
+.mypy_cache/
+.ruff_cache/

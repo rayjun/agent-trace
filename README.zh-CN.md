@@ -18,7 +18,12 @@ bash install.sh pi                      # Pi 扩展
 python3 codex/install_hook.py           # Codex hook
 bash install.sh cli                     # agenttrace 命令
 bash install.sh all                     # 以上全部
+bash install.sh status                  # 装了什么 —— 以及哪一份已经 STALE
 ```
+
+Hermes 适配器是以**副本**方式安装的，所以 `status` 会把已部署的字节和本仓库
+逐一比对，告诉你运行中的 agent 是不是还在跑旧代码。其余三个是指向仓库的
+活引用，改完即生效。
 
 各跑一次真实调用来验证 —— `agenttrace ls` 的第二列就是 agent 名：
 
@@ -48,6 +53,12 @@ agenttrace stats                   # 按 agent / model 统计调用、token、�
 所有命令都支持 `--agent`、`--model`、`--event`、`--session`、`--since`、
 `--contains`、`--limit`，以及可选的 trace 目录参数。
 
+`ls` 打印的是**最近**的记录 —— 最新的 `--limit` 条，按时间正序；加
+`--reverse` 则最新在前。首次运行会在 `~/.cache/agent-trace` 里建一份小索引
+（一次性成本），之后 `ls`/`sessions`/`stats` 大约一秒内返回，而不是重新扫几百
+兆字节。`AGENTTRACE_INDEX=0` 强制全量扫描，`AGENTTRACE_VALIDATE=1` 让每个适配器
+写入时逐条对照契约自检。
+
 ## 实时观看
 
 ```bash
@@ -70,3 +81,33 @@ tmux new-session -d -s trace
 tmux split-window -t trace -h -l 45
 # 右侧面板运行: agenttrace watch
 ```
+
+## 结构
+
+```
+hermes/__init__.py   插件钩子 ──┐
+codex/codex_import.py rollout 增量 ├─> 共享记录格式 ─> schema/trace.schema.json
+pi/agent-trace.ts    Pi 事件    ┘        │
+                                 common/agenttrace_common.py
+                                          │
+                    cli/agenttrace.py ────┴───> ls / show / search / sessions / stats
+                    cli/agenttrace_watch.py ──> 实时面板（cli/panel/*）
+```
+
+`common/agenttrace_common.py` 是三个适配器必须共享的规则的唯一出处：时间戳、
+content 扁平化、usage 归一化、截断、脱敏，以及带锁的 JSONL 追加写入。
+`schema/CHANGELOG.md` 记录每个契约字段的含义及其由来。
+
+## 开发
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install ruff mypy
+test/run-all.sh            # 全部测试（SKIP_E2E=1 跳过真实模型调用）
+.venv/bin/ruff check cli common codex hermes test
+.venv/bin/mypy
+cd pi && npm ci && npm run typecheck
+```
+
+CI 会在每次 push 时跑完以上全部（`.github/workflows/ci.yml`）。e2e 测试要发真实
+模型请求、并且需要本机装好 `hermes`/`pi`，所以放在本地按需执行，不进 CI。
+

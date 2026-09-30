@@ -19,7 +19,12 @@ bash install.sh pi                      # Pi extension
 python3 codex/install_hook.py           # Codex hook
 bash install.sh cli                     # agenttrace command
 bash install.sh all                     # everything above
+bash install.sh status                  # what is installed — and what is STALE
 ```
+
+The Hermes adapter is installed as a *copy*, so `status` compares the deployed
+bytes against this repo and tells you when the running agent is still on old
+code. The other three are live references into the checkout.
 
 Prove it works with one real call — `agenttrace ls` prints the agent as its
 second column:
@@ -51,6 +56,13 @@ agenttrace stats                   # calls / tokens / errors per agent and model
 Every command accepts `--agent`, `--model`, `--event`, `--session`, `--since`,
 `--contains`, `--limit`, and optional trace directories.
 
+`ls` prints the most recent records — the newest `--limit`, oldest first; add
+`--reverse` for newest first. A first run pays a one-off cost to build a small
+index in `~/.cache/agent-trace`, after which `ls`/`sessions`/`stats` answer in
+about a second instead of rescanning hundreds of megabytes. Set
+`AGENTTRACE_INDEX=0` to force a full rescan, or `AGENTTRACE_VALIDATE=1` to make
+every adapter check each record against the contract as it writes it.
+
 ## Watch it live
 
 ```bash
@@ -74,3 +86,35 @@ tmux new-session -d -s trace
 tmux split-window -t trace -h -l 45
 # right pane runs: agenttrace watch
 ```
+
+## How it fits together
+
+```
+hermes/__init__.py   plugin hooks ─┐
+codex/codex_import.py rollout tail ├─> shared record shape ─> schema/trace.schema.json
+pi/agent-trace.ts    Pi events    ┘         │
+                                    common/agenttrace_common.py
+                                             │
+                       cli/agenttrace.py ────┴───> ls / show / search / sessions / stats
+                       cli/agenttrace_watch.py ──> live panel (cli/panel/*)
+```
+
+`common/agenttrace_common.py` is the single source of truth for the rules all
+three adapters must share: timestamps, content flattening, usage mapping,
+truncation, redaction and the locked JSONL append. `schema/CHANGELOG.md` records
+what each contract field means and why.
+
+## Development
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install ruff mypy
+test/run-all.sh            # every test (SKIP_E2E=1 to skip the live model calls)
+.venv/bin/ruff check cli common codex hermes test
+.venv/bin/mypy
+cd pi && npm ci && npm run typecheck
+```
+
+CI runs all of the above on every push (`.github/workflows/ci.yml`). The e2e
+tests make real model calls and need a live `hermes`/`pi` install, so they are
+opt-in locally rather than part of CI.
+

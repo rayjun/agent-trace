@@ -35,8 +35,23 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Shared trace rules (schema version, timestamps, content flattening, usage
+# mapping, truncation, redaction, locked append) live one directory up. This
+# file is always executed from the repo — the Codex hook points straight at it
+# — so there is no deployed copy to reconcile.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "common"))
+import agenttrace_common as common  # noqa: E402
+
 AGENT = "codex"
-SCHEMA_V = 1
+SCHEMA_V = common.SCHEMA_V
+
+# Codex's own names for the shared token fields, in preference order.
+CODEX_USAGE_ALIASES = {
+    "input_tokens": ("input_tokens", "prompt_tokens"),
+    "output_tokens": ("output_tokens", "completion_tokens"),
+    "cache_read_tokens": ("cached_input_tokens", "cache_read_input_tokens"),
+    "reasoning_tokens": ("reasoning_output_tokens", "reasoning_tokens"),
+}
 API_MODE = "responses"  # Codex dropped wire_api="chat"; this is the only wire format
 
 _state_dir = Path(os.environ.get("AGENTTRACE_STATE_DIR") or (Path.home() / ".codex" / "traces" / ".state"))
@@ -48,7 +63,7 @@ _trace_dir = Path(os.environ.get("AGENTTRACE_CODEX_DIR") or (Path.home() / ".cod
 # --------------------------------------------------------------------------
 
 def _now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return common.now_iso()
 
 
 def _iso(epoch) -> str | None:
@@ -61,50 +76,30 @@ def _iso(epoch) -> str | None:
 
 
 def _max_chars() -> int:
-    try:
-        return max(0, int(os.environ.get("AGENTTRACE_MAX_CHARS") or 200_000))
-    except ValueError:
-        return 200_000
+    return common.max_chars()
 
 
 def _truncate(v, limit: int | None = None):
-    limit = _max_chars() if limit is None else limit
-    if isinstance(v, str) and len(v) > limit:
-        return v[:limit] + f"\n...[truncated {len(v) - limit} chars]"
-    return v
+    return common.truncate(v, limit)
 
 
 def _content_to_text(content) -> str:
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for p in content:
-            if isinstance(p, str):
-                parts.append(p)
-            elif isinstance(p, dict):
-                t = p.get("text") or p.get("content") or p.get("output")
-                if t:
-                    parts.append(str(t))
-        return "\n".join(parts)
-    return str(content)
+    return common.flatten_content(content)
 
 
 def _emit(rec: dict) -> None:
-    """Prepend v/ts/agent, drop None values, append one JSONL line."""
-    out = {"v": SCHEMA_V, "ts": rec.pop("ts", None) or _now(), "agent": AGENT}
+    """Prepend agent, drop None values, append one JSONL line.
+
+    Serialisation, redaction and the locked append are the shared writer's.
+    `AGENTTRACE_CAPTURE=metadata` is honoured here rather than sprinkled
+    through `parse_rollout`: stripping bodies at the single exit point means a
+    future record shape cannot forget to honour it.
+    """
+    out = {"agent": AGENT}
     out.update(rec)
-    rec = {k: v for k, v in out.items() if v is not None}
-    try:
-        line = json.dumps(rec, ensure_ascii=False, default=str)
-    except (TypeError, ValueError):
-        return
-    _trace_dir.mkdir(parents=True, exist_ok=True)
-    path = _trace_dir / f"codex-{datetime.now(timezone.utc):%Y%m%d}.jsonl"
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(line + "\n")
+    if not common.capture_content():
+        out = common.strip_content(out)
+    common.emit_record(_trace_dir, "codex", out)
 
 
 # --------------------------------------------------------------------------
@@ -117,25 +112,7 @@ def _token_info(payload: dict) -> dict | None:
     if not isinstance(info, dict):
         info = payload
     last = info.get("last_token_usage") or info.get("total_token_usage") or info
-    if not isinstance(last, dict):
-        return None
-
-    def num(*keys):
-        for k in keys:
-            v = last.get(k)
-            if isinstance(v, bool):
-                continue
-            if isinstance(v, (int, float)):
-                return int(v)
-        return None
-
-    u = {
-        "input_tokens": num("input_tokens", "prompt_tokens"),
-        "output_tokens": num("output_tokens", "completion_tokens"),
-        "cache_read_tokens": num("cached_input_tokens", "cache_read_input_tokens"),
-        "reasoning_tokens": num("reasoning_output_tokens", "reasoning_tokens"),
-    }
-    return {k: v for k, v in u.items() if v is not None} or None
+    return common.normalize_usage(last, CODEX_USAGE_ALIASES)
 
 
 def parse_rollout(path: Path, since_line: int = 0) -> tuple[int, list[dict], dict]:

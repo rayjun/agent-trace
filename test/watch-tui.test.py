@@ -13,7 +13,6 @@ import pty
 import re
 import select
 import shutil
-import signal
 import struct
 import subprocess
 import sys

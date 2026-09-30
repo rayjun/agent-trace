@@ -1,6 +1,6 @@
 {
   "name": "agent-trace-pi",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
   "description": "agent-trace adapter for Pi (pi-coding-agent) — local LLM input/output tracing",

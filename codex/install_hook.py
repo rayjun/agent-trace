@@ -95,7 +95,7 @@ def main() -> int:
     cmd = [sys.executable, str(SCRIPT)]
     entry = {"type": "command", "command": " ".join(cmd), "timeout": 20}
 
-    data = {"hooks": {}}
+    data: dict = {"hooks": {}}
     if hooks_json.exists():
         try:
             data = json.loads(hooks_json.read_text(encoding="utf-8")) or data

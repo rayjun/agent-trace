@@ -6,16 +6,17 @@
 #   ./install.sh hermes all        # ...into every profile that has one
 #   ./install.sh codex             # wire the codex hook
 #   ./install.sh pi                # register the pi extension (pi install)
+#   ./install.sh status         # what is installed, and what is STALE
 #   ./install.sh all
 #
 # The hermes adapter is installed as a *copy*, so it must be re-run after every
-# change to hermes/__init__.py. Editing the repo alone has no effect on a
-# running agent: a stale copy is exactly how a duration-unit fix ended up
-# "fixed" in git while the live traces kept writing floats.
+# change to hermes/__init__.py or common/agenttrace_common.py. Editing the repo
+# alone has no effect on a running agent: a stale copy is exactly how a
+# duration-unit fix ended up "fixed" in git while the live traces kept writing
+# floats.
 set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-TARGET_PROFILES=()
 install_hermes() {
   local name="${1:-default}"
   local home
@@ -31,21 +32,32 @@ install_hermes() {
   fi
 
   mkdir -p "$home/plugins/agent-trace"
+  # agenttrace_common.py ships alongside: the plugin cannot reach back into
+  # the repo once copied, and hermes/__init__.py probes for it next to itself
+  # first, then at ../common.
   cp hermes/__init__.py hermes/plugin.yaml "$home/plugins/agent-trace/"
+  cp common/agenttrace_common.py "$home/plugins/agent-trace/"
 
   # Verify the deployed bytes, not just the exit code of cp. (A stale
   # __pycache__ is not a problem: CPython invalidates .pyc by source
   # mtime+size, so the freshly copied source is always recompiled.)
-  if ! cmp -s hermes/__init__.py "$home/plugins/agent-trace/__init__.py"; then
-    echo "FAIL: deployed copy differs from hermes/__init__.py" >&2
-    return 1
-  fi
+  local src
+  for src in hermes/__init__.py common/agenttrace_common.py; do
+    if ! cmp -s "$src" "$home/plugins/agent-trace/$(basename "$src")"; then
+      echo "FAIL: deployed copy differs from $src" >&2
+      return 1
+    fi
+  done
   echo "synced hermes plugin -> $home/plugins/agent-trace"
 
   if command -v hermes >/dev/null 2>&1; then
     local flag=()
     [ "$name" != "default" ] && flag=(--profile "$name")
-    hermes "${flag[@]}" plugins enable agent-trace >/dev/null 2>&1 \
+    # </dev/null + timeout: an installer must never block waiting for input.
+    # `hermes plugins enable` has been observed to prompt when the plugin was
+    # already enabled, which hung the e2e suite on a prompt nobody was there
+    # to answer.
+    timeout 30 hermes "${flag[@]}" plugins enable agent-trace </dev/null >/dev/null 2>&1 \
       && echo "  enabled (profile=$name)" \
       || echo "  ! enable failed; run: hermes ${flag[*]:-} plugins enable agent-trace"
   fi
@@ -91,6 +103,99 @@ install_pi() {
   echo "installed pi extension: $(pi list 2>/dev/null | grep -i agent-trace | head -1)"
 }
 
+# Report what is installed and, for the copy-installed pieces, whether the
+# deployed bytes still match this repo.
+#
+# Hermes is the reason this exists: it is installed as a *copy*, so editing the
+# repo alone has no effect on the running agent — a duration-unit fix sat
+# "fixed" in git while live traces kept writing floats, because nobody could
+# see that ~/.hermes/plugins/agent-trace/ had drifted. Comparing the bytes is
+# the only way to catch that from outside the agent.
+status() {
+  local stale=0
+  echo "agent-trace $(cat VERSION 2>/dev/null || echo '?')"
+  echo
+
+  local home name dest label src
+  local homes=()
+  homes+=("$HOME/.hermes")
+  local d
+  for d in "$HOME"/.hermes/profiles/*/; do
+    [ -d "$d" ] && homes+=("${d%/}")
+  done
+
+  for home in "${homes[@]}"; do
+    if [ "$home" = "$HOME/.hermes" ]; then
+      name="default"
+    else
+      name="profile=$(basename "$home")"
+    fi
+    dest="$home/plugins/agent-trace"
+    if [ ! -d "$dest" ]; then
+      printf '  %-26s %-14s\n' "hermes $name" "not installed"
+      continue
+    fi
+    local missing=() staleparts=() note
+    for src in hermes/__init__.py hermes/plugin.yaml common/agenttrace_common.py; do
+      if [ ! -f "$dest/$(basename "$src")" ]; then
+        missing+=("$(basename "$src")")
+      elif ! cmp -s "$src" "$dest/$(basename "$src")"; then
+        staleparts+=("$(basename "$src")")
+      fi
+    done
+    note=""
+    [ ${#missing[@]} -gt 0 ] && note="missing ${missing[*]}"
+    [ ${#staleparts[@]} -gt 0 ] && note="${note:+$note; }stale ${staleparts[*]}"
+    if [ -n "$note" ]; then
+      # Both are reported, not just the first kind: a half-synced deploy
+      # (new __init__.py, forgotten agenttrace_common.py) fails at import
+      # inside a running agent, and "stale" alone would hide that.
+      printf '  %-26s %-14s %s\n' "hermes $name" "SYNC NEEDED" "$note"
+      stale=1
+    else
+      printf '  %-26s %-14s %s\n' "hermes $name" "ok" "$dest"
+    fi
+  done
+
+  # The CLI is a symlink, so it cannot go stale — only disappear or point at
+  # a checkout that has moved.
+  local link="$HOME/.local/bin/agenttrace"
+  if [ -L "$link" ]; then
+    if [ "$(readlink -f "$link")" = "$(readlink -f "$PWD/cli/agenttrace.py")" ]; then
+      printf '  %-26s %-14s %s\n' "cli" "ok" "$link"
+    else
+      printf '  %-26s %-14s points at %s\n' "cli" "STALE" "$(readlink -f "$link")"
+      stale=1
+    fi
+  elif [ -x "$link" ]; then
+    printf '  %-26s %-14s %s (copied, not linked)\n' "cli" "ok" "$link"
+  else
+    printf '  %-26s %-14s\n' "cli" "not installed"
+  fi
+
+  if [ -f "$HOME/.codex/hooks.json" ] && grep -q codex_import.py "$HOME/.codex/hooks.json" 2>/dev/null; then
+    printf '  %-26s %-14s %s\n' "codex" "ok" "$HOME/.codex/hooks.json"
+  else
+    printf '  %-26s %-14s\n' "codex" "not installed"
+  fi
+
+  if command -v pi >/dev/null 2>&1 && pi list 2>/dev/null | grep -qi agent-trace; then
+    printf '  %-26s %-14s registered by pi install\n' "pi" "ok"
+  else
+    printf '  %-26s %-14s\n' "pi" "not installed"
+  fi
+
+  echo
+  echo "  traces: ~/.hermes/traces  ~/.codex/traces  ~/.pi/agent/traces"
+  if [ "$stale" -ne 0 ]; then
+    echo
+    echo "  STALE means the repo changed but the deployed copy did not — rerun"
+    echo "  install.sh so the running agent picks it up." >&2
+    return 1
+  fi
+  return 0
+}
+
 case "${1:-all}" in
   hermes)
     name="${2:-default}"
@@ -107,6 +212,7 @@ case "${1:-all}" in
   codex) install_codex ;;
   pi)    install_pi ;;
   cli)   install_cli ;;
+  status) status ;;
   all)
     name="${2:-default}"
     if [ "$name" = "all" ]; then
@@ -123,7 +229,7 @@ case "${1:-all}" in
     install_pi
     ;;
   *)
-    echo "usage: $0 {hermes|codex|pi|cli|all} [profile|all]" >&2
+    echo "usage: $0 {hermes|codex|pi|cli|status|all} [profile|all]" >&2
     exit 2
     ;;
 esac

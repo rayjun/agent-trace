@@ -19,12 +19,42 @@ from __future__ import annotations
 
 import json
 import os
-import threading
-from datetime import datetime, timezone
+import sys as _sys
 from pathlib import Path
 
+# --------------------------------------------------------------------------
+# shared helpers
+# --------------------------------------------------------------------------
+#
+# The trace rules (schema version, timestamps, content flattening, usage
+# mapping, truncation, redaction, the JSONL append) live in one module so all
+# three agents write records that are shaped identically. In the repo that
+# module is ../common; a deployed plugin is a *copy* (install.sh) and cannot
+# reach back into the repo, so install.sh copies agenttrace_common.py next to
+# this file. Both layouts are probed here.
+_here = Path(__file__).resolve().parent
+for _d in (_here, _here.parent / "common"):
+    if (_d / "agenttrace_common.py").is_file():
+        if str(_d) not in _sys.path:
+            _sys.path.insert(0, str(_d))
+        break
+
+import agenttrace_common as common  # noqa: E402
+
 AGENT = "hermes"
-SCHEMA_V = 1
+SCHEMA_V = common.SCHEMA_V
+
+# Provider usage -> shared token fields. Hermes sees OpenAI-shaped usage
+# (prompt/completion_tokens) and Anthropic-shaped cache counters in the same
+# stream; the order below is the preference when a provider sends both
+# spellings of one field.
+HERMES_USAGE_ALIASES = {
+    "input_tokens": ("prompt_tokens", "input_tokens"),
+    "output_tokens": ("completion_tokens", "output_tokens"),
+    "cache_read_tokens": ("cache_read_input_tokens", "cache_read_tokens"),
+    "cache_write_tokens": ("cache_creation_input_tokens", "cache_write_tokens"),
+    "reasoning_tokens": ("reasoning_tokens",),
+}
 
 # Optional dep from the Hermes runtime. Imported lazily so the plugin still loads
 # in test harnesses that stub the lifecycle module.
@@ -33,9 +63,6 @@ try:
 except Exception:  # pragma: no cover
     def redact_sensitive_text(text: str, force: bool = False) -> str:
         return text
-
-
-_write_lock = threading.Lock()
 
 
 # --------------------------------------------------------------------------
@@ -50,25 +77,18 @@ def _hermes_home() -> Path:
 
 
 def _trace_dir() -> Path:
-    d = _hermes_home() / "traces"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    # No mkdir here: the directory is created inside emit_record, whose
+    # OSError guard is what keeps a read-only HOME from killing the agent.
+    return _hermes_home() / "traces"
 
 
 def _capture_mode() -> str:
     """full (default) | metadata. metadata keeps structure, drops content."""
-    return (os.environ.get("AGENTTRACE_CAPTURE") or "full").strip().lower()
+    return common.capture_mode()
 
 
 def _max_chars() -> int:
-    try:
-        return max(0, int(os.environ.get("AGENTTRACE_MAX_CHARS") or 200_000))
-    except ValueError:
-        return 200_000
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return common.max_chars()
 
 
 def _ms(seconds) -> int | None:
@@ -109,28 +129,12 @@ def _ms_int(milliseconds) -> int | None:
 
 def _truncate(obj, limit: int):
     """Bound one string field; returns the value unchanged if it fits."""
-    if isinstance(obj, str) and len(obj) > limit:
-        return obj[:limit] + f"\n...[truncated {len(obj) - limit} chars]"
-    return obj
+    return common.truncate(obj, limit)
 
 
 def _coerce_text(v) -> str:
     """Normalize a message content field (str, or provider part list) to text."""
-    if v is None:
-        return ""
-    if isinstance(v, str):
-        return v
-    if isinstance(v, list):
-        out = []
-        for part in v:
-            if isinstance(part, str):
-                out.append(part)
-            elif isinstance(part, dict):
-                t = part.get("text") or part.get("content") or part.get("thinking")
-                if t:
-                    out.append(str(t))
-        return "\n".join(out)
-    return str(v)
+    return common.flatten_content(v)
 
 
 def _shape_messages(raw) -> list[dict]:
@@ -215,34 +219,8 @@ def _usage(raw) -> dict | None:
         raw = _as_dict(raw)
     if not raw:
         return None
-    def num(*keys):
-        for k in keys:
-            v = raw.get(k)
-            if isinstance(v, bool):
-                continue
-            if isinstance(v, (int, float)):
-                return int(v)
-            if isinstance(v, str):
-                try:
-                    return int(float(v))
-                except ValueError:
-                    continue
-        return None
-    u = {
-        "input_tokens": num("prompt_tokens", "input_tokens"),
-        "output_tokens": num("completion_tokens", "output_tokens"),
-        "cache_read_tokens": num("cache_read_input_tokens", "cache_read_tokens"),
-        "cache_write_tokens": num("cache_creation_input_tokens", "cache_write_tokens"),
-        "reasoning_tokens": num("reasoning_tokens"),
-    }
-    out = {k: v for k, v in u.items() if v is not None}
-    if not out:
-        return None
     # keep provider extras (total_tokens, request_count, ...) for cost analysis
-    for k, v in raw.items():
-        if k not in out and isinstance(v, (int, float)) and not isinstance(v, bool):
-            out[k] = int(v)
-    return out
+    return common.normalize_usage(raw, HERMES_USAGE_ALIASES, keep_extras=True)
 
 
 def _as_dict(obj) -> dict:
@@ -283,26 +261,23 @@ def _shape_tool_calls(raw) -> list[dict]:
 # --------------------------------------------------------------------------
 
 def _write(record: dict) -> None:
-    try:
-        line = json.dumps(record, ensure_ascii=False, default=str)
-    except (TypeError, ValueError) as e:
-        return
-    if os.environ.get("AGENTTRACE_REDACT", "1") not in ("0", "false", "no"):
-        try:
-            line = redact_sensitive_text(line, force=True)
-        except Exception:
-            pass
-    path = _trace_dir() / f"hermes-{datetime.now(timezone.utc):%Y%m%d}.jsonl"
-    with _write_lock:
-        try:
-            with path.open("a", encoding="utf-8") as fh:
-                fh.write(line + "\n")
-        except OSError:
-            pass
+    """Append one record to the profile's daily trace file.
+
+    Never raises — tracing must not be able to kill the agent. Serialisation,
+    redaction and the locked append are the shared writer's job; this adapter
+    only contributes its file prefix and the host's own redactor, which runs
+    on top of the built-in one when AGENTTRACE_REDACT is on.
+    """
+    common.emit_record(
+        _trace_dir(),
+        "hermes",
+        record,
+        extra_redact=lambda line: redact_sensitive_text(line, force=True),
+    )
 
 
 def _emit(event: str, **fields) -> None:
-    rec = {"v": SCHEMA_V, "ts": _now(), "agent": AGENT, "event": event}
+    rec = {"agent": AGENT, "event": event}
     rec.update({k: v for k, v in fields.items() if v is not None})
     _write(rec)
 
