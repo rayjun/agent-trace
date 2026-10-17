@@ -74,11 +74,21 @@ await fire("message_end", {
 		usage: { input: 1200, output: 340, cacheRead: 900, reasoningTokens: 120 },
 		stopReason: "tool_use",
 		durationMs: 1520.7,
+		responseId: "chatcmpl-abc123",
 	},
 });
 
 await fire("tool_execution_start", { toolCallId: "call_1", toolName: "read", args: { path: "src/config.py" } });
-await fire("tool_execution_end", { toolCallId: "call_1", toolName: "read", isError: false, durationMs: 12 });
+// The real shape of `result` (measured on Pi 1.3.0): content blocks plus a
+// structuredContent payload carrying the exit code.
+await fire("tool_execution_end", {
+	toolCallId: "call_1", toolName: "read", isError: false, durationMs: 12,
+	result: {
+		content: [{ type: "text", text: "def parse_config():\n    return {}" }],
+		details: {},
+		structuredContent: { output: "def parse_config():\n    return {}", truncated: false, exit_code: 0 },
+	},
+});
 await fire("agent_end", {});
 
 // ---- assertions ------------------------------------------------------------
@@ -174,6 +184,29 @@ assert.equal(tcall.tool.args.path, "src/config.py", "args carried through (schem
 const tres = recs.find((r) => r.event === "tool_result");
 assert.equal(tres.tool.name, "read");
 assert.equal(tres.tool.status, "ok");
+// The tool's OUTPUT was dropped until this was fixed: the panel showed
+// `⚙ read ok` and nothing about what the tool returned, which is the most
+// useful line in a coding trace.
+assert.match(tres.response.content, /def parse_config/, "tool result body captured");
+assert.equal(tres.tool.exit_code, 0, "exit code surfaced from structuredContent");
+assert.equal(tres.duration_ms, 12);
+
+// Turn/request identity. Pi carries NEITHER natively (turn_start has only an
+// index, the response id only exists after the call), so without these the
+// reader cannot pair an llm_request with its llm_response — `agenttrace show`
+// found nothing for pi and the v2 converter produced an orphan span_end.
+const treq = recs.find((r) => r.event === "llm_request");
+assert.ok(treq.request_id, "llm_request carries a request_id");
+// non-vacuous: turn_id comes from Pi's turn_start index and must be present,
+// else the two halves would "agree" by both being undefined.
+assert.equal(treq.turn_id, "0", "turn_id comes from turn_start's turnIndex");
+assert.equal(treq.request_id, "pi-0-1", "request id is turn + per-turn sequence");
+assert.equal(tres.request_id, treq.request_id, "tool result joins its turn's request");
+const tresp = recs.find((r) => r.event === "llm_response");
+assert.equal(tresp.request_id, treq.request_id, "llm_response pairs with its request");
+assert.equal(tresp.turn_id, treq.turn_id, "both halves agree on the turn");
+assert.match(tresp.note, /response_id=chatcmpl-abc123/,
+	"Pi's own provider response id kept for cross-referencing");
 
 // session identity: env first (this run), then the runner context
 for (const r of recs) {

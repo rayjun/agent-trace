@@ -129,10 +129,103 @@ def parse_rollout(path: Path, since_line: int = 0) -> tuple[int, list[dict], dic
     pending_tool: dict[str, str] = {}   # call_id -> tool name
     n = 0
 
+    # ---- turn bookkeeping -------------------------------------------------
+    # Codex logs no wire request, so the request/response PAIR for a turn has
+    # to be reconstructed. It must be per TURN, not per session:
+    # `token_count` fires once per API call and carries that call's usage, and
+    # hanging every one of them on a single session-level request_id produced
+    # whichever came last — 28 same-id/different-payload collisions on one real
+    # rollout. A per-turn pair gives each turn a closed llm span with its own
+    # usage, which is also what the v2 tree wants.
+    turn_seq = 0
+    turn_key = None
+    turn_usage: dict[str, dict] = {}      # turn key -> merged usage
+    turn_request: dict[str, str] = {}     # turn key -> request_id
+    turn_emitted: set[str] = set()
+    closed_turns: set[str] = set()
+
+    def open_turn(key: str | None, model, cwd, ts) -> str:
+        """Register a turn and emit its llm_request exactly once."""
+        nonlocal turn_seq
+        k = key or f"turn{turn_seq}"
+        if k in turn_emitted:
+            return k
+        turn_seq += 1
+        turn_emitted.add(k)
+        request_id = f"codex-{k}"
+        turn_request[k] = request_id
+        # The system prompt is a session-level artifact and is stored ONCE, on
+        # the first turn's request: repeating a multi-KB prompt in every turn
+        # would duplicate it on disk for no gain (see the "stored once" rule in
+        # schema/CHANGELOG.md). Later turns therefore carry an empty request
+        # body — honest, because Codex does not log one.
+        first = len(turn_request) == 1
+        records.append({
+            "event": "llm_request",
+            "session_id": meta["session_id"],
+            "turn_id": key,
+            "request_id": request_id,
+            "model": model or meta["model"],
+            "provider": meta["provider"],
+            "api_mode": API_MODE,
+            "cwd": cwd or meta["cwd"],
+            **({"ts": ts} if ts else {}),
+            "request": {
+                "messages": [],
+                "system_prompt": _truncate(meta["system_prompt"]) if first else None,
+                "message_count": None,
+                "tool_count": None,
+            },
+            "note": ("codex does not log the wire request; the system prompt is "
+                     "the only request-side artifact" if first else
+                     "codex does not log the wire request"),
+            "source_file": str(path),
+        })
+        return k
+
+    def close_turn(key: str, model, content, ts) -> bool:
+        """Emit the turn's llm_response: usage + whatever text is observable.
+
+        Returns True when the turn carried usage, so the caller knows whether
+        there is anything to say about an unclosed turn.
+        """
+        request_id = turn_request.get(key)
+        if request_id is None or key in closed_turns:
+            return False
+        closed_turns.add(key)
+        response: dict = {}
+        if content:
+            response["content"] = _truncate(content)
+        usage = turn_usage.pop(key, None)
+        if usage:
+            response["usage"] = usage
+        records.append({
+            "event": "llm_response",
+            "session_id": meta["session_id"],
+            "turn_id": key,
+            "request_id": request_id,
+            "model": model or meta["model"],
+            **({"ts": ts} if ts else {}),
+            "note": "usage_only=true" if content is None else None,
+            "response": response,
+            "source_file": str(path),
+        })
+        return bool(usage)
+
     try:
         fh = path.open(encoding="utf-8", errors="replace")
     except OSError:
         return since_line, [], meta
+
+    # Every rollout line carries the REAL event time (`timestamp`, ISO). Using
+    # it is what makes a turn's duration meaningful; the previous behaviour
+    # stamped each record with the time WE imported it, so a trace held records
+    # from both clocks and its task span measured weeks instead of seconds.
+    # Stamping happens for the PREVIOUS line at the top of each iteration,
+    # because the body uses `continue` extensively and any per-branch stamping
+    # would have to be repeated at ten call sites (and missed at the eleventh).
+    mark = len(records)
+    pending_ts: str | None = None
 
     with fh:
         for n, line in enumerate(fh, 1):
@@ -145,6 +238,13 @@ def parse_rollout(path: Path, since_line: int = 0) -> tuple[int, list[dict], dic
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if pending_ts:
+                for rec in records[mark:]:
+                    if not rec.get("ts"):
+                        rec["ts"] = pending_ts
+                mark = len(records)
+            raw_ts = obj.get("timestamp")
+            pending_ts = raw_ts if isinstance(raw_ts, str) and raw_ts.endswith("Z") else None
             rtype = obj.get("type")
             payload = obj.get("payload")
             if not isinstance(payload, dict):
@@ -164,16 +264,36 @@ def parse_rollout(path: Path, since_line: int = 0) -> tuple[int, list[dict], dic
                 continue
 
             if rtype == "turn_context":
-                turn_id = payload.get("turn_id") or turn_id
+                tid = payload.get("turn_id")
+                if tid and tid != turn_id:
+                    turn_id = tid
+                    turn_key = None          # a new turn: open it below
                 meta["model"] = payload.get("model") or meta["model"]
                 meta["cwd"] = payload.get("cwd") or meta["cwd"]
+                if turn_key is None:
+                    turn_key = open_turn(turn_id, meta["model"], meta["cwd"], None)
                 continue
 
             if rtype == "event_msg":
                 if ptype == "task_started":
-                    turn_id = payload.get("turn_id") or turn_id
+                    new_turn = payload.get("turn_id")
+                    if new_turn and new_turn != turn_id:
+                        turn_id = new_turn
                     turn_started_at = payload.get("started_at")
+                    turn_key = open_turn(turn_id, meta["model"], meta["cwd"], None)
                 elif ptype == "user_message":
+                    # Any record naming a NEW turn id opens that turn. A rollout
+                    # may log turn_context, task_started, or neither for a given
+                    # turn (the incremental append in the test carries only
+                    # user_message), and the pair must not depend on which
+                    # boundary line this Codex version happened to write.
+                    if payload.get("turn_id") and payload["turn_id"] != turn_id:
+                        turn_id = payload["turn_id"]
+                        turn_key = open_turn(turn_id, meta["model"], meta["cwd"],
+                                             None)
+                    elif turn_key is None:
+                        turn_key = open_turn(turn_id, meta["model"], meta["cwd"],
+                                             None)
                     records.append({
                         "event": "user_prompt",
                         "session_id": meta["session_id"],
@@ -186,24 +306,34 @@ def parse_rollout(path: Path, since_line: int = 0) -> tuple[int, list[dict], dic
                 elif ptype == "token_count":
                     u = _token_info(payload)
                     if u:
-                        records.append({
-                            "event": "note",
-                            "session_id": meta["session_id"],
-                            "turn_id": turn_id,
-                            "model": meta["model"],
-                            "note": "token_count " + json.dumps(u, ensure_ascii=False),
-                        })
+                        # Accumulated, not emitted. token_count fires once per
+                        # API call; each reading belongs to THIS turn's llm
+                        # response, which close_turn emits once. Emitting one
+                        # record per reading is what produced duplicate
+                        # request_ids with different payloads on real data.
+                        key = turn_key or (turn_id or "turn0")
+                        merged = dict(turn_usage.get(key) or {})
+                        merged.update({k: v for k, v in u.items()
+                                       if v is not None})
+                        turn_usage[key] = merged
                 elif ptype == "task_complete":
                     dur = payload.get("duration_ms")
+                    last_message = payload.get("last_agent_message")
                     records.append({
                         "event": "assistant_message",
                         "session_id": meta["session_id"],
                         "turn_id": turn_id,
                         "model": meta["model"],
                         "duration_ms": dur if isinstance(dur, int) else None,
-                        "response": {"content": _truncate(payload.get("last_agent_message"))},
+                        "response": {"content": _truncate(last_message)},
                         "source_file": str(path),
                     })
+                    # The turn's llm_response is emitted HERE, carrying the
+                    # usage collected from its token_count events and the text
+                    # Codex reported as this turn's output. Without this the
+                    # usage had nowhere to live that a reader could reach.
+                    close_turn(turn_key or (turn_id or "turn0"), meta["model"],
+                               last_message, None)
                 continue
 
             if rtype == "response_item":
@@ -220,7 +350,6 @@ def parse_rollout(path: Path, since_line: int = 0) -> tuple[int, list[dict], dic
                             "session_id": meta["session_id"],
                             "turn_id": turn_id,
                             "model": meta["model"],
-                            "ts": _iso(turn_started_at) or None,
                             "response": {"content": _truncate(_content_to_text(payload.get("content"))),
                                          "role": role},
                             "source_file": str(path),
@@ -252,39 +381,40 @@ def parse_rollout(path: Path, since_line: int = 0) -> tuple[int, list[dict], dic
                     })
                 continue
 
-    # Codex never logs a wire request, so on the FIRST import of a rollout we
-    # synthesise one llm_request carrying the system prompt, which lets the CLI
-    # pair request/response. This must happen exactly once per file: on
-    # incremental imports the header lines were already skipped, so no
-    # llm_request appears in `records` and a "not already present" check would
-    # re-emit it on every hook event.
-    if since_line == 0 and meta["system_prompt"] and not any(
-        r.get("event") == "llm_request" for r in records
-    ):
-        records.insert(0, {
-            "event": "llm_request",
+    if pending_ts:
+        for rec in records[mark:]:
+            if not rec.get("ts"):
+                rec["ts"] = pending_ts
+
+    # Flush any turn that collected usage but never saw task_complete (the
+    # rollout ended mid-turn: a crash, `SIGINT`, or the file still being
+    # written). Dropping it would lose real token data; pretending the turn
+    # completed would be worse. So:
+    #   * the llm_response is emitted — the provider DID return, and
+    #     `token_count` is the evidence, so closing the llm SPAN is correct;
+    #   * a `note` records that the TURN never reported completion, which is
+    #     the part that is genuinely unknown.
+    for key in sorted(set(turn_usage) | set(turn_request)):
+        # close_turn owns the usage pop; popping here too silently emptied the
+        # response it then emitted.
+        if not close_turn(key, meta["model"], None, pending_ts):
+            continue
+        records.append({
+            "event": "note",
             "session_id": meta["session_id"],
-            "turn_id": None,
+            "turn_id": key,
             "model": meta["model"],
-            "provider": meta["provider"],
-            "api_mode": API_MODE,
-            "cwd": meta["cwd"],
-            "request": {
-                "messages": [],
-                "system_prompt": _truncate(meta["system_prompt"]),
-                # No `instructions` here: it was assigned
-                # `meta["system_prompt"]` too, so it was a definitionally
-                # identical second copy of a multi-KB prompt in every codex
-                # record. `api_mode: "responses"` already records that Codex
-                # sends it as `instructions`, and every reader checks
-                # `system_prompt` first (see canonical_request / the panel's
-                # fallback chain), so dropping it loses nothing but bytes.
-                "message_count": None,
-                "tool_count": None,
-            },
-            "note": "codex does not log the wire request; the system prompt is the only request-side artifact",
+            **({"ts": pending_ts} if pending_ts else {}),
+            "note": "turn_incomplete=true (no task_complete in the rollout)",
             "source_file": str(path),
         })
+
+    # A session with no turn boundaries at all still gets one request record so
+    # the system prompt is not lost; it is left unclosed, which the
+    # materializer reports as `incomplete` rather than pretending the turn
+    # finished.
+    if since_line == 0 and meta["system_prompt"] and not turn_emitted:
+        open_turn(None, meta["model"], meta["cwd"], pending_ts)
 
     return n, records, meta
 
@@ -305,6 +435,12 @@ def _cursor_path(path: Path) -> Path:
     return _state_dir / f"cursor-{digest}.json"
 
 
+def _today_trace_file() -> Path:
+    """The daily file the next emit would append to (matches emit_record)."""
+    day = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return _trace_dir / f"codex-{day}.jsonl"
+
+
 def import_rollout(path: Path, session_id: str | None = None) -> int:
     """Import new lines of one rollout file; returns how many records were written."""
     cur = _cursor_path(path)
@@ -317,6 +453,14 @@ def import_rollout(path: Path, session_id: str | None = None) -> int:
         except (json.JSONDecodeError, ValueError, OSError):
             since = 0
     else:
+        since = 0
+
+    # The cursor claims "lines up to N are already in the trace file". That
+    # claim is only true while the file it wrote to still exists: delete the
+    # traces to start over and the cursor would keep answering "nothing new"
+    # forever, with no new records and no error. Verify the output, not the
+    # bookkeeping.
+    if since and not _today_trace_file().exists():
         since = 0
 
     n, records, meta = parse_rollout(path, since)

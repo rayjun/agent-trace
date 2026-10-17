@@ -31,7 +31,7 @@ ignore = [
 
 [tool.mypy]
 python_version = "3.10"
-files = ["common", "cli", "codex", "hermes"]
+files = ["common", "cli", "codex", "hermes", "core", "adapter_sdk", "server", "evaluation"]
 # Untyped defs are still *checked* where an annotation exists, but missing
 # annotations are not errors yet: the adapters predate typing and rewriting
 # 2k lines to satisfy strict mode would be churn, not safety.
@@ -47,6 +47,13 @@ show_error_codes = true
 # place a mistake affects every adapter at once.
 [[tool.mypy.overrides]]
 module = "agenttrace_common"
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+
+# The v2 platform layers are new code and are held to the same full standard.
+[[tool.mypy.overrides]]
+module = ["core.*", "adapter_sdk.*", "server.*", "evaluation.*"]
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
 check_untyped_defs = true

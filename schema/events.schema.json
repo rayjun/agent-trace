@@ -1,0 +1,187 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/rayjun/agent-trace/schema/events.schema.json",
+  "title": "agent-trace canonical event (v2)",
+  "description": "The canonical execution-trace event every adapter converges on. One event is one line of JSONL. span_start + span_end with the same span_id form a Span; type=event records a discrete occurrence. This file is the authoritative contract — Python constants in core/schema/model.py are derived from it and pinned by test/v2_schema.test.py.",
+  "type": "object",
+  "required": ["v", "event_id", "type", "ts", "observed_at", "adapter_id"],
+  "additionalProperties": false,
+  "properties": {
+    "v": { "const": 2, "description": "record schema version" },
+
+    "event_id": {
+      "type": "string",
+      "minLength": 8,
+      "description": "globally unique id of THIS event. Adapters that re-emit (importers, hooks) must derive it deterministically from source identity so re-ingestion deduplicates instead of doubling."
+    },
+
+    "type": {
+      "enum": ["span_start", "span_end", "event"],
+      "description": "span lifecycle marker, or a discrete event"
+    },
+
+    "ts": {
+      "type": "string",
+      "description": "RFC3339 UTC ms — when the observed thing happened, per the adapter's best knowledge"
+    },
+    "observed_at": {
+      "type": "string",
+      "description": "RFC3339 UTC ms — when the adapter wrote the event. ts < observed_at is normal for file-parsing adapters (codex); a gap flags derived data."
+    },
+    "sequence": {
+      "type": ["integer", "null"],
+      "description": "source ordering hint when the agent provides one; null otherwise"
+    },
+
+    "session_id": {
+      "type": ["string", "null"],
+      "description": "the continuous agent session this belongs to; null only for events that genuinely have no session"
+    },
+    "trace_id": {
+      "type": ["string", "null"],
+      "description": "one task execution. Required on span_start/span_end; session-level events (session_start) carry null."
+    },
+    "span_id": {
+      "type": ["string", "null"],
+      "description": "required on span_start/span_end; both markers of one span share it"
+    },
+    "parent_span_id": {
+      "type": ["string", "null"],
+      "description": "parent span within the same trace; null on the root (task) span"
+    },
+
+    "adapter_id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]*$",
+      "description": "which adapter produced this (hermes, codex, pi, langgraph, ...). Deliberately an open string, NOT an enum: adding an adapter must not require editing the schema."
+    },
+    "agent_name": {
+      "type": ["string", "null"],
+      "description": "the agent product being observed (usually equals adapter_id; differs when one adapter serves several agents)"
+    },
+    "agent_version": { "type": ["string", "null"] },
+
+    "span": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["kind", "name"],
+      "properties": {
+        "kind": {
+          "enum": ["task", "agent", "llm", "tool", "chain"],
+          "description": "task = trace root; agent = subagent delegation; llm = one model call; tool = one tool execution; chain = generic grouping"
+        },
+        "name": { "type": "string" },
+        "status": {
+          "type": ["string", "null"],
+          "enum": ["running", "ok", "error", "cancelled", "interrupted", null],
+          "description": "span_start: running or absent. span_end: one of the four terminal states. 'incomplete' is NEVER emitted — it is assigned by the materializer to a start that saw no end."
+        },
+        "input": {
+          "type": ["object", "null"],
+          "additionalProperties": true,
+          "description": "span_start payload: messages/args/task description, already truncated and redacted by the adapter"
+        },
+        "output": {
+          "type": ["object", "null"],
+          "additionalProperties": true,
+          "description": "span_end payload: content/result/finish_reason"
+        },
+        "error": {
+          "type": ["object", "null"],
+          "additionalProperties": true,
+          "properties": {
+            "type": { "type": "string" },
+            "message": { "type": "string" },
+            "status_code": { "type": ["integer", "null"] },
+            "retryable": { "type": ["boolean", "null"] },
+            "retry_count": { "type": ["integer", "null"] }
+          }
+        },
+        "attributes": {
+          "type": ["object", "null"],
+          "additionalProperties": true,
+          "description": "controlled extension point for agent-specific data: provider/model/api_mode/usage for llm spans, exit_code for tools, delegation info for agent spans. Core fields stay stable; adapters put the rest here."
+        }
+      }
+    },
+
+    "event": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "open string. Well-known: session_start, session_end, user_prompt, assistant_message, note"
+        },
+        "attributes": {
+          "type": ["object", "null"],
+          "additionalProperties": true
+        }
+      }
+    },
+
+    "resource": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "description": "process/machine context: pid, cwd, runtime, host",
+      "properties": {
+        "pid": { "type": ["integer", "null"] },
+        "cwd": { "type": ["string", "null"] },
+        "runtime": { "type": ["string", "null"] },
+        "host": { "type": ["string", "null"] }
+      }
+    },
+
+    "privacy": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "description": "how this event was treated BEFORE it hit disk, so a reader can distinguish 'empty' from 'withheld'",
+      "properties": {
+        "capture": {
+          "type": ["string", "null"],
+          "enum": ["full", "metadata", null]
+        },
+        "redacted": { "type": ["boolean", "null"] }
+      }
+    },
+
+    "source": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "description": "traceability back to the raw artefact: source event id, file, byte offset",
+      "properties": {
+        "event_id": { "type": ["string", "null"] },
+        "file": { "type": ["string", "null"] },
+        "line": { "type": ["integer", "null"] }
+      }
+    }
+  },
+
+  "allOf": [
+    {
+      "if": { "properties": { "type": { "enum": ["span_start", "span_end"] } } },
+      "then": {
+        "required": ["span_id", "trace_id", "span"],
+        "description": "a span marker is meaningless without its identity and payload"
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "span_end" } } },
+      "then": {
+        "description": "an end marker must reach a terminal state",
+        "properties": {
+          "span": {
+            "properties": {
+              "status": { "enum": ["ok", "error", "cancelled", "interrupted"] }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "type": { "const": "event" } } },
+      "then": { "required": ["event"] }
+    }
+  ]
+}

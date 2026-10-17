@@ -113,6 +113,26 @@ def test_hermes_tool_events():
     check("_result_text non-json", mod._result_text("not json {") == "not json {")
     check("_result_text None", mod._result_text(None) == "")
 
+    # The exit code is the difference between "ran" and "succeeded", and the v2
+    # schema reserves span.attributes.exit_code for it. It was declared and
+    # never populated until this existed.
+    check("_result_exit_code numeric",
+          mod._result_exit_code(json.dumps({"output": "x", "exit_code": 0})) == 0)
+    check("_result_exit_code nonzero",
+          mod._result_exit_code(json.dumps({"exit_code": 127})) == 127)
+    check("_result_exit_code string form",
+          mod._result_exit_code(json.dumps({"exit_code": "1"})) == 1)
+    check("_result_exit_code alias returncode",
+          mod._result_exit_code({"returncode": 2}) == 2)
+    check("_result_exit_code bool is not an exit code",
+          mod._result_exit_code({"exit_code": True}) is None)
+    check("_result_exit_code absent",
+          mod._result_exit_code(json.dumps({"output": "no code"})) is None)
+    check("_result_exit_code non-json string",
+          mod._result_exit_code("not json {") is None)
+    check("_result_exit_code None", mod._result_exit_code(None) is None)
+
+
     # post_tool_call duration_ms is ALREADY ms (model_tools._elapsed_ms), unlike
     # api_duration which is seconds. Mixing them up is a 1000x error.
     check("_ms_int passes ms through", mod._ms_int(34) == 34, repr(mod._ms_int(34)))
@@ -121,7 +141,7 @@ def test_hermes_tool_events():
 
     mod.on_post_tool_call(
         tool_name="read_file", args={"path": "/tmp/x"},
-        result=json.dumps({"output": "1|# agent-trace"}),
+        result=json.dumps({"output": "1|# agent-trace", "exit_code": 0}),
         tool_call_id="call_1", session_id="s1", turn_id="t1", model="m",
         duration_ms=34, status="ok",
     )
@@ -149,6 +169,11 @@ def test_hermes_tool_events():
               (tr.get("response") or {}).get("content") == "1|# agent-trace",
               str((tr.get("response") or {}).get("content")))
         check("no error field on success", tr.get("error") is None, str(tr.get("error")))
+        # The exit code must reach the record, not just the helper: the v2
+        # schema reserves span.attributes.exit_code for it and nothing
+        # populated that field before this.
+        check("tool_result records exit_code from the result JSON",
+              tr["tool"].get("exit_code") == 0, str(tr["tool"]))
 
     # A failing tool must carry the error, not silently look successful.
     mod.on_post_tool_call(

@@ -22,6 +22,39 @@ agree, so the two definitions of `v`/`agent`/`event` cannot drift.
 
 ---
 
+## v2 — canonical events (parallel introduction)
+
+`schema/events.schema.json` defines the v2 canonical event: Session > Trace >
+Span > Event, emitted as `span_start` / `span_end` / `event` lines. It runs IN
+PARALLEL with v1 — the three adapters still write v1, and
+`core/convert/v1_to_v2.py` is the read-side bridge. v1 stays the adapter write
+format until the adapters migrate in a later milestone; nothing about v1
+above is weakened.
+
+Design decisions that differ from v1, and why:
+
+* `adapter_id` is an open string (`^[a-z][a-z0-9_-]*$`), not an enum. v1's
+  `agent` enum meant adding an agent required editing the schema — the exact
+  coupling the platform is meant to remove.
+* A Span is two events sharing one `span_id`, not one record with both sides.
+  v1's single-record shape cannot represent a call that started and never
+  returned (the crash case); the pair can, and a start without an end is
+  materialized as `incomplete` — a state adapters never emit themselves.
+* `event_id` is mandatory and, for re-emittable sources, deterministic
+  (`derive_event_id` over source identity), so re-ingestion dedups.
+* `ts` (when it happened) and `observed_at` (when the adapter wrote it) are
+  separate fields. File-parsing adapters (codex) only have the second; v1
+  conflated them and made parse-time look like call-time.
+* Agent-specific fields go in `span.attributes` / `event.attributes`, which
+  are `additionalProperties: true`. The core envelope stays
+  `additionalProperties: false`, same strictness as v1.
+
+`test/v2_schema.test.py` pins `core/schema/model.py` against
+`schema/events.schema.json`, the same mechanism `test/schema.test.py` uses
+for v1.
+
+---
+
 ## v1 — current
 
 The initial (and only) version. Field reference lives in
@@ -91,6 +124,29 @@ the panel show `2ms` for a 2-second call.
 The unit is part of the field name and is not negotiable: convert at the edge
 (`_ms` for seconds, `_ms_int` for values already in milliseconds — running one
 through the other inflates tool timings by 1000× or truncates them to 0).
+
+#### `tool.exit_code` is populated (it used to be declared and empty)
+
+`span.attributes.exit_code` is documented as the tool convention in
+`events.schema.json`, and `adapters/otlp/convert.py` reads it on export — but
+no adapter ever SET it, so the field was permanently absent and the OTLP
+attribute never appeared. `tool.exit_code` is now an optional integer in this
+schema, written by hermes (from the terminal tool's `{"exit_code": ...}`) and
+by pi (from `structuredContent.exit_code`), and moved into
+`span.attributes.exit_code` by the v1 -> v2 converter.
+
+#### pi records carry `turn_id` and `request_id` (they had neither)
+
+`request_id` is documented as "stable id correlating an llm_request with its
+llm_response/llm_error". The pi adapter emitted neither that nor `turn_id`, so
+`agenttrace show <request_id>` could never match a pi call, the live panel had
+nothing to pair on, and the v2 converter produced an orphan `span_end`
+alongside an unclosed `span_start` — which the conformance kit rejected.
+Pi's extension API does not supply either value (`turn_start` has an index;
+the provider's response id only exists after the call), so the adapter
+synthesises `request_id = pi-<turnIndex>-<seq>` and sets
+`turn_id = <turnIndex>`. A session therefore also splits into one trace per
+turn, which is what `Trace: one task execution` was always supposed to mean.
 
 #### `ts` is RFC3339 UTC with millisecond precision
 

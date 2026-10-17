@@ -214,6 +214,36 @@ def _result_text(result) -> str:
     return json.dumps(data, ensure_ascii=False)
 
 
+def _result_exit_code(result) -> int | None:
+    """The tool's exit code when it reported one.
+
+    Hermes' terminal tool returns `{"output": ..., "exit_code": 0}`. That
+    number is the difference between "the command ran" and "the command
+    succeeded", and the v2 schema reserves `span.attributes.exit_code` for it —
+    but nothing populated it, so the field was declared and permanently empty.
+    """
+    if isinstance(result, (dict, list)):
+        data = result
+    elif isinstance(result, str):
+        try:
+            data = json.loads(result)
+        except (json.JSONDecodeError, ValueError):
+            return None
+    else:
+        return None
+    if not isinstance(data, dict):
+        return None
+    for key in ("exit_code", "exitCode", "returncode", "return_code", "code"):
+        v = data.get(key)
+        if isinstance(v, bool):
+            continue                      # `code: true` is not an exit code
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str) and v.lstrip("-").isdigit():
+            return int(v)
+    return None
+
+
 def _usage(raw) -> dict | None:
     if not isinstance(raw, dict):
         raw = _as_dict(raw)
@@ -507,7 +537,8 @@ def on_post_tool_call(**kw) -> None:
     _emit(
         "tool_result",
         **common,
-        tool={"name": name, "call_id": call_id, "status": status},
+        tool={"name": name, "call_id": call_id, "status": status,
+              "exit_code": _result_exit_code(kw.get("result"))},
         response={"content": _truncate(_result_text(kw.get("result")), _max_chars())},
         duration_ms=_ms_int(kw.get("duration_ms")),
         error=({

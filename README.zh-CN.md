@@ -8,6 +8,13 @@
 支持 **Hermes**、**OpenAI Codex CLI** 和 **Pi**。没有代理、没有云端、没有
 外部服务：trace 全程以纯 JSONL 留在磁盘上。
 
+> **演进方向：** agent-trace 正从 trace 查看器成长为 local-first 的
+> 可观测与评估平台 —— 统一的 canonical event schema、带一致性测试的
+> adapter 契约、本地 collector 和 Web Dashboard。v2 schema、adapter SDK、
+> v1→v2 转换器和架构决策记录见 `docs/`（`architecture.md`、`schema.md`、
+> `writing-an-adapter.md`、`decisions.md`）。上述 v1 格式不受影响，
+> 仍是三个适配器的写入格式。
+
 ## 安装
 
 在仓库根目录执行 —— 每个 agent 一条命令，外加 CLI：
@@ -49,6 +56,50 @@ agenttrace search "17*23"          # 在全部记录内容里 grep
 agenttrace sessions                # 按 session id 分组
 agenttrace stats                   # 按 agent / model 统计调用、token、错误
 ```
+
+## Dashboard
+
+```bash
+agenttrace serve --daemon          # 索引进程 + 本地 API + Web UI，后台常驻
+agenttrace serve --status          # 是否在运行、pid 是多少
+agenttrace serve --stop
+agenttrace serve                   # 前台运行（Ctrl-C 退出）
+```
+
+要「起一次，之后随时打开看」就用 `--daemon`：它通过 `scripts/serve-daemon.py`
+重新执行，用 `fork` + `setsid` 脱离当前会话（macOS 没有 `setsid(1)` 命令）。
+直接 `nohup ... &` 起的进程仍留在启动它的进程组里，会被回收进程组的一方连带
+杀掉，表现就是「页面突然连不上」。pid 写在 `~/.agenttrace/server.pid`，
+日志在 `~/.agenttrace/server.log`。
+
+把所有已知 trace 目录索引进 `~/.agenttrace/agenttrace.db`（增量、崩溃安全
+—— JSONL 始终是真源），并在 `http://127.0.0.1:8741` 启动 dashboard，
+启动日志里给出一次性 token。包含 Overview、Trace 浏览器、完整的 Trace
+详情页（执行树、waterfall、span 输入/输出/错误、token 用量）、Sessions，
+以及每个适配器「声明能力 vs 实际观测」的健康页。新 trace 通过 SSE 实时
+推送。一切留在本地：loopback 绑定、Host/Origin 检查、无 CORS、无云端。
+
+```bash
+agenttrace index                   # 一次性重建索引，输出报告
+agenttrace index --full            # 从原始归档重建全部投影
+```
+
+## 适配器
+
+内置五个：**hermes**、**codex**、**pi**，以及 **otlp**（导入/导出任何接入
+OTel 的应用）和 **langgraph**（LangChain/LangGraph callback handler）。
+
+```bash
+agenttrace adapter list            # 来源、能力、验证测试
+agenttrace adapter test langgraph  # 对内置 fixture 跑一致性校验
+agenttrace otlp import otel.json   # OTLP 导入
+agenttrace otlp export --trace <id> > otel.json   # OTLP 导出
+```
+
+能力用四级诚实声明（`supported` / `partial` / `unsupported` / `unknown`），
+dashboard 逐项展示每个适配器能看见什么、看不见什么。第三方适配器通过
+manifest 或 entry point 被发现，**发现时不导入任何代码** —— 只有显式调用
+才会执行。详见 `docs/adapters.md`。
 
 `show` 打印的是模型真正收到的 prompt：system 消息永远在第一位，每条消息都标注
 了是谁写的 —— `written by developer` 即开发者写的 system 提示词，`user input`

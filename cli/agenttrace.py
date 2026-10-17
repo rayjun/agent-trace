@@ -17,7 +17,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
+import subprocess
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -25,6 +28,11 @@ from pathlib import Path
 # in the repo and the shared helpers are reachable from there.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "common"))
 import agenttrace_common as common  # noqa: E402
+
+# Repo root, for core.* (discovery, storage) — the platform layers the `serve`
+# and `index` subcommands drive. Imported lazily by those commands; only the
+# discovery helper is needed at module level.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # Sibling modules (trace_index, panel/) live beside this file — the CLI is
 # invoked through a symlink, so resolve() first lands us back in the repo.
@@ -38,50 +46,11 @@ SCHEMA_V = common.SCHEMA_V
 # trace discovery
 # --------------------------------------------------------------------------
 
-def default_trace_dirs() -> list[Path]:
-    """Where adapters write. Each is optional; missing dirs are skipped.
-
-    Hermes is profile-aware: the active profile writes under $HERMES_HOME
-    (which is ~/.hermes/profiles/<name> when a profile is active), while the
-    default profile writes under ~/.hermes. Scan both plus the other agents'
-    conventional locations.
-    """
-    home = Path.home()
-    candidates: list[Path] = []
-
-    if os.environ.get("AGENTTRACE_HOME"):
-        candidates.append(Path(os.environ["AGENTTRACE_HOME"]))
-
-    hermes_homes = [home / ".hermes"]
-    if os.environ.get("HERMES_HOME"):
-        hermes_homes.insert(0, Path(os.environ["HERMES_HOME"]))
-    for hh in hermes_homes:
-        candidates.append(hh / "traces")
-        # every named profile too, so traces from all profiles show up
-        profiles = hh / "profiles"
-        if profiles.is_dir():
-            for p in sorted(profiles.iterdir()):
-                if p.is_dir():
-                    candidates.append(p / "traces")
-
-    candidates += [home / ".codex" / "traces",
-                   # Pi's own dir (PI_CODING_AGENT_DIR) wins: the adapter
-                   # writes under ~/.pi/agent/traces, and ~/.pi/traces alone
-                   # silently hid every pi record from the CLI.
-                   home / ".pi" / "agent" / "traces",
-                   home / ".pi" / "traces",
-                   home / ".agent-trace"]
-
-    out, seen = [], set()
-    for c in candidates:
-        try:
-            r = c.expanduser().resolve()
-        except OSError:
-            continue
-        if r not in seen and r.is_dir():
-            seen.add(r)
-            out.append(r)
-    return out
+# Discovery rules (profile-aware hermes homes, the two pi locations, ...) now
+# live in core/storage/discovery.py — the indexer is their primary consumer and
+# there must be exactly one copy. Re-exported here so existing imports keep
+# working.
+from core.storage.discovery import default_trace_dirs  # noqa: E402,F401
 
 
 def iter_records(dirs: list[Path]):
@@ -594,6 +563,61 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument("--all-sessions", action="store_true",
                          help="show every session instead of only the current one")
     _dirs(p_watch)
+
+    # Platform commands (M2): no shared record filters — they operate on the
+    # store, not on raw v1 records.
+    p_serve = sub.add_parser("serve", help="local dashboard: indexer + HTTP API + web UI")
+    p_serve.add_argument("--host", default=os.environ.get("AGENTTRACE_HOST", "127.0.0.1"))
+    p_serve.add_argument("--port", type=int,
+                         default=int(os.environ.get("AGENTTRACE_PORT", "8741")))
+    p_serve.add_argument("--db", type=Path, default=None,
+                         help="SQLite path (default: ~/.agenttrace/agenttrace.db)")
+    p_serve.add_argument("--interval", type=float, default=1.0,
+                         help="trace-dir scan interval seconds")
+    p_serve.add_argument("--verbose", action="store_true")
+    p_serve.add_argument("--daemon", action="store_true",
+                         help="detach and keep running (survives this shell); "
+                              "writes ~/.agenttrace/server.pid + server.log")
+    p_serve.add_argument("--stop", action="store_true",
+                         help="stop a daemon started with --daemon")
+    p_serve.add_argument("--status", action="store_true",
+                         help="report whether a daemon is running")
+    _dirs(p_serve)
+
+    p_index = sub.add_parser("index", help="one-shot (re)index of trace files into SQLite")
+    p_index.add_argument("--db", type=Path, default=None)
+    p_index.add_argument("--full", action="store_true",
+                         help="rebuild projections from the raw archive")
+    _dirs(p_index)
+
+    # Adapter ecosystem (M4): discovery + conformance, no shared filters.
+    p_adapter = sub.add_parser("adapter", help="list / inspect / test adapters")
+    adapter_sub = p_adapter.add_subparsers(dest="adapter_cmd", required=True)
+    p_al = adapter_sub.add_parser("list", help="every known adapter, with source")
+    p_al.add_argument("--json", action="store_true")
+    p_at = adapter_sub.add_parser(
+        "test",
+        help="run the conformance kit over an event stream, or an adapter's "
+             "shipped fixture")
+    p_at.add_argument("target", help="events.jsonl path, or an adapter id")
+    p_at.add_argument("--adapter", default=None,
+                      help="adapter id for the capability cross-check")
+
+    p_otlp = sub.add_parser("otlp", help="import/export OTLP JSON (M4)")
+    otlp_sub = p_otlp.add_subparsers(dest="otlp_cmd", required=True)
+    p_oi = otlp_sub.add_parser("import", help="OTLP JSON file -> trace dirs")
+    p_oi.add_argument("file", type=Path)
+    p_oi.add_argument("--adapter", default=None,
+                      help="adapter_id when the payload names none")
+    p_oi.add_argument("--out", type=Path, default=None,
+                      help="output dir (default: first trace dir)")
+    _dirs(p_oi)
+    p_oe = otlp_sub.add_parser("export", help="recorded traces -> OTLP JSON")
+    p_oe.add_argument("--trace", action="append", default=[],
+                      help="trace_id (repeatable); default: recent traces")
+    p_oe.add_argument("--limit", type=int, default=20)
+    p_oe.add_argument("--db", type=Path, default=None)
+    _dirs(p_oe)
     return ap
 
 
@@ -601,6 +625,195 @@ DEFAULTS = {
     "agent": None, "model": None, "event": None, "session": None,
     "since": None, "contains": None, "limit": 40, "reverse": False,
 }
+
+
+def cmd_serve(args) -> int:
+    """Indexer + local HTTP API + dashboard. Imports are lazy: `agenttrace ls`
+    must keep starting fast and dependency-free for users who never serve."""
+    from server.main import platform_dir, serve
+
+    pid_file = platform_dir() / "server.pid"
+    if args.stop or args.status:
+        pid = None
+        try:
+            pid = int(pid_file.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            pid = None
+        alive = False
+        if pid:
+            try:
+                os.kill(pid, 0)
+                alive = True
+            except OSError:
+                alive = False
+        if args.status:
+            print(f"pid {pid or '?'} : {'running' if alive else 'not running'}")
+            print(f"pid file : {pid_file}")
+            print(f"log      : {platform_dir() / 'server.log'}")
+            return 0 if alive else 1
+        if not alive:
+            print("no running dashboard", file=sys.stderr)
+            return 1
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(50):
+            try:
+                os.kill(pid, 0)
+                time.sleep(0.1)
+            except OSError:
+                break
+        try:
+            pid_file.unlink()
+        except OSError:
+            pass
+        print(f"stopped dashboard (pid {pid})")
+        return 0
+
+    if args.daemon:
+        # Re-exec through the launcher so the server lands in its own session.
+        launcher = Path(__file__).resolve().parent.parent / "scripts" / "serve-daemon.py"
+        cmd = [sys.executable, str(launcher), "--host", args.host,
+               "--port", str(args.port), "--interval", str(args.interval)]
+        if args.db:
+            cmd += ["--db", str(args.db)]
+        cmd += [str(d) for d in args.dirs]
+        return subprocess.call(cmd)
+
+    db = args.db or Path(os.environ.get("AGENTTRACE_DB")
+                         or platform_dir() / "agenttrace.db")
+    serve(host=args.host, port=args.port, db_path=db, dirs=args.dirs,
+          scan_interval=args.interval, verbose=args.verbose)
+    return 0
+
+
+def cmd_index(args) -> int:
+    """One-shot indexing: scan once (or full rebuild) and print the report."""
+    from core.storage.indexer import Indexer
+    from core.storage.sqlite_store import TraceStore
+    from server.main import platform_dir
+    db = args.db or Path(os.environ.get("AGENTTRACE_DB")
+                         or platform_dir() / "agenttrace.db")
+    store = TraceStore(db)
+    report = (Indexer(store, args.dirs).full_rebuild() if args.full
+              else Indexer(store, args.dirs).scan_once())
+    print(json.dumps(report.__dict__, indent=2))
+    store.close()
+    return 0
+
+
+def cmd_adapter(args) -> int:
+    from adapter_sdk import compatibility, discovery
+
+    if args.adapter_cmd == "list":
+        entries = discovery.discover()
+        if args.json:
+            print(json.dumps({
+                "adapters": [e.to_dict() for e in entries],
+                "compatibility": [
+                    {"adapter_id": c.adapter_id, "target": c.target,
+                     "status": c.status, "verified_by": c.verified_by,
+                     "notes": c.notes}
+                    for c in compatibility.all_compatibility()],
+            }, indent=2))
+            return 0
+        for e in entries:
+            compat = compatibility.for_adapter(e.adapter_id)
+            caps = e.capabilities.to_dict()
+            supported = [k for k, v in caps.items() if v["level"] == "supported"]
+            partial = [k for k, v in caps.items() if v["level"] == "partial"]
+            print(f"{e.adapter_id:<12} {e.kind:<13} {e.source:<12} "
+                  f"{compat.status if compat else 'unverified'}")
+            if e.integration:
+                print(f"{'':14} {e.integration}")
+            if e.module:
+                print(f"{'':14} module: {e.module}")
+            if supported:
+                print(f"{'':14} supported: {', '.join(sorted(supported))}")
+            if partial:
+                print(f"{'':14} partial:   {', '.join(sorted(partial))}")
+        print(f"\n{len(entries)} adapter(s). "
+              f"Manifests: {discovery.manifest_dir()}")
+        print("Discovery reads metadata only; nothing is imported "
+              "until `agenttrace adapter test <id>`.")
+        return 0
+
+    # adapter test <events.jsonl | adapter_id>
+    from adapter_sdk.testing import check_stream
+
+    target = Path(args.target).expanduser()
+    adapter_id = args.adapter
+    if not target.is_file():
+        adapter_id = adapter_id or args.target
+        target = _fixture_stream_for(adapter_id)
+        if target is None:
+            print(f"no such stream file, and no fixture stream for "
+                  f"adapter {adapter_id!r}.\nProduce one: point the adapter at "
+                  "a temp file and run a small scenario, then pass the path.",
+                  file=sys.stderr)
+            return 2
+        print(f"using fixture stream: {target}")
+    report = check_stream(target, adapter_id=adapter_id)
+    print(report.render())
+    return 0 if report.ok else 1
+
+
+def _fixture_stream_for(adapter_id: str) -> Path | None:
+    """Adapter-shipped event streams under test/fixtures/adapters/."""
+    root = Path(__file__).resolve().parent.parent
+    candidate = root / "test" / "fixtures" / "adapters" / f"{adapter_id}.jsonl"
+    return candidate if candidate.is_file() else None
+
+
+def cmd_otlp(args) -> int:
+    from adapters.otlp import export_traces, import_file
+    from core.query import get_trace, list_traces
+    from core.storage.sqlite_store import TraceStore
+    from server.main import platform_dir
+
+    if args.otlp_cmd == "import":
+        events = list(import_file(args.file, args.adapter))
+        if not events:
+            print("no spans found in the payload", file=sys.stderr)
+            return 1
+        out = args.out or (args.dirs[0] if args.dirs else None)
+        if out is None:
+            print("no output dir: pass --out or a trace dir", file=sys.stderr)
+            return 2
+        out = Path(out)
+        out.mkdir(parents=True, exist_ok=True)
+        dest = out / f"otlp-import-{time.strftime('%Y%m%d')}.jsonl"
+        # Through the SDK sink, not a raw json.dumps: a foreign payload is
+        # untrusted input and must get the same validate + redact treatment as
+        # an adapter-native event (decision D7). Writing it directly would put
+        # any credential the producer happened to include on disk verbatim.
+        from adapter_sdk.event_sink import JsonlEventSink
+        sink = JsonlEventSink(dest)
+        written = sink.emit_many(events)
+        print(f"imported {written} event(s) -> {dest}")
+        if sink.write_errors:
+            print(f"{sink.write_errors} event(s) refused: "
+                  f"{'; '.join(sink.violations[:3])}", file=sys.stderr)
+        return 0 if written else 1
+
+    # export — from the RAW events, not the projection: the projection merges
+    # a span's two halves into one row, which is right for a UI and lossy for
+    # an interchange (per-half attributes, per-half timestamps).
+    db = args.db or Path(os.environ.get("AGENTTRACE_DB")
+                         or platform_dir() / "agenttrace.db")
+    store = TraceStore(db)
+    if args.trace:
+        traces = [t for t in (get_trace(store, tid) for tid in args.trace) if t]
+    else:
+        traces = [get_trace(store, t["trace_id"])
+                  for t in list_traces(store, limit=args.limit)["traces"]]
+        traces = [t for t in traces if t]
+    events = {t["trace_id"]: list(store.iter_events(t["trace_id"]))
+              for t in traces}
+    store.close()
+    if not traces:
+        print("no traces to export (run `agenttrace index` first)", file=sys.stderr)
+        return 1
+    print(json.dumps(export_traces(traces, events), ensure_ascii=False))
+    return 0
 
 
 def cmd_watch(args) -> int:
@@ -630,7 +843,9 @@ def main(argv=None) -> int:
     for k, v in DEFAULTS.items():
         if not hasattr(args, k):
             setattr(args, k, v)
-    if not args.dirs:
+    # `adapter list` / `adapter test` do not take trace dirs; only the
+    # commands that scan traces declare them.
+    if not getattr(args, "dirs", None):
         args.dirs = default_trace_dirs()
     else:
         args.dirs = [d.expanduser().resolve() for d in args.dirs]
@@ -638,6 +853,8 @@ def main(argv=None) -> int:
     return {
         "ls": cmd_ls, "show": cmd_show, "search": cmd_search,
         "sessions": cmd_sessions, "stats": cmd_stats, "watch": cmd_watch,
+        "serve": cmd_serve, "index": cmd_index,
+        "adapter": cmd_adapter, "otlp": cmd_otlp,
     }[args.cmd](args)
 
 

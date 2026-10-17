@@ -4,6 +4,22 @@
 # locate the session by the exact prompt, like e2e-hermes.sh).
 # Skips (exit 0) when pi or the extension is not installed.
 set -uo pipefail
+
+# Count trace records without relying on glob success or `wc` reading empty
+# stdin. The previous form — `cat "$DIR"/*.jsonl | wc -l || echo 0` — printed
+# "0\n0" whenever no file existed yet: `wc` counted zero lines AND the `||`
+# fired because `cat` failed, so the two-line value then made
+# `[ "$after" -le "$before" ]` error out ("integer expression expected") and
+# the gate silently stopped gating.
+count_records() {
+  local dir="$1" total=0 f
+  for f in "$dir"/*.jsonl; do
+    [ -f "$f" ] || continue
+    total=$(( total + $(wc -l < "$f") ))
+  done
+  printf '%s' "$total"
+}
+
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 TRACE_DIR="$HOME/.pi/agent/traces"
@@ -32,15 +48,42 @@ PI_ARGS=()
 # below cannot find this run's own session. Give the test call a clean session.
 unset PI_SESSION_FILE PI_SESSION_ID
 
-before=$(cat "$TRACE_DIR"/*.jsonl 2>/dev/null | wc -l)
+before=$(count_records "$TRACE_DIR")
 
-if ! timeout 240 pi "${PI_ARGS[@]}" -p "$PROMPT" >/dev/null 2>&1; then
+# A command must never be able to hang the suite or the installer, but
+# `timeout` is GNU coreutils and is ABSENT on stock macOS — where its absence
+# made this script report "pi -p exited non-zero" for a pi that never ran.
+# The watchdog below is dependency-free; it returns the command's own exit
+# status, and kills the command if it overruns.
+run_with_timeout() {
+  local secs="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"; return $?
+  fi
+  if command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$secs" "$@"; return $?
+  fi
+  "$@" &
+  local cmd_pid=$!
+  ( sleep "$secs"; kill -TERM "$cmd_pid" 2>/dev/null ) >/dev/null 2>&1 &
+  local watchdog=$!
+  local rc=0
+  wait "$cmd_pid" || rc=$?
+  kill -TERM "$watchdog" 2>/dev/null || true
+  wait "$watchdog" 2>/dev/null || true
+  return $rc
+}
+
+# ${PI_ARGS[@]+...}: bash 3.2 (macOS /bin/bash) treats "${PI_ARGS[@]}" on an
+# empty array as unbound under `set -u`. The expansion guard is the portable
+# form and a no-op on newer bash.
+if ! run_with_timeout 240 pi ${PI_ARGS[@]+"${PI_ARGS[@]}"} -p "$PROMPT" >/dev/null 2>&1; then
   echo "FAIL — pi -p exited non-zero (model=${PI_E2E_MODEL:-default}; pass PI_E2E_MODEL if the default is unavailable)"
   exit 1
 fi
 sleep 1
 
-after=$(cat "$TRACE_DIR"/*.jsonl 2>/dev/null | wc -l)
+after=$(count_records "$TRACE_DIR")
 if [ "$after" -le "$before" ]; then
   echo "FAIL — no new records (before=$before after=$after)"
   exit 1

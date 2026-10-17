@@ -10,11 +10,30 @@
  * and the exact response after.
  *
  * Events used (see packages/coding-agent/src/core/extensions/types.ts):
+ *   turn_start             -> turnIndex, the id every record in a turn carries
  *   before_provider_request -> the outbound payload (full messages + tools)
  *   after_provider_response -> HTTP status, before the stream is consumed
  *   message_end            -> finalized assistant message incl. tool calls
  *   tool_execution_end     -> tool result
  *   turn_end / agent_end   -> turn boundaries
+ *
+ * `turn_id` and `request_id` are load-bearing and were MISSING until the v2
+ * pipeline exposed it. Pi's own events carry neither: `turn_start` has an
+ * index, `before_provider_request` has only a payload, and the response id
+ * (`msg.responseId`) only exists AFTER the call. Without a request_id the
+ * reader could not pair a pi `llm_request` with its `llm_response` at all —
+ * `agenttrace show <request_id>` silently found nothing for pi, and the v2
+ * converter minted two unrelated spans (one unclosed start, one orphan end),
+ * which the conformance kit rejected. The adapter therefore synthesises a
+ * request id per provider call and threads the turn index through everything,
+ * which also splits a session into per-turn traces instead of one blob.
+ *
+ * Event ORDER (measured with a probe extension, Pi 1.3.0) — the pairing below
+ * depends on it:
+ *   session_start, agent_start, turn_start(turnIndex=0), message_end(system),
+ *   message_end(user), before_provider_request, after_provider_response,
+ *   message_end(assistant), tool_execution_start/end, message_end(toolResult),
+ *   turn_end, turn_start(1), ...
  *
  * Privacy: content is written in cleartext to a local file. Nothing leaves the
  * machine. Set AGENTTRACE_CAPTURE=metadata to drop message bodies.
@@ -64,6 +83,8 @@ interface ExtensionEvent {
 	toolName?: string;
 	toolCallId?: string;
 	args?: unknown;
+	/** tool_execution_end — the tool's return value (see toolResultText). */
+	result?: unknown;
 	isError?: boolean;
 	durationMs?: number;
 }
@@ -147,6 +168,37 @@ function contentToText(content: unknown): string {
 			.join("\n");
 	}
 	return String(content);
+}
+
+/**
+ * The tool's output as displayable text.
+ *
+ * `tool_execution_end.result` is normally `{content:[{type:"text",text}], …}`
+ * (measured on Pi 1.3.0), so `contentToText` covers the common case; the
+ * fallbacks handle a tool that returns a bare string or `{output}` payload.
+ * Until this existed the adapter stored a tool result with NO body at all —
+ * the panel showed `⚙ bash ok` and nothing about what the command printed,
+ * which is the single most useful thing in a coding trace.
+ */
+function toolResultText(result: unknown): string {
+	if (result == null) return "";
+	if (typeof result === "string") return result;
+	const obj = result as any;
+	if (Array.isArray(obj.content)) {
+		const text = contentToText(obj.content);
+		if (text) return text;
+	}
+	if (typeof obj.output === "string") return obj.output;
+	if (typeof obj.text === "string") return obj.text;
+	const text = contentToText(obj);
+	return text === "[object Object]" ? "" : text;
+}
+
+/** A shell tool's exit code when the result carries one (bash sets it). */
+function toolExitCode(result: unknown): number | undefined {
+	const sc = (result as any)?.structuredContent;
+	const code = sc?.exit_code ?? (result as any)?.exit_code;
+	return typeof code === "number" ? Math.trunc(code) : undefined;
 }
 
 function shapeMessages(messages: unknown): any[] {
@@ -243,6 +295,23 @@ export default function agentTrace(pi: ExtensionHost) {
 	let provider: string | undefined;
 	let apiMode: string | undefined;
 
+	// Turn/request identity. `turnIndex` is Pi's own and starts at 0 for the
+	// first assistant turn; `requestSeq` counts provider calls so a retry (or a
+	// context-overflow re-request) inside one turn gets a distinct id instead
+	// of overwriting the previous one's pairing.
+	let turnIndex: number | undefined;
+	let requestSeq = 0;
+	/**
+	 * request_id of the provider call this turn is currently on. Kept for the
+	 * WHOLE turn, not cleared when the response arrives: the tool calls that
+	 * response asked for execute after it, and a tool that names no request is
+	 * harder to attribute than one that does. Reset at the next `turn_start`,
+	 * so a retry inside a turn still overwrites it and the response pairs with
+	 * the most recent attempt.
+	 */
+	let turnRequestId: string | undefined;
+	const currentTurnId = () => (turnIndex === undefined ? undefined : String(turnIndex));
+
 	pi.on("session_start", (event, ctx) => {
 		sessionFile = pickSessionId(ctx);
 		emit({
@@ -254,7 +323,10 @@ export default function agentTrace(pi: ExtensionHost) {
 		});
 	});
 
-	pi.on("turn_start", (_event, ctx) => {
+	pi.on("turn_start", (event: any, ctx) => {
+		if (typeof event?.turnIndex === "number") turnIndex = event.turnIndex;
+		requestSeq = 0;
+		turnRequestId = undefined;
 		const m = ctx?.model;
 		if (m) {
 			model = typeof m === "string" ? m : m.id;
@@ -285,9 +357,16 @@ export default function agentTrace(pi: ExtensionHost) {
 				: typeof payload?.instructions === "string"
 					? payload.instructions
 					: null;
+		requestSeq += 1;
+		// Unique per session and stable enough to be grepped by eye; the
+		// session is prepended because `agenttrace show` searches all files.
+		const requestId = `pi-${turnIndex ?? 0}-${requestSeq}`;
+		turnRequestId = requestId;
 		emit({
 			event: "llm_request",
 			session_id: sessionFile,
+			request_id: requestId,
+			turn_id: currentTurnId(),
 			model,
 			provider,
 			api_mode: apiMode ?? payload?.api,
@@ -307,12 +386,37 @@ export default function agentTrace(pi: ExtensionHost) {
 	});
 
 	pi.on("after_provider_response", (event) => {
+		const status = event?.status;
+		const requestId = turnRequestId;
+		if (typeof status === "number" && status >= 400) {
+			// A structured failure, not free text: this is the one HTTP-level
+			// error the extension can actually observe, and it used to be a
+			// `note` that no reader could filter on.
+			emit({
+				event: "llm_error",
+				session_id: sessionFile,
+				request_id: requestId,
+				turn_id: currentTurnId(),
+				model,
+				provider,
+				error: {
+					type: status >= 500 ? "provider_error" : "provider_rejected",
+					message: `provider responded status=${status}`,
+					status_code: status,
+					// 429 and 5xx are the retryable classes; 4xx otherwise is not.
+					retryable: status === 429 || status >= 500,
+				},
+			});
+			return;
+		}
 		emit({
 			event: "note",
 			session_id: sessionFile,
+			request_id: requestId,
+			turn_id: currentTurnId(),
 			model,
 			provider,
-			note: `provider_response status=${event?.status ?? "?"}`,
+			note: `provider_response status=${status ?? "?"}`,
 		});
 	});
 
@@ -326,6 +430,9 @@ export default function agentTrace(pi: ExtensionHost) {
 			emit({
 				event: "user_prompt",
 				session_id: sessionFile,
+				// turn_start fires BEFORE the user message (measured), so the
+				// prompt belongs to the turn that is about to run.
+				turn_id: currentTurnId(),
 				model,
 				cwd: ctx?.cwd,
 				request: { messages: shapeMessages([msg]) },
@@ -339,10 +446,16 @@ export default function agentTrace(pi: ExtensionHost) {
 		emit({
 			event: "llm_response",
 			session_id: sessionFile,
+			request_id: turnRequestId,
+			turn_id: currentTurnId(),
 			model,
 			provider,
 			api_mode: apiMode,
 			duration_ms: typeof msg.durationMs === "number" ? Math.trunc(msg.durationMs) : undefined,
+			// Pi's own provider response id is kept for cross-referencing an
+			// upstream log; it is NOT the pairing key because it does not exist
+			// at request time.
+			note: typeof msg.responseId === "string" ? `response_id=${msg.responseId}` : undefined,
 			response: {
 				content: captureMode() === "metadata" ? null : truncate(text),
 				reasoning: captureMode() === "metadata" ? null : undefined,
@@ -365,6 +478,8 @@ export default function agentTrace(pi: ExtensionHost) {
 		emit({
 			event: "tool_call",
 			session_id: sessionFile,
+			request_id: turnRequestId,
+			turn_id: currentTurnId(),
 			model,
 			cwd: ctx?.cwd,
 			tool: {
@@ -376,18 +491,34 @@ export default function agentTrace(pi: ExtensionHost) {
 	});
 
 	pi.on("tool_execution_end", (event, ctx) => {
+		const meta = captureMode() === "metadata";
+		const exitCode = toolExitCode(event?.result);
 		emit({
 			event: "tool_result",
 			session_id: sessionFile,
+			request_id: turnRequestId,
+			turn_id: currentTurnId(),
 			model,
 			cwd: ctx?.cwd,
 			tool: {
 				name: event?.toolName,
 				call_id: event?.toolCallId,
 				status: event?.isError ? "error" : "ok",
+				exit_code: exitCode,
+			},
+			response: {
+				content: meta ? null : truncate(toolResultText(event?.result)),
 			},
 			duration_ms: typeof event?.durationMs === "number" ? Math.trunc(event.durationMs) : undefined,
 		});
+	});
+
+	// Turn boundary: clears the request id so a tool event that arrives after
+	// turn_end (there should be none) cannot claim the previous turn's call.
+	pi.on("turn_end", (event: any) => {
+		requestSeq = 0;
+		turnRequestId = undefined;
+		if (event?.turnIndex !== undefined) turnIndex = event.turnIndex;
 	});
 
 	pi.on("agent_end", (_event, ctx) => {

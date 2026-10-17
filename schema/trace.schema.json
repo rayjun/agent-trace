@@ -110,7 +110,11 @@
         "name": { "type": "string" },
         "call_id": { "type": "string" },
         "args": { "type": ["object", "array", "string", "null"] },
-        "status": { "type": "string" }
+        "status": { "type": "string" },
+        "exit_code": {
+          "type": ["integer", "null"],
+          "description": "process exit code when the tool ran a command; null/absent when it did not report one"
+        }
       }
     },
 

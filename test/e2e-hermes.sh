@@ -6,6 +6,22 @@
 # bare `hermes` (the default profile, which has no plugin) reports "no new
 # records" no matter how healthy the adapter is. Override with AGENTTRACE_PROFILE.
 set -euo pipefail
+
+# Count trace records without relying on glob success or `wc` reading empty
+# stdin. The previous form — `cat "$DIR"/*.jsonl | wc -l || echo 0` — printed
+# "0\n0" whenever no file existed yet: `wc` counted zero lines AND the `||`
+# fired because `cat` failed, so the two-line value then made
+# `[ "$after" -le "$before" ]` error out ("integer expression expected") and
+# the gate silently stopped gating.
+count_records() {
+  local dir="$1" total=0 f
+  for f in "$dir"/*.jsonl; do
+    [ -f "$f" ] || continue
+    total=$(( total + $(wc -l < "$f") ))
+  done
+  printf '%s' "$total"
+}
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROFILE="${AGENTTRACE_PROFILE:-default}"
 
@@ -24,10 +40,12 @@ if [ ! -f "$HERMES_HOME_DIR/plugins/agent-trace/__init__.py" ]; then
   exit 0
 fi
 
-before=$(cat "$TRACES"/*.jsonl 2>/dev/null | wc -l || echo 0)
-hermes "${HERMES_ARGS[@]}" chat -q "Reply with exactly: E2E-OK" >/dev/null 2>&1
+before=$(count_records "$TRACES")
+# ${HERMES_ARGS[@]+...}: portable empty-array expansion — bash 3.2 (macOS)
+# errors on "${HERMES_ARGS[@]}" under `set -u` when the array is empty.
+hermes ${HERMES_ARGS[@]+"${HERMES_ARGS[@]}"} chat -q "Reply with exactly: E2E-OK" >/dev/null 2>&1
 sleep 1
-after=$(cat "$TRACES"/*.jsonl 2>/dev/null | wc -l || echo 0)
+after=$(count_records "$TRACES")
 
 if [ "$after" -le "$before" ]; then
   echo "FAIL — hermes produced no new trace records (before=$before after=$after)"

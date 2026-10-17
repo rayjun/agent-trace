@@ -9,6 +9,14 @@ live in a side panel while the agent runs.
 Works with **Hermes**, **OpenAI Codex CLI** and **Pi**. No proxy, no cloud, no
 external service: traces stay on disk as plain JSONL.
 
+> **Where this is going:** agent-trace is growing from a trace viewer into a
+> local-first observability & evaluation platform — one canonical event
+> schema, an adapter contract with a conformance kit, a local collector,
+> and a web dashboard. The v2 schema, adapter SDK, v1→v2 converter and the
+> architecture decisions are in `docs/` (`architecture.md`, `schema.md`,
+> `writing-an-adapter.md`, `decisions.md`). The v1 format above is untouched
+> and remains what all three adapters write.
+
 ## Install
 
 Run from the repo root — one command per agent, plus the CLI:
@@ -52,6 +60,54 @@ agenttrace search "17*23"          # grep across all record content
 agenttrace sessions                # group by session id
 agenttrace stats                   # calls / tokens / errors per agent and model
 ```
+
+## The dashboard
+
+```bash
+agenttrace serve --daemon          # indexer + local API + web UI, detached
+agenttrace serve --status          # is it running? which pid?
+agenttrace serve --stop
+agenttrace serve                   # foreground (Ctrl-C to stop)
+```
+
+`--daemon` is the one to use for "start it once, look at it later". It re-execs
+through `scripts/serve-daemon.py`, which detaches into its own session
+(`fork` + `setsid`; macOS has no `setsid(1)`). A plain `nohup ... &` stays in
+the launcher's process group and is taken down by whatever reaps that group —
+the symptom is a page that suddenly cannot connect. The pid is written to
+`~/.agenttrace/server.pid`, the log to `~/.agenttrace/server.log`.
+
+indexes all known trace dirs into `~/.agenttrace/agenttrace.db` (incremental,
+crash-safe — JSONL stays the source of truth) and serves a dashboard on
+`http://127.0.0.1:8741` with a one-time token in the startup line. Overview,
+trace explorer, a full trace detail (execution tree, waterfall, span
+input/output/errors, token usage), sessions, and per-adapter capability vs.
+observed-data health. Updates live over SSE as agents write new traces.
+Everything is local: loopback bind, Host/Origin checks, no CORS, no cloud.
+
+```bash
+agenttrace index                   # one-shot reindex, prints the report
+agenttrace index --full            # rebuild projections from the raw archive
+```
+
+## Adapters
+
+Five adapters ship: **hermes**, **codex**, **pi**, plus **otlp** (import and
+export any OTel-instrumented app) and **langgraph** (LangChain/LangGraph
+callback handler).
+
+```bash
+agenttrace adapter list            # source, capabilities, verified-by test
+agenttrace adapter test langgraph  # conformance kit over the shipped fixture
+agenttrace otlp import otel.json   # OTLP in
+agenttrace otlp export --trace <id> > otel.json   # OTLP out
+```
+
+Capabilities are declared honestly at four levels (`supported` / `partial` /
+`unsupported` / `unknown`) and the dashboard shows what each adapter can and
+cannot see. Third-party adapters are discovered from manifests or entry
+points **without importing them** — code runs only when you explicitly ask.
+See `docs/adapters.md`.
 
 `show` prints the prompt as the model actually received it: one system message
 first, every message marked with who wrote it. The adapters store the system

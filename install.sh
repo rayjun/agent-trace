@@ -15,6 +15,28 @@
 # duration-unit fix ended up "fixed" in git while the live traces kept writing
 # floats.
 set -uo pipefail
+
+# Portable timeout. `timeout` is GNU coreutils and is ABSENT on stock macOS,
+# where its absence silently turned the hermes-enable step into a no-op that
+# reported failure. Returns the command's own exit status; kills it on overrun.
+run_with_timeout() {
+  local secs="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"; return $?
+  fi
+  if command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$secs" "$@"; return $?
+  fi
+  "$@" &
+  local cmd_pid=$!
+  ( sleep "$secs"; kill -TERM "$cmd_pid" 2>/dev/null ) >/dev/null 2>&1 &
+  local watchdog=$!
+  local rc=0
+  wait "$cmd_pid" || rc=$?
+  kill -TERM "$watchdog" 2>/dev/null || true
+  wait "$watchdog" 2>/dev/null || true
+  return $rc
+}
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 install_hermes() {
@@ -53,11 +75,17 @@ install_hermes() {
   if command -v hermes >/dev/null 2>&1; then
     local flag=()
     [ "$name" != "default" ] && flag=(--profile "$name")
-    # </dev/null + timeout: an installer must never block waiting for input.
+    # </dev/null + a timeout: an installer must never block waiting for input.
     # `hermes plugins enable` has been observed to prompt when the plugin was
     # already enabled, which hung the e2e suite on a prompt nobody was there
     # to answer.
-    timeout 30 hermes "${flag[@]}" plugins enable agent-trace </dev/null >/dev/null 2>&1 \
+    #
+    # `timeout` is GNU coreutils and is ABSENT on stock macOS, where this
+    # silently took the `|| echo` branch and reported an enable failure for an
+    # enable that never ran. `run_with_timeout` is dependency-free.
+    # ${flag[@]+...}: bash 3.2 treats "${flag[@]}" on an empty array as
+    # unbound under `set -u`.
+    run_with_timeout 30 hermes ${flag[@]+"${flag[@]}"} plugins enable agent-trace </dev/null >/dev/null 2>&1 \
       && echo "  enabled (profile=$name)" \
       || echo "  ! enable failed; run: hermes ${flag[*]:-} plugins enable agent-trace"
   fi

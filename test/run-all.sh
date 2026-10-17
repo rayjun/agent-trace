@@ -18,6 +18,17 @@ run "trace index"              python3 test/index.test.py
 run "show request format"      python3 test/show-format.test.py
 run "system prompt stored once" python3 test/system-prompt-once.test.py
 run "cache hit rate <=100%"    python3 test/cache-rate.test.py
+run "v2 canonical schema"     python3 test/v2_schema.test.py
+run "v1 -> v2 converter"      python3 test/v2_convert.test.py
+run "adapter conformance kit" python3 test/conformance.test.py
+run "sqlite store + indexer"  python3 test/storage.test.py
+run "query service layer"     python3 test/query.test.py
+run "local http server"       python3 test/server.test.py
+run "datasets + evaluators + experiments" python3 test/evaluation.test.py
+run "otlp import/export"     python3 test/otlp.test.py
+run "langgraph callback adapter" python3 test/langgraph.test.py
+run "adapter discovery + matrix" python3 test/discovery.test.py
+run "M4 review regressions"   python3 test/review-fixes.test.py
 run "pi adapter"            node    test/pi-adapter.test.mjs
 run "watch TUI (pty)"       python3 test/watch-tui.test.py
 if [ "${SKIP_E2E:-0}" != "1" ]; then
