@@ -178,15 +178,3 @@ cd pi && npm ci && npm run typecheck
 the two end-to-end tests, and `test/review-fixes.test.py`, which holds every
 finding from the review rounds — including the ones the fixes themselves
 introduced. CI runs lint, types and the suite on every push.
-
-## Docs
-
-| | |
-|---|---|
-| [architecture.md](docs/architecture.md) | the six layers and the boundaries between them |
-| [schema.md](docs/schema.md) | the canonical event model, field by field |
-| [usage.md](docs/usage.md) | every flag, filter, environment variable and file path |
-| [adapters.md](docs/adapters.md) | the five adapters, capabilities, coverage, recovery |
-| [writing-an-adapter.md](docs/writing-an-adapter.md) | how to add one, and how it will be checked |
-| [examples.md](docs/examples.md) | runnable starting points |
-| [decisions.md](docs/decisions.md) | every architectural decision, with its reasoning |

@@ -130,15 +130,3 @@ cd pi && npm ci && npm run typecheck
 ```
 
 约 29 个测试文件：每个适配器的 fixture、一致性测试工具、Dashboard 路由测试、两个端到端测试，以及 `test/review-fixes.test.py` —— 它保存了各轮 review 的全部发现，**包括那些由修复本身引入的问题**。CI 在每次 push 时运行 lint、类型检查和完整套件。
-
-## 文档
-
-| | |
-|---|---|
-| [architecture.md](docs/architecture.md) | 六层架构与层间边界 |
-| [schema.md](docs/schema.md) | canonical event 模型，逐字段说明 |
-| [usage.md](docs/usage.md) | 所有参数、筛选、环境变量与文件路径 |
-| [adapters.md](docs/adapters.md) | 五个适配器、能力、覆盖率、数据恢复 |
-| [writing-an-adapter.md](docs/writing-an-adapter.md) | 如何新增适配器，以及它会被如何检验 |
-| [examples.md](docs/examples.md) | 可直接运行的起步示例 |
-| [decisions.md](docs/decisions.md) | 每一个架构决策及其理由 |
