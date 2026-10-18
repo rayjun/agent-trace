@@ -140,9 +140,19 @@ def parse_rollout(path: Path, since_line: int = 0) -> tuple[int, list[dict], dic
     turn_seq = 0
     turn_key = None
     turn_usage: dict[str, dict] = {}      # turn key -> merged usage
+    #: turn key -> the newest line timestamp seen for it. A turn that never
+    #: reported `task_complete` used to be closed at the END OF THE FILE, so a
+    #: resumed rollout gave it a duration of days and the waterfall showed an
+    #: 18-hour "model call". Closing at the turn's own last event bounds it to
+    #: what was actually observed.
+    turn_last_ts: dict[str, str | None] = {}
     turn_request: dict[str, str] = {}     # turn key -> request_id
     turn_emitted: set[str] = set()
     closed_turns: set[str] = set()
+
+    def note_turn_ts(key: str | None, ts: str | None) -> None:
+        if key and ts:
+            turn_last_ts[key] = ts
 
     def open_turn(key: str | None, model, cwd, ts) -> str:
         """Register a turn and emit its llm_request exactly once."""
@@ -185,7 +195,8 @@ def parse_rollout(path: Path, since_line: int = 0) -> tuple[int, list[dict], dic
         })
         return k
 
-    def close_turn(key: str, model, content, ts) -> bool:
+    def close_turn(key: str, model, content, ts, duration_ms=None,
+                   measured: bool = True) -> bool:
         """Emit the turn's llm_response: usage + whatever text is observable.
 
         Returns True when the turn carried usage, so the caller knows whether
@@ -208,7 +219,17 @@ def parse_rollout(path: Path, since_line: int = 0) -> tuple[int, list[dict], dic
             "request_id": request_id,
             "model": model or meta["model"],
             **({"ts": ts} if ts else {}),
-            "note": "usage_only=true" if content is None else None,
+            # Codex measures the TURN, not the call, so this is NOT written as
+            # the span's `duration_ms`: doing that reported one turn's duration
+            # as every call's latency, and a turn with two calls then counted
+            # twice as much work as it contained. It travels under its own name
+            # so a reader can see codex's own number without it being mistaken
+            # for a model latency.
+            **({"turn_duration_ms": duration_ms} if measured and duration_ms else {}),
+            "note": ("usage_only=true" if content is None
+                     else ("turn_incomplete=true (no task_complete; duration is "
+                           "the log gap, not a measured latency)" if not measured
+                           else None)),
             "response": response,
             "source_file": str(path),
         })
@@ -296,6 +317,7 @@ def parse_rollout(path: Path, since_line: int = 0) -> tuple[int, list[dict], dic
                     elif turn_key is None:
                         turn_key = open_turn(turn_id, meta["model"], meta["cwd"],
                                              None)
+                    note_turn_ts(turn_key, pending_ts)
                     records.append({
                         "event": "user_prompt",
                         "session_id": meta["session_id"],
@@ -321,6 +343,7 @@ def parse_rollout(path: Path, since_line: int = 0) -> tuple[int, list[dict], dic
                 elif ptype == "task_complete":
                     dur = payload.get("duration_ms")
                     last_message = payload.get("last_agent_message")
+                    note_turn_ts(turn_key, pending_ts)
                     records.append({
                         "event": "assistant_message",
                         "session_id": meta["session_id"],
@@ -335,7 +358,8 @@ def parse_rollout(path: Path, since_line: int = 0) -> tuple[int, list[dict], dic
                     # Codex reported as this turn's output. Without this the
                     # usage had nowhere to live that a reader could reach.
                     close_turn(turn_key or (turn_id or "turn0"), meta["model"],
-                               last_message, None)
+                               last_message, None,
+                               duration_ms=dur if isinstance(dur, int) else None)
                 continue
 
             if rtype == "response_item":
@@ -399,7 +423,10 @@ def parse_rollout(path: Path, since_line: int = 0) -> tuple[int, list[dict], dic
     for key in sorted(set(turn_usage) | set(turn_request)):
         # close_turn owns the usage pop; popping here too silently emptied the
         # response it then emitted.
-        if not close_turn(key, meta["model"], None, pending_ts):
+        # `measured=False`: this turn's end is the file's end, not the call's
+        # return, so no duration is claimed.
+        if not close_turn(key, meta["model"], None,
+                          turn_last_ts.get(key) or pending_ts, measured=False):
             continue
         records.append({
             "event": "note",

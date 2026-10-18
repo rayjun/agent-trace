@@ -42,7 +42,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from core.query import get_trace, list_adapters, list_sessions, list_traces, overview
 from core.storage.indexer import Indexer, ScanReport
@@ -430,6 +430,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(trace)
         elif path == "/api/sessions":
             self._send_json(list_sessions(store, limit=_int(qs, "limit", 100)))
+        elif path.startswith("/api/sessions/"):
+            # A session is a CONVERSATION: its turns, each with its own duration.
+            # A trace is one turn, so this is the only place the per-turn time is
+            # visible at all.
+            from core.query import session_detail
+            detail = session_detail(
+                store, unquote(path[len("/api/sessions/"):]))
+            self._send_json(detail if detail is not None
+                            else {"error": "session not found"},
+                            200 if detail is not None else 404)
         elif path == "/api/adapters":
             self._send_json(list_adapters(
                 store, index_ready=self.state.scans_completed > 0))

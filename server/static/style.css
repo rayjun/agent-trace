@@ -110,3 +110,23 @@ pre.body { background: var(--bg); border: 1px solid var(--border); border-radius
 a { color: var(--llm); }
 .cap-table td:first-child { font-family: ui-monospace, monospace; }
 .note { color: var(--dim); font-size: 11px; }
+
+/* Per-turn timing: a bar per turn, and the same turns on the session's wall
+   clock. The table carries the exact numbers; these carry the shape. */
+.turn-row { display: grid; grid-template-columns: 28px 1fr 72px 56px 1fr;
+            align-items: center; gap: 8px; padding: 2px 0; cursor: pointer;
+            border-bottom: 1px solid #21262d; height: 22px; }
+.turn-row:hover { background: #1c2129; }
+.turn-idx { text-align: right; font-size: 11px; }
+.turn-bar-wrap { background: #1c2129; border-radius: 3px; height: 12px; }
+.turn-bar { display: block; height: 12px; border-radius: 3px; background: var(--llm); opacity: .8; }
+.turn-bar.error { background: var(--error); }
+.turn-bar.incomplete { background: repeating-linear-gradient(45deg, #8b949e, #8b949e 3px, #30363d 3px, #30363d 6px); }
+.turn-dur { font-size: 11px; text-align: right; }
+.turn-share { font-size: 11px; text-align: right; }
+.turn-meta { font-size: 11px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.wall-strip { position: relative; height: 26px; background: #1c2129;
+              border-radius: 4px; overflow: hidden; }
+.wall-block { position: absolute; top: 3px; height: 20px; background: var(--llm);
+              opacity: .75; border-radius: 2px; }
+.wall-block.error { background: var(--error); }

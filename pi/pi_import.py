@@ -321,6 +321,12 @@ def build_records(path: Path, header: dict | None,
         "note": "backfill=session reason=recovered-from-transcript",
     }]
     transcript: list[dict] = []          # the conversation, in order
+    # The PREVIOUS entry's timestamp: the message that triggered the request
+    # being built. Updated in exactly one place below, because setting it inside
+    # each branch is how the first turn's request ended up with no trigger at
+    # all and, before that, how both halves of a span ended up with one
+    # timestamp and a duration of zero.
+    prev_ts: str | None = None
     system_prompt: str | None = None
     model: str | None = None
     provider: str | None = None
@@ -346,6 +352,9 @@ def build_records(path: Path, header: dict | None,
         msg = entry.get("message")
         if not isinstance(msg, dict):
             continue
+        # This entry triggers whatever request comes next; the previous one is
+        # the trigger of THIS request.
+        trigger_ts, prev_ts = prev_ts, ts
         role = msg.get("role")
         if msg.get("model"):
             model = msg["model"]
@@ -392,14 +401,23 @@ def build_records(path: Path, header: dict | None,
                 "provider": provider,
                 "api_mode": api_mode,
                 "cwd": cwd,
-                "ts": ts,
+                # The REQUEST is stamped with the entry that triggered it, not
+                # with the response that answered it. Both halves used to take
+                # the assistant entry's timestamp, so every llm span's duration
+                # was exactly 0 — and the time a model call took is the number a
+                # reader comes to this view for. Pi does not log the call's start,
+                # so the triggering message is the best anchor there is; that it
+                # is an approximation is recorded below.
+                "ts": trigger_ts or ts,
                 "request": _truncate({
                     "messages": _shape_messages(transcript),
                     "system_prompt": system_prompt,
                     "message_count": len(transcript),
                 }),
                 "note": "backfill=session (request rebuilt from the transcript; "
-                        "Pi does not persist the wire payload)",
+                        "Pi does not persist the wire payload; request_time="
+                        + ("trigger-entry" if trigger_ts else "response-entry")
+                        + ")",
             })
             calls = _tool_calls(msg.get("content"))
             response: dict = {

@@ -554,6 +554,17 @@ def build_parser() -> argparse.ArgumentParser:
     _dirs(_add("sessions", help="group records by session id"))
     _dirs(_add("stats", help="calls/tokens/errors per agent and model"))
 
+    p_session = _add(
+        "session",
+        help="one conversation: every turn with its own duration (a trace is "
+             "ONE turn, so this is where per-turn time lives)")
+    p_session.add_argument("session_id",
+                           help="session id, or the trailing part of it")
+    p_session.add_argument("--failing-only", action="store_true",
+                           help="list only the turns that have a failed span")
+    p_session.add_argument("--db", type=Path, default=None)
+    _dirs(p_session)
+
     p_watch = _add("watch", help="live full-screen panel of LLM traffic")
     p_watch.add_argument("--no-follow", action="store_true",
                          help="print current contents and exit (no TUI)")
@@ -859,6 +870,90 @@ def _fixture_stream_for(adapter_id: str) -> Path | None:
     return candidate if candidate.is_file() else None
 
 
+def _fmt_ms(ms: int | None) -> str:
+    if ms is None:
+        return "—"
+    if ms < 1000:
+        return f"{ms}ms"
+    if ms < 60_000:
+        return f"{ms / 1000:.1f}s"
+    if ms < 3_600_000:
+        return f"{ms / 60_000:.1f}m"
+    return f"{ms / 3_600_000:.1f}h"
+
+
+def cmd_session(args) -> int:
+    """Per-turn timing for one conversation, from the index."""
+    from core.query import session_detail
+    from core.storage.indexer import Indexer
+    from core.storage.sqlite_store import TraceStore
+    from server.main import platform_dir
+
+    db = args.db or Path(os.environ.get("AGENTTRACE_DB")
+                         or platform_dir() / "agenttrace.db")
+    store = TraceStore(db)
+    if not store.one("SELECT COUNT(*) AS n FROM spans")["n"]:
+        Indexer(store, args.dirs).scan_once()
+
+    # Match the whole id or its tail: these ids are long paths for pi and
+    # opaque handles for hermes, and nobody wants to paste a full path.
+    exact = store.one("SELECT DISTINCT session_id FROM spans WHERE session_id = ?",
+                      (args.session_id,))
+    sid = exact["session_id"] if exact else None
+    if sid is None:
+        like = store.query(
+            "SELECT session_id, MAX(COALESCE(end_ts, start_ts)) AS last"
+            " FROM spans WHERE session_id LIKE ?"
+            " GROUP BY session_id ORDER BY last DESC LIMIT 2",
+            (f"%{args.session_id}%",))
+        if not like:
+            print(f"no session matching {args.session_id!r}", file=sys.stderr)
+            store.close()
+            return 1
+        sid = like[0]["session_id"]
+
+    detail = session_detail(store, sid)
+    store.close()
+    if detail is None:
+        print("session has no turns", file=sys.stderr)
+        return 1
+
+    print(f"session   {detail['session_id']}")
+    print(f"adapter   {detail['adapter_id']}")
+    print(f"window    {detail['start']} -> {detail['end']}")
+    print(f"turns     {detail['turn_count']}"
+          f"   p50 {_fmt_ms(detail['turn_p50_ms'])}"
+          f"   p95 {_fmt_ms(detail['turn_p95_ms'])}")
+    # The two numbers mean different things and are both useful: the agent's own
+    # time, and how long the conversation was open.
+    # Two different numbers, deliberately apart: what the agent spent, and how
+    # long the conversation was open. Collapsing them makes an idle session look
+    # like a busy one.
+    print(f"agent work {_fmt_ms(detail['work_ms'])}"
+          f"   wall {_fmt_ms(detail['wall_ms'])}"
+          f"   outside turns {_fmt_ms(detail['outside_ms'])}"
+          + (f"   (excluded {detail['work_excluded_turns']} interrupted turn(s))"
+             if detail.get("work_excluded_turns") else ""))
+    print(f"tokens    in {detail['tokens']['input']:,}"
+          f"  out {detail['tokens']['output']:,}"
+          f"  cache_read {detail['tokens']['cache_read']:,}")
+    if detail["models"]:
+        print("models    " + ", ".join(
+            f"{m}×{v['turns']}" for m, v in detail["models"].items()))
+
+    print()
+    print(f"{'#':>3}  {'start':<20} {'duration':>9} {'status':<11} "
+          f"{'spans':>5} {'tokens':>9}  kinds")
+    for i, turn in enumerate(detail["turns"], 1):
+        if args.failing_only and not turn["errors"]:
+            continue
+        mark = " (interrupted)" if turn.get("interrupted") else ""
+        print(f"{i:>3}  {turn['start']:<20} {_fmt_ms(turn['duration_ms']):>9} "
+              f"{turn['status']:<11} {turn['spans']:>5} "
+              f"{turn['tokens']['input']:>9,}  {','.join(turn['kinds'])}{mark}")
+    return 0
+
+
 def cmd_report(args) -> int:
     """The efficiency report, over the index (or a one-shot scan if there is none).
 
@@ -976,6 +1071,7 @@ def main(argv=None) -> int:
         "sessions": cmd_sessions, "stats": cmd_stats, "watch": cmd_watch,
         "serve": cmd_serve, "index": cmd_index,
         "adapter": cmd_adapter, "otlp": cmd_otlp, "report": cmd_report,
+        "session": cmd_session,
     }[args.cmd](args)
 
 

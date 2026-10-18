@@ -491,3 +491,49 @@ was too weak, because an adapter whose request hook broke still writes
 response, a tool call), and when the agent itself failed the scripts say that
 the reply-render assertion is not evidence of a rendered reply — it can match
 the prompt.
+
+## D25 — Per-conversation time, and the two numbers that must not be merged
+
+A reader looking at a trace saw "one round" and asked where the time of each
+conversation went. Both halves of the answer were missing:
+
+* **A trace IS one turn.** That is what `Trace: one task execution` means, and it
+  is why a trace page shows a single round: the conversation lives one level up.
+  The Sessions page listed counts and nothing about time.
+* **Nothing computed per-turn time at all.** `session_detail()` now does: every
+  turn with its own start, duration, active time, status, tokens and kinds, plus
+  the session's totals and a per-model breakdown. `agenttrace session <id>` prints
+  the same table, and the dashboard draws the turns as ordered bars (width = the
+  turn's own duration, labelled with its share of agent time) and again on the
+  session's wall clock, where the gaps are visible.
+
+Getting the numbers right took four corrections, each of which had produced a
+number that looked fine and was wrong:
+
+1. **A turn's wall clock is not its work.** The first version summed turn
+   durations and reported a session "agent time" of 9.5 days inside a 1.1-day
+   window. A resumed session has turns whose start and end straddle the gap.
+2. **A model call's duration was exactly 0 for every backfilled span**, because
+   the importer stamped the request and the response with the SAME timestamp (the
+   assistant entry's). The request is now stamped at the entry that TRIGGERED it —
+   the best anchor a transcript has — which makes model latency measurable, and
+   the record says `request_time=trigger-entry` rather than implying precision it
+   does not have.
+3. **"Interrupted" was a threshold I invented** (duration > 10× active). It was
+   replaced by a structural test with no number to tune: a turn whose window
+   contains another turn's start was interrupted, and a span whose window contains
+   another trace's start has a gap for a duration. Nothing starts inside a
+   genuine 20-minute call.
+4. **Codex measures the TURN, not the call.** Writing its `task_complete`
+   duration as the llm span's latency double-counted every turn with two calls,
+   and a turn that never reported completion was closed at the end of the FILE —
+   an 18-hour "model call", one span measuring 26 days. Codex's own number now
+   travels as `turn_duration_ms`, a flushed turn is closed at its OWN last
+   observed event, and the session's work total excludes turns known to be
+   contaminated while reporting how many it excluded.
+
+The shape of the result: `work_ms` (trusted turns) and `outside_ms` (the session
+was open but the agent was not running) are shown apart, because collapsing them
+makes an idle session look busy. On the session that prompted this: 101 turns,
+48.9 minutes of work, 27 hours open, 26.2 hours outside turns, 33 turns
+interrupted by a resume.

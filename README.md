@@ -102,6 +102,9 @@ Already-lost history can be recovered for agents that keep a transcript:
 ```bash
 python3 pi/pi_import.py            # Pi: every session with no live traces
 python3 codex/codex_import.py <rollout.jsonl>
+```bash
+agenttrace session <id>            # one conversation: every turn with its own time
+```
 agenttrace adapter coverage         # what is missing, and why (exit 1 on a gap)
 ```
 

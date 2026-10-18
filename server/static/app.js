@@ -78,6 +78,7 @@ const routes = {
   traces: renderTraces,
   trace: renderTraceDetail,
   sessions: renderSessions,
+  session: renderSessionDetail,
   adapters: renderAdapters,
 };
 
@@ -262,12 +263,13 @@ async function renderTraceDetail(traceId, selectedSpan) {
             ${span.synthetic ? '<span class="note">synthetic</span>' : ""}
             ${span.status === "error" ? '<span class="badge error">err</span>' : ""}
             ${!span.ended ? '<span class="badge incomplete">open</span>' : ""}
+            ${span.duration_suspect ? '<span class="badge incomplete" title="another turn of this session started inside this span: its duration is a gap (interruption or resume), not work">duration is a gap</span>' : ""}
           </div>
           <div class="wf-track">
             <div class="wf-bar kind-${esc(span.kind)} ${span.status === "error" ? "error" : ""} ${!span.ended ? "incomplete" : ""}"
                  style="left:${leftPct(span).toFixed(2)}%;width:${widthPct(span).toFixed(2)}%"></div>
           </div>
-          <div class="wf-dur">${fmtDur(span.duration_ms)}</div>
+          <div class="wf-dur">${span.duration_suspect ? "~" : ""}${fmtDur(span.duration_ms)}</div>
         </div>`).join("")}
     </div>
     ${t.events.length ? `<div class="panel"><h2>events</h2>
@@ -366,10 +368,13 @@ function bindTabs() {
 async function renderSessions() {
   const data = await api("sessions?limit=100");
   app.innerHTML = `<div class="panel"><h1>sessions</h1>
+    <p class="dim">A session is a conversation; click one to see every turn with
+    its own duration. (A single trace is ONE turn, which is why a trace page shows
+    one round.)</p>
     <table><thead><tr><th>session</th><th>adapter</th><th>last activity</th>
     <th>traces</th><th>tokens in/out</th><th>model</th><th>cwd</th><th>state</th></tr></thead>
     <tbody>${data.sessions.map(s => `
-      <tr><td class="mono">${esc((s.session_id || "").slice(0, 28))}</td>
+      <tr class="clickable" data-session="${esc(s.session_id)}"><td class="mono">${esc((s.session_id || "").slice(0, 28))}</td>
       <td class="mono">${esc(s.adapter_id)}</td>
       <td class="mono dim">${esc(fmtDay(s.last_ts))} ${esc(fmtTs(s.last_ts))}</td>
       <td>${s.trace_count}</td>
@@ -378,6 +383,103 @@ async function renderSessions() {
       <td class="mono dim" title="${esc(s.cwd || "")}">${esc((s.cwd || "—").slice(-40))}</td>
       <td>${s.ended ? '<span class="badge ok">ended</span>' : '<span class="badge incomplete">open</span>'}</td>
       </tr>`).join("")}</tbody></table></div>`;
+  document.querySelectorAll("tr[data-session]").forEach(row => {
+    row.addEventListener("click", () => {
+      location.hash = `#/session/${encodeURIComponent(row.dataset.session)}`;
+    });
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* session detail: per-turn timing                                     */
+/* ------------------------------------------------------------------ */
+
+async function renderSessionDetail(id) {
+  const d = await api(`sessions/${encodeURIComponent(id)}`);
+  if (d.error) { app.innerHTML = `<div class="panel"><h1>error</h1><pre class="body">${esc(d.error)}</pre></div>`; return; }
+  const max = Math.max(1, ...d.turns.map(t => t.duration_ms || 0));
+  const total = Math.max(1, d.work_ms || 1);
+  const wall = Math.max(1, d.wall_ms || 1);
+
+  // Two different numbers, deliberately shown apart: what the agent spent, and
+  // how long the conversation was open. A reader who conflates them will think
+  // the agent was working the whole time the session was open.
+  app.innerHTML = `
+    <div class="panel">
+      <h1>conversation <span class="mono dim">${esc(d.adapter_id)}</span></h1>
+      <div class="cards">
+        <div class="card"><div class="num">${d.turn_count}</div><div class="lbl">turns</div></div>
+        <div class="card"><div class="num">${fmtDur(d.work_ms)}</div><div class="lbl">agent work (trusted turns)</div></div>
+        <div class="card"><div class="num">${fmtDur(d.turn_p50_ms)}</div><div class="lbl">turn p50</div></div>
+        <div class="card"><div class="num">${fmtDur(d.turn_p95_ms)}</div><div class="lbl">turn p95</div></div>
+        <div class="card"><div class="num">${fmtDur(d.wall_ms)}</div><div class="lbl">session open for</div></div>
+        <div class="card"><div class="num">${fmtDur(d.outside_ms)}</div><div class="lbl">outside turns</div></div>
+        <div class="card ${d.errors ? "err" : ""}"><div class="num">${d.errors}</div><div class="lbl">failed spans</div></div>
+        <div class="card"><div class="num">${fmtTok(d.tokens.input)}</div><div class="lbl">input tokens</div></div>
+      </div>
+      <dl class="kv">
+        <dt>session</dt><dd class="mono dim">${esc(d.session_id)}</dd>
+        <dt>window</dt><dd class="mono">${esc(d.start)} → ${esc(d.end)}</dd>
+        ${Object.keys(d.models || {}).length ? `<dt>models</dt><dd class="mono">${Object.entries(d.models).map(([m, v]) => `${esc(m)}×${v.turns}`).join(", ")}</dd>` : ""}
+      </dl>
+    </div>
+
+    <div class="panel">
+      <h2>each turn, in order</h2>
+      <p class="dim">Bar width is the turn's own duration (the longest turn is
+      full width); the number is its share of agent time.</p>
+      ${d.turns.map((t, i) => `
+        <div class="turn-row clickable" data-trace="${esc(t.trace_id)}">
+          <span class="turn-idx mono dim">${i + 1}</span>
+          <span class="turn-bar-wrap">
+            <span class="turn-bar ${t.errors ? "error" : ""} ${t.status === "incomplete" ? "incomplete" : ""}"
+                  style="width:${Math.max(2, (100 * (t.duration_ms || 0)) / max).toFixed(2)}%"></span>
+          </span>
+          <span class="turn-dur mono">${fmtDur(t.duration_ms)}</span>
+          <span class="turn-share mono dim">${(((t.duration_ms || 0) / total) * 100).toFixed(1)}%</span>
+          <span class="turn-meta dim">${esc((t.start || "").slice(11, 19))} · ${t.spans} spans ·
+            ${t.kinds.join("/") || "no spans"}
+            ${t.interrupted ? '· <span class="badge incomplete">interrupted (wall time is a gap, not work)</span>' : ""}</span>
+        </div>`).join("")}
+    </div>
+
+    <div class="panel">
+      <h2>across the session's wall clock</h2>
+      <p class="dim">Turns positioned where they actually happened; the gaps are
+      time the agent was not working.</p>
+      <div class="wall-strip">
+        ${d.turns.map((t, i) => {
+          const s0 = Date.parse(d.start), e0 = Date.parse(d.end);
+          const a = Date.parse(t.start || t.end), b = Date.parse(t.end || t.start);
+          const left = Math.max(0, ((a - s0) / wall) * 100);
+          const width = Math.max(0.15, ((b - a) / wall) * 100);
+          return `<span class="wall-block ${t.errors ? "error" : ""}"
+                        style="left:${left.toFixed(3)}%;width:${width.toFixed(3)}%"
+                        title="turn ${i + 1}: ${esc(t.start)} (${fmtDur(t.duration_ms)})"></span>`;
+        }).join("")}
+      </div>
+      <div class="note mono">${esc(d.start)} → ${esc(d.end)}</div>
+    </div>
+
+    <div class="panel">
+      <h2>turns</h2>
+      <table><thead><tr><th>#</th><th>start</th><th>duration</th><th>% agent time</th>
+        <th>status</th><th>spans</th><th>tokens in/out</th><th>model</th></tr></thead>
+      <tbody>${d.turns.map((t, i) => `
+        <tr class="clickable" data-trace="${esc(t.trace_id)}">
+          <td class="mono dim">${i + 1}</td>
+          <td class="mono dim">${esc(t.start)}</td>
+          <td class="mono">${fmtDur(t.duration_ms)}</td>
+          <td class="mono dim">${(((t.duration_ms || 0) / total) * 100).toFixed(1)}%</td>
+          <td>${badge(t.status)}</td>
+          <td>${t.spans}</td>
+          <td class="mono">${fmtTok(t.tokens.input)} / ${fmtTok(t.tokens.output)}</td>
+          <td class="mono dim">${esc(t.model || "—")}</td>
+        </tr>`).join("")}</tbody></table>
+    </div>`;
+  document.querySelectorAll("tr[data-trace], .turn-row[data-trace]").forEach(row => {
+    row.addEventListener("click", () => { location.hash = `#/trace/${row.dataset.trace}`; });
+  });
 }
 
 async function renderAdapters() {

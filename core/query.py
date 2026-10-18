@@ -154,6 +154,24 @@ def get_trace(store: TraceStore, trace_id: str) -> dict[str, Any] | None:
     # span). Looking only at this trace's spans therefore found nothing on every
     # trace. Prefer a snapshot that carries `git` — a bare `cwd` is not what a
     # reader came for — and fall back to any resource at all.
+    # A span whose window CONTAINS the start of another trace in the same session
+    # was interrupted: the process died or the session was resumed between its
+    # two halves, so its duration is a gap rather than work (one codex span
+    # "took" 26 days that way). Structural, so no threshold to tune, and a
+    # genuine long call has nothing else starting inside it.
+    starts: list[str] = []
+    session_id = rows[0]["session_id"]
+    if session_id:
+        starts = [r["start_ts"] for r in store.query(
+            "SELECT DISTINCT trace_id, MIN(start_ts) AS start_ts FROM spans"
+            " WHERE session_id = ? AND trace_id != ? AND start_ts IS NOT NULL"
+            " GROUP BY trace_id", (session_id, trace_id))]
+    for span in spans:
+        begin, finish = span.get("start"), span.get("end")
+        if begin and finish:
+            span["duration_suspect"] = any(begin < other < finish
+                                          for other in starts)
+
     workspace = _session_workspace(store, rows[0]["session_id"],
                                    [s.get("resource") for s in spans])
     return {
@@ -262,6 +280,136 @@ def list_sessions(store: TraceStore, *, limit: int = 100) -> dict[str, Any]:
             "trace_count": r["trace_count"],
             "tokens": {"input": r["input_tokens"], "output": r["output_tokens"]},
         } for r in rows]}
+
+
+def session_detail(store: TraceStore, session_id: str) -> dict[str, Any] | None:
+    """One session as a CONVERSATION: every turn, with its own duration.
+
+    A trace is one turn (that is what "Trace: one task execution" means), so a
+    reader looking at a trace sees one round and cannot tell how long the
+    conversation took, where the time went, or how much of it was the agent
+    working rather than the person typing. Those are different numbers and both
+    are useful:
+
+      active_ms     — the sum of a session's turn ACTIVE time (what the agent
+                      actually spent: the work of each span, added up)
+      wall_ms       — first turn's start to last turn's end
+      outside_ms    — the difference: the person thinking, the machine idle, or
+                      the session sitting open between resumes
+
+    A turn also carries both, because a turn's wall clock is not its work: a
+    session that is resumed the next day has a turn whose start and end straddle
+    the gap, and summing THOSE produced a session "agent time" of 9.5 days inside
+    a 1.1-day window — an impossible number that hid the real one. `active_ms` is
+    the sum of a turn's own spans, which cannot exceed the work done.
+    """
+    rows = store.query(
+        "SELECT * FROM spans WHERE session_id = ? AND kind = 'task'"
+        " ORDER BY COALESCE(start_ts, end_ts)", (session_id,))
+    if not rows:
+        return None
+
+    turns: list[dict[str, Any]] = []
+    for row in rows:
+        trace_id = row["trace_id"]
+        children = store.query(
+            "SELECT kind, name, status, duration_ms, model,"
+            "       input_tokens, output_tokens, cache_read_tokens"
+            " FROM spans WHERE trace_id = ? AND span_id != ?"
+            " ORDER BY COALESCE(start_ts, end_ts)", (trace_id, trace_id))
+        kinds = sorted({c["kind"] for c in children})
+        errors = sum(1 for c in children
+                     if c["status"] in ("error", "interrupted", "cancelled"))
+        models = [c["model"] for c in children if c["model"]]
+        # The work of this turn: its spans' own durations. Bounded by reality in
+        # a way the span's start-end difference is not (a resume gap between a
+        # request and its response is not time spent working).
+        active = sum(c["duration_ms"] or 0 for c in children)
+        turns.append({
+            "trace_id": trace_id,
+            "name": row["name"],
+            "start": row["start_ts"],
+            "end": row["end_ts"],
+            "duration_ms": row["duration_ms"],
+            "active_ms": active,
+            "status": row["status"] if row["ended"] else "incomplete",
+            "spans": len(children),
+            "kinds": kinds,
+            "errors": errors,
+            "model": models[0] if models else None,
+            "tokens": {
+                "input": sum(c["input_tokens"] or 0 for c in children),
+                "output": sum(c["output_tokens"] or 0 for c in children),
+                "cache_read": sum(c["cache_read_tokens"] or 0 for c in children),
+            },
+        })
+
+    # Structural, not a threshold: a turn whose window CONTAINS another turn's
+    # start was interrupted — the session was resumed, or the process died and
+    # was restarted — so its wall clock is a gap, not work. No magic number, and
+    # it cannot be fooled by a slow model: nothing else starts inside a genuine
+    # 20-minute call.
+    starts = sorted(t["start"] for t in turns if t["start"])
+    for turn in turns:
+        begin, finish = turn["start"], turn["end"]
+        if begin and finish:
+            turn["interrupted"] = any(
+                begin < other < finish for other in starts)
+
+    # Statistics over the turns we can trust. A turn whose window contains
+    # another turn's start was interrupted, so its wall clock is partly a gap;
+    # including it would report the gap as work (that is how codex's flushed
+    # turns produced an 18-hour "average latency"). The count of excluded turns
+    # is reported rather than hidden, and `work_ms` is a floor, not a guess.
+    trusted = [t for t in turns if not t.get("interrupted")]
+    durations = sorted(t["duration_ms"] or 0 for t in trusted)
+    total = sum(durations)
+    first = min((t["start"] or t["end"] or "") for t in turns)
+    last = max((t["end"] or t["start"] or "") for t in turns)
+    wall = _duration_ms(first, last) or 0
+
+    def _pct(q: float) -> int | None:
+        if not durations:
+            return None
+        return durations[min(len(durations) - 1, int(q * len(durations)))]
+
+    models: dict[str, dict[str, int]] = {}
+    for turn in turns:
+        if not turn["model"]:
+            continue
+        bucket = models.setdefault(turn["model"], {"turns": 0, "input": 0})
+        bucket["turns"] += 1
+        bucket["input"] += turn["tokens"]["input"]
+
+    return {
+        "session_id": session_id,
+        "adapter_id": rows[0]["adapter_id"],
+        "start": first,
+        "end": last,
+        "turns": turns,
+        "turn_count": len(turns),
+        "work_ms": total,
+        "work_excluded_turns": len(turns) - len(trusted),
+        "turn_p50_ms": _pct(0.50),
+        "turn_p95_ms": _pct(0.95),
+        "wall_ms": wall,
+        # Never negative: clocks in the source data are not guaranteed monotone,
+        # and a negative "outside" would read as a bug in the agent.
+        # Outside the turns: the session was open but the agent was not running
+        # (the person thinking, or the process gone). Measured against the
+        # TRUSTED turns only — an interrupted turn's wall clock is itself mostly
+        # a gap, and subtracting it made a 27-hour session report zero idle time,
+        # i.e. "the agent worked the whole time".
+        "outside_ms": max(0, wall - total),
+        "interrupted_turns": len(turns) - len(trusted),
+        "errors": sum(t["errors"] for t in turns),
+        "tokens": {
+            "input": sum(t["tokens"]["input"] for t in turns),
+            "output": sum(t["tokens"]["output"] for t in turns),
+            "cache_read": sum(t["tokens"]["cache_read"] for t in turns),
+        },
+        "models": models,
+    }
 
 
 def overview(store: TraceStore) -> dict[str, Any]:

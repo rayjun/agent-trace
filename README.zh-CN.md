@@ -95,6 +95,9 @@ live 型适配器只在 agent **启动时**加载，所以装好扩展对已经�
 ```bash
 python3 pi/pi_import.py            # Pi：回填所有没有 live trace 的会话
 python3 codex/codex_import.py <rollout.jsonl>
+```bash
+agenttrace session <id>            # 一次对话：每一轮的耗时
+```
 agenttrace adapter coverage         # 缺什么、为什么缺（有近期缺口时退出码 1）
 ```
 
