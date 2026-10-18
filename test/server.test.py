@@ -13,6 +13,7 @@ import sys
 import tempfile
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -169,6 +170,24 @@ check("unknown trace -> 404", req("/api/traces/nope?token=test-token")[0] == 404
 
 code, body = req("/api/sessions?token=test-token")
 check("sessions endpoint", code == 200 and len(body["sessions"]) == 1)
+
+# A session id is usually a FILE PATH, so it arrives percent-escaped. It must
+# resolve with exactly one decode, and a double-escaped id (what an older
+# dashboard put in the URL bar) must still resolve rather than 404 — the
+# bookmarks people already have are not going to fix themselves.
+sid = body["sessions"][0]["session_id"]
+one = urllib.parse.quote(sid, safe="")
+two = urllib.parse.quote(one, safe="")
+code, detail = req(f"/api/sessions/{one}?token=test-token")
+check("a session id with slashes resolves (single-escaped)",
+      code == 200 and detail.get("session_id") == sid,
+      f"{code} {str(detail)[:80]}")
+code, detail = req(f"/api/sessions/{two}?token=test-token")
+check("...and a double-escaped one still resolves (old bookmarks)",
+      code == 200 and detail.get("session_id") == sid,
+      f"{code} {str(detail)[:80]}")
+code, _ = req("/api/sessions/nope-not-a-session?token=test-token")
+check("an unknown session still 404s", code == 404, str(code))
 
 code, body = req("/api/adapters?token=test-token")
 check("adapters endpoint joins registry + observed",

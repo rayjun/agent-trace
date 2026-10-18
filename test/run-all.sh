@@ -33,6 +33,7 @@ run "pi adapter"            node    test/pi-adapter.test.mjs
 run "pi backfill importer"  python3 test/pi-import.test.py
 run "adapter coverage"      python3 test/coverage.test.py
 run "workspace snapshot"    python3 test/workspace.test.py
+run "dashboard routing"     node    test/dashboard-routing.test.mjs
 run "watch TUI (pty)"       python3 test/watch-tui.test.py
 if [ "${SKIP_E2E:-0}" != "1" ]; then
   run "hermes end-to-end"    bash    test/e2e-hermes.sh

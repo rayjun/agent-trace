@@ -80,23 +80,49 @@ const routes = {
   sessions: renderSessions,
   session: renderSessionDetail,
   adapters: renderAdapters,
+  datasets: renderDatasets,
+  dataset: renderDatasetDetail,
+  experiments: renderExperiments,
+  experiment: renderExperimentDetail,
 };
 
 let currentRender = null; // re-invoked on SSE change events
 
 function router() {
   const hash = location.hash || "#/overview";
-  const parts = hash.slice(2).split("/");
+  // The route is the part BEFORE the query. Splitting the whole hash on "/" made
+  // `#/traces?agent=pi` a route name nobody has a renderer for, so the filter
+  // silently fell through to the Overview page. A renderer that needs the query
+  // reads `location.hash` itself.
+  const parts = hash.slice(2).split("?")[0].split("/");
   const name = parts[0] || "overview";
+  // DECODE the segment. A session is identified by a file PATH, so the route
+  // holds percent-escapes; passing them through meant the API call escaped them
+  // a second time (%2F -> %252F) and every session page 404'd. Trace ids are
+  // hex and never showed it, which is why only this route was broken.
+  const arg = decodeArg(parts[1]);
   document.querySelectorAll("#topbar nav a").forEach(a => {
     a.classList.toggle("active", a.dataset.route === name ||
       (a.dataset.route === "traces" && name === "trace"));
   });
   const fn = routes[name] || renderOverview;
-  currentRender = () => fn(parts[1]).catch(e => {
-    app.innerHTML = `<div class="panel"><h1>error</h1><pre class="body">${esc(e.message)}</pre></div>`;
+  currentRender = () => fn(arg).catch(e => {
+    // Say WHICH route failed and what it was given: a bare "error" gave no clue
+    // that the id arriving here was still escaped.
+    app.innerHTML = `<div class="panel"><h1>error</h1>
+      <pre class="body">${esc(e.message)}</pre>
+      <p class="dim">route ${esc(name)} — ${esc(String(arg))}</p></div>`;
   });
   currentRender();
+}
+
+function decodeArg(raw) {
+  if (!raw) return raw;
+  try {
+    return decodeURIComponent(raw);
+  } catch (e) {
+    return raw;      // a malformed escape is not worth turning into a blank page
+  }
 }
 
 window.addEventListener("hashchange", router);

@@ -537,3 +537,29 @@ was open but the agent was not running) are shown apart, because collapsing them
 makes an idle session look busy. On the session that prompted this: 101 turns,
 48.9 minutes of work, 27 hours open, 26.2 hours outside turns, 33 turns
 interrupted by a resume.
+
+## D26 — Three routing bugs, and the test that would have caught all three
+
+The session page 404'd on a URL that had worked a minute earlier. The cause was
+one line in the dashboard's router, and chasing it found two more of the same
+kind — none of which any existing test could see, because every test drove the
+renderers *directly* and none drove the ROUTE → RENDERER mapping.
+
+| bug | effect |
+|---|---|
+| the route segment was not decoded | a session is identified by a file PATH, so the route holds `%2F...`; the page escaped it again (`%2F` → `%252F`) and every session page 404'd. Trace ids are hex, so only this route was affected — which is why it looked like a session bug rather than a routing one |
+| the route was taken from the whole hash | `#/traces?agent=pi` was a route name with no renderer, so the filter silently rendered the Overview. Clicking a filter moved you to a different page |
+| `routes` was missing `dataset`, `dataset`, `experiments`, `experiment` | the Datasets and Experiments pages were unreachable by URL at all: clicking a row set the hash, the router found no renderer, and the Overview appeared. This shipped with M3 and survived every review |
+
+Fixes: decode the segment once (and keep the raw value in the error message, so a
+bad id is visible instead of a bare "error"); strip the query before splitting;
+list the six missing routes. The server also decodes a **double**-escaped session
+id on a second try, because URLs already in someone's history are not going to
+fix themselves and a session id never contains a literal `%`.
+
+The durable part is `test/dashboard-routing.test.mjs`: it drives the real router
+with a DOM shim and asserts which API path each hash asks for — the mapping that
+was wrong three times — and the stubbed payloads are minimal-but-valid, so a
+renderer that throws on an empty dataset fails there too (the fresh-install
+case). `test/server.test.py` covers the other half: a session id with slashes
+resolves single- and double-escaped, and an unknown one still 404s.

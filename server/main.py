@@ -435,8 +435,15 @@ class Handler(BaseHTTPRequestHandler):
             # A trace is one turn, so this is the only place the per-turn time is
             # visible at all.
             from core.query import session_detail
-            detail = session_detail(
-                store, unquote(path[len("/api/sessions/"):]))
+            raw = path[len("/api/sessions/"):]
+            detail = session_detail(store, unquote(raw))
+            if detail is None and "%25" in raw.upper():
+                # An id that is itself still escaped: older versions of the
+                # dashboard escaped the route segment twice, so URLs already in
+                # someone's history carry `%252F`. Decoding once more costs
+                # nothing (a session id never contains a literal `%`) and makes
+                # those bookmarks work instead of 404-ing.
+                detail = session_detail(store, unquote(unquote(raw)))
             self._send_json(detail if detail is not None
                             else {"error": "session not found"},
                             200 if detail is not None else 404)
