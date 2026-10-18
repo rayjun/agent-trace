@@ -149,11 +149,13 @@ def get_trace(store: TraceStore, trace_id: str) -> dict[str, Any] | None:
     has_usage = any(t is not None for s in spans
                     for t in (s["tokens"]["input"], s["tokens"]["output"],
                               s["tokens"]["cache_read"]))
-    workspace = None
-    for span in spans:
-        if span.get("resource"):
-            workspace = span["resource"]
-            break
+    # The workspace belongs to the SESSION, and the adapter records it on a
+    # session-level event (the only cheap place: once per session, not per
+    # span). Looking only at this trace's spans therefore found nothing on every
+    # trace. Prefer a snapshot that carries `git` — a bare `cwd` is not what a
+    # reader came for — and fall back to any resource at all.
+    workspace = _session_workspace(store, rows[0]["session_id"],
+                                   [s.get("resource") for s in spans])
     return {
         "trace_id": trace_id,
         "adapter_id": rows[0]["adapter_id"],
@@ -174,6 +176,34 @@ def get_trace(store: TraceStore, trace_id: str) -> dict[str, Any] | None:
         "spans": spans,
         "events": events,
     }
+
+
+def _session_workspace(store: TraceStore, session_id: str | None,
+                       own: list[Any]) -> dict[str, Any] | None:
+    """The workspace of the session a trace belongs to.
+
+    Read from the session's events, because that is where an adapter puts it.
+    `own` (this trace's spans) is tried first so a per-span resource still wins
+    for an adapter that records one there.
+    """
+    candidates = [r for r in own if isinstance(r, dict)]
+    if session_id:
+        for row in store.query(
+                "SELECT payload FROM events WHERE session_id = ?"
+                ' AND payload LIKE \'%"resource"%\' LIMIT 20', (session_id,)):
+            try:
+                event = json.loads(row["payload"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            resource = event.get("resource")
+            if isinstance(resource, dict):
+                candidates.append(resource)
+    if not candidates:
+        return None
+    for resource in candidates:
+        if isinstance(resource.get("git"), dict):
+            return resource
+    return candidates[0]
 
 
 def _row_to_span(row: sqlite3.Row) -> dict[str, Any]:
