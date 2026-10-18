@@ -93,6 +93,30 @@ if [ "$after" -le "$before" ]; then
     tail -3 "$PI_LOG" | sed 's/^/       /'; }
   exit 1
 fi
+# "Some record was written" is too weak: an adapter whose provider hook broke
+# still writes session_start. Require the conversation itself.
+CONV=$(python3 - "$TRACE_DIR" <<'PYEOF'
+import glob, json, os, sys
+kinds = {"llm_request", "llm_response", "assistant_message", "tool_call", "tool_result"}
+seen = 0
+for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.jsonl"))):
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if '"event"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get("event") in kinds:
+                seen += 1
+print(seen)
+PYEOF
+)
+if [ "${CONV:-0}" -le 0 ]; then
+  echo "FAIL — the adapter wrote records but NO conversation in $TRACE_DIR"
+  exit 1
+fi
 if [ "$pi_rc" -ne 0 ]; then
   echo "NOTE — pi exited $pi_rc and the adapter recorded the attempt anyway"
   grep -iE "404|401|403|429|expired|quota|rate limit|not found" "$PI_LOG" \

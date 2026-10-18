@@ -437,3 +437,57 @@ ADAPTER's. Hermes' API key expired during this session (HTTP 401), so
 which is what a tracer is for. The gate is now "did the adapter write records",
 with the agent's own failure reported as context. Failing the suite on an
 expired key trains people to ignore the suite.
+
+## D24 — M5 begins: the trace now knows which code it was about
+
+A coding-agent trace without the code it worked on answers "the tests failed"
+and not "the tests failed on this branch, at this commit, after editing these
+files". `common/workspace_snapshot()` records the repository — root, branch,
+HEAD, dirty state, changed files (untracked included, because that is what an
+agent creating a file looks like) — onto the v1 `resource` field, which becomes
+`event.resource` in v2. Three rules: read-only (`--no-optional-locks`, so git
+never takes the user's index lock), bounded (timeout, capped diff), and honest
+about WHEN (`at: capture` when an adapter saw it, `at: index` when it was read
+later, because comparing a months-old trace against today's diff is a wrong
+conclusion waiting to happen). The diff is off by default — it can carry source
+and credentials — and the snapshot says it withheld it.
+
+It lives in `common/`, not the platform layer, because a deployed Hermes plugin
+is a COPY of that file and can import nothing else; one implementation serves
+every adapter. That also exposed a real gap: **the Hermes adapter recorded no
+`cwd` at all**, in any event, so nothing could ever link its traces to a
+repository. It now snapshots the workspace once per session (the hook carries no
+cwd, so `os.getcwd()` — the plugin runs inside the agent's process, which is the
+directory it works in).
+
+Also in this round:
+
+* tool spans carry `attributes.file` when the arguments name one, so a reader can
+  follow a single file through a trace instead of guessing from a command string;
+* `agenttrace report` aggregates the trajectory evaluators across traces —
+  per-signal, with sample sizes, confidence and `no_signal` counts, and never
+  summed into one score (proposal §8.2). Cost is `unknown` when a model is
+  unpriced, as everywhere else;
+* **`--full` was not a rebuild.** Clearing the archive is what makes it one:
+  without it the same event ids came back, ingest dedups by id, and stored
+  payloads kept whatever an *older* converter had written — so a converter fix
+  never reached an already-indexed trace. It now clears events/spans/sessions and
+  re-reads the files, and deliberately keeps datasets/experiments, which are the
+  user's own work rather than derived data;
+* **the span upsert had a cross-process race.** SELECT-then-INSERT let the
+  indexer thread of a running `agenttrace serve` and a one-shot
+  `agenttrace index --full` both find no row and both insert, one dying on the
+  UNIQUE constraint. It is now `INSERT OR IGNORE` followed by a merge, so SQLite
+  decides the conflict atomically. Two writers on one database is the normal
+  case, not an edge.
+
+Two more came from the review of the previous round, both about evidence rather
+than behaviour: the run discriminator was a **clock slice**
+(`Date.now().toString(36).slice(-5)`), which gives two processes started in the
+same millisecond the same id — the very collision it was added to prevent — and
+is now random; and the e2e scripts' new gate ("did the adapter write records")
+was too weak, because an adapter whose request hook broke still writes
+`session_start`. The gate now requires the **conversation** (a request, a
+response, a tool call), and when the agent itself failed the scripts say that
+the reply-render assertion is not evidence of a rendered reply — it can match
+the prompt.

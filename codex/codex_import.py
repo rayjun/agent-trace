@@ -169,6 +169,8 @@ def parse_rollout(path: Path, since_line: int = 0) -> tuple[int, list[dict], dic
             "provider": meta["provider"],
             "api_mode": API_MODE,
             "cwd": cwd or meta["cwd"],
+            **({"resource": _workspace(cwd or meta["cwd"])} if
+               (cwd or meta["cwd"]) else {}),
             **({"ts": ts} if ts else {}),
             "request": {
                 "messages": [],
@@ -422,6 +424,28 @@ def parse_rollout(path: Path, since_line: int = 0) -> tuple[int, list[dict], dic
 # --------------------------------------------------------------------------
 # hook entry point
 # --------------------------------------------------------------------------
+
+_workspace_cache: dict = {}
+
+
+def _workspace(cwd: str | None) -> dict | None:
+    """The repository the session ran in, captured once per importer run.
+
+    The rollout records the cwd but nothing about version control, so this is
+    read from the directory as it is NOW — which is why the snapshot is labelled
+    `at: index` unless the file it came from was written today. A codex rollout
+    can be months old and a diff of it would be a fiction.
+    """
+    if cwd in _workspace_cache:
+        return _workspace_cache[cwd]
+    # Always `at: index`: a rollout is a transcript we are re-reading, so any
+    # repository state read now describes the directory as it is, not as the
+    # session found it. Claiming "capture" would let a months-old trace look
+    # like it ran against today's branch.
+    snap = common.workspace_snapshot(cwd, at="index") if cwd else None
+    _workspace_cache[cwd] = snap
+    return snap
+
 
 def _cursor_path(path: Path) -> Path:
     """Cursor key is the rollout path, not the session id.

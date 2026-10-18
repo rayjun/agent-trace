@@ -184,6 +184,16 @@ local-time or variable-precision stamp silently breaks all three.
 
 ---
 
+#### `resource` records the workspace
+
+Optional, additive: `resource` is an object with `cwd` and a `git` block (root,
+branch, head, subject, dirty, changed_count, changed_files, and the diff only
+when `AGENTTRACE_GIT=full`). `git.at` is `capture` when an adapter saw the state
+live and `index` when nobody recorded one and it was read later — the two are
+different claims, and confusing them makes a months-old trace look like it ran
+against today's branch. `tool` spans additionally carry the file a call touched
+inside `span.attributes.file`.
+
 ## Adding a field
 
 1. Add it to `schema/trace.schema.json` as an **optional** property with an

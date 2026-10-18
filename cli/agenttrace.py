@@ -609,6 +609,17 @@ def build_parser() -> argparse.ArgumentParser:
     p_at.add_argument("--adapter", default=None,
                       help="adapter id for the capability cross-check")
 
+    p_report = sub.add_parser(
+        "report",
+        help="efficiency report across recent traces (trajectory signals, "
+             "never one score)")
+    p_report.add_argument("--limit", type=int, default=200)
+    p_report.add_argument("--verbose", action="store_true",
+                          help="show the evidence behind each flagged trace")
+    p_report.add_argument("--json", action="store_true")
+    p_report.add_argument("--db", type=Path, default=None)
+    _dirs(p_report)
+
     p_otlp = sub.add_parser("otlp", help="import/export OTLP JSON (M4)")
     otlp_sub = p_otlp.add_subparsers(dest="otlp_cmd", required=True)
     p_oi = otlp_sub.add_parser("import", help="OTLP JSON file -> trace dirs")
@@ -848,6 +859,31 @@ def _fixture_stream_for(adapter_id: str) -> Path | None:
     return candidate if candidate.is_file() else None
 
 
+def cmd_report(args) -> int:
+    """The efficiency report, over the index (or a one-shot scan if there is none).
+
+    Reads the STORE, not the raw files: the report needs every trace's spans,
+    and re-parsing the JSONL for that is the thing the index exists to avoid.
+    """
+    from core.storage.indexer import Indexer
+    from core.storage.sqlite_store import TraceStore
+    from evaluation.report import render, report
+    from server.main import platform_dir
+
+    db = args.db or Path(os.environ.get("AGENTTRACE_DB")
+                         or platform_dir() / "agenttrace.db")
+    store = TraceStore(db)
+    if not store.one("SELECT COUNT(*) AS n FROM spans")["n"]:
+        # No index yet: build one from the dirs the user pointed at, so the
+        # command works on a fresh machine without a separate `index` run.
+        Indexer(store, args.dirs).scan_once()
+    rep = report(store, limit=args.limit, agent=args.agent, since=args.since)
+    print(json.dumps(rep, indent=2) if args.json
+          else render(rep, verbose=args.verbose))
+    store.close()
+    return 0
+
+
 def cmd_otlp(args) -> int:
     from adapters.otlp import export_traces, import_file
     from core.query import get_trace, list_traces
@@ -939,7 +975,7 @@ def main(argv=None) -> int:
         "ls": cmd_ls, "show": cmd_show, "search": cmd_search,
         "sessions": cmd_sessions, "stats": cmd_stats, "watch": cmd_watch,
         "serve": cmd_serve, "index": cmd_index,
-        "adapter": cmd_adapter, "otlp": cmd_otlp,
+        "adapter": cmd_adapter, "otlp": cmd_otlp, "report": cmd_report,
     }[args.cmd](args)
 
 

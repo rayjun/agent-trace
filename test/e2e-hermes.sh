@@ -66,10 +66,40 @@ if [ "$after" -le "$before" ]; then
     tail -3 "$AGENT_LOG" | sed 's/^/       /'; }
   exit 1
 fi
-echo "PASS — hermes (profile=$PROFILE) wrote $((after - before)) new trace records"
+# A record count alone is too weak a gate: an adapter whose request hooks broke
+# still writes `session_start`, and the suite would say PASS. What the trace must
+# contain is the CONVERSATION — a request or a response — which is the thing this
+# test is about.
+CONV=$(python3 - "$TRACES" "$PROFILE" <<'PYEOF'
+import glob, json, os, sys
+traces = sys.argv[1]
+kinds = {"llm_request", "llm_response", "llm_error", "assistant_message"}
+seen = 0
+for path in sorted(glob.glob(os.path.join(traces, "*.jsonl"))):
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if '"event"' not in line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get("event") in kinds:
+                seen += 1
+print(seen)
+PYEOF
+)
+if [ "${CONV:-0}" -le 0 ]; then
+  echo "FAIL — the adapter wrote records but NO conversation (llm_request/llm_response)"
+  echo "       a broken request hook writes session_start and nothing else"
+  exit 1
+fi
+echo "PASS — hermes (profile=$PROFILE) wrote $((after - before)) new trace records, $CONV conversational"
 if [ "$agent_rc" -ne 0 ]; then
   echo "NOTE — the agent exited $agent_rc, and the adapter recorded the attempt"
-  echo "       anyway (that is what a tracer is for). Provider-side cause:"
+  echo "       anyway (that is what a tracer is for). The reply-render assertion"
+  echo "       below is therefore NOT evidence that a reply was rendered — it can"
+  echo "       match the prompt. Provider-side cause:"
   grep -iE "404|401|403|429|expired|quota|rate limit|not found" "$AGENT_LOG" \
     | head -2 | sed 's/^/       /' || true
 fi

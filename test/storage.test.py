@@ -148,6 +148,52 @@ check("projections rebuilt after shrink",
       store.one("SELECT COUNT(*) AS n FROM spans WHERE span_id='llm:fresh'")["n"] == 1
       and store.one("SELECT COUNT(*) AS n FROM spans WHERE span_id='llm:r1'")["n"] == 0)
 
+# Two WRITERS on one database is the normal case, not an edge: `agenttrace
+# serve` indexes in a background thread while a user's one-shot
+# `agenttrace index --full` clears and re-reads the archive. The span upsert
+# used to be SELECT-then-INSERT, so both could find no row, both insert, and one
+# died on the UNIQUE constraint. Two threads on one store reproduce it without
+# needing two processes.
+import threading as _threading  # noqa: E402
+
+race_dir = td / "race"
+race_dir.mkdir()
+write(race_dir / "r.jsonl", [
+    v1("llm_request", m, request_id=f"r{m}", model="m") for m in range(20)
+] + [
+    v1("llm_response", m, request_id=f"r{m}", model="m",
+       response={"content": "x"}) for m in range(20)
+])
+race_store = TraceStore(td / "race.db")
+race_idx = Indexer(race_store, [race_dir])
+errors: list[str] = []
+
+
+def loop() -> None:
+    try:
+        for _ in range(4):
+            race_idx.scan_once()
+    except Exception as exc:                     # noqa: BLE001
+        errors.append(f"{type(exc).__name__}: {exc}")
+
+
+threads = [_threading.Thread(target=loop) for _ in range(3)]
+for t in threads:
+    t.start()
+try:
+    race_idx.full_rebuild()                      # clears the archive underneath
+except Exception as exc:                         # noqa: BLE001
+    errors.append(f"rebuild: {type(exc).__name__}: {exc}")
+for t in threads:
+    t.join()
+check("concurrent writers and a full rebuild do not collide",
+      not errors, "; ".join(errors[:2]))
+if not errors:
+    n = race_store.one("SELECT COUNT(*) AS n FROM spans WHERE kind = 'llm'")["n"]
+    check("...and the result is the 20 llm spans, not fewer",
+          n == 20, str(n))
+race_store.close()
+
 # A file REPLACED by a different, larger one is not an append. Size alone only
 # catches truncation: the stored offset then pointed into the middle of the new
 # file's records and the tail read ingested fragments of them (measured: 6 junk

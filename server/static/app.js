@@ -251,6 +251,7 @@ async function renderTraceDetail(traceId, selectedSpan) {
         <dt>tokens in/out/cache</dt><dd class="mono">${fmtTok(t.tokens.input)} / ${fmtTok(t.tokens.output)} / ${fmtTok(t.tokens.cache_read)}</dd>
         <dt>spans</dt><dd>${t.spans.length}</dd>
       </dl>
+      ${workspaceBlock(t.workspace)}
     </div>
     <div class="panel">
       <h2>waterfall</h2>
@@ -282,6 +283,35 @@ async function renderTraceDetail(traceId, selectedSpan) {
     });
   });
   bindTabs();
+}
+
+function workspaceBlock(ws) {
+  // A trace without the code it worked on answers "the tests failed" but not
+  // "on which branch, at which commit, after changing what". `at` matters: a
+  // snapshot read at index time is the directory NOW, not what the agent saw.
+  if (!ws || !ws.git) return "";
+  const g = ws.git;
+  const bits = [];
+  if (g.branch) bits.push(`<span class="mono">${esc(g.branch)}</span>`);
+  if (g.detached) bits.push('<span class="badge unknown">detached</span>');
+  if (g.head) bits.push(`<span class="mono dim">@${esc(g.head)}</span>`);
+  if (g.dirty) bits.push(`<span class="badge incomplete">${g.changed_count || 0} changed</span>`);
+  else bits.push('<span class="badge ok">clean</span>');
+  if (g.at === "index") bits.push('<span class="note">read at index time, not at capture</span>');
+  const files = (g.changed_files || []).length
+    ? `<div class="note mono">${g.changed_files.map(esc).join("<br>")}</div>` : "";
+  const diff = g.diff
+    ? `<pre class="body" style="margin-top:8px">${esc(g.diff)}</pre>`
+      + (g.diff_truncated ? '<div class="note">(diff truncated)</div>' : "")
+    : (g.diff_withheld
+        ? '<div class="note">diff not captured — set <code>AGENTTRACE_GIT=full</code> to record it</div>'
+        : "");
+  return `<h2>workspace</h2>
+    <dl class="kv">
+      <dt>repository</dt><dd class="mono dim">${esc(g.root || "—")}</dd>
+      <dt>state</dt><dd>${bits.join(" ")}</dd>
+      ${g.subject ? `<dt>commit</dt><dd>${esc(g.subject)}</dd>` : ""}
+    </dl>${files}${diff}`;
 }
 
 function summarizeAttrs(attrs) {

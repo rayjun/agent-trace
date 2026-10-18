@@ -93,6 +93,7 @@ CREATE TABLE IF NOT EXISTS spans (
   attributes_json TEXT,
   privacy_json TEXT,
   source_json TEXT,
+  resource_json TEXT,
   agent_version TEXT,
   synthetic INTEGER NOT NULL DEFAULT 0,
   ended INTEGER NOT NULL DEFAULT 0,
@@ -191,6 +192,7 @@ CREATE TABLE IF NOT EXISTS spans (
   attributes_json TEXT,
   privacy_json TEXT,
   source_json TEXT,
+  resource_json TEXT,
   agent_version TEXT,
   synthetic INTEGER NOT NULL DEFAULT 0,
   ended INTEGER NOT NULL DEFAULT 0,
@@ -217,6 +219,7 @@ def _spans_key_is_wrong(conn: sqlite3.Connection) -> bool:
 #: migration is explicit and additive.
 _MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("ingest_files", "inode INTEGER"),
+    ("spans", "resource_json TEXT"),
     ("spans", "privacy_json TEXT"),
     ("spans", "source_json TEXT"),
     ("spans", "agent_version TEXT"),
@@ -320,24 +323,22 @@ class TraceStore:
                 "duration_ms", "model", "input_tokens", "output_tokens",
                 "cache_read_tokens", "input_json", "output_json", "error_json",
                 "attributes_json", "privacy_json", "source_json",
-                "agent_version", "synthetic", "ended",
+                "resource_json", "agent_version", "synthetic", "ended",
             ]
             columns = ", ".join(names)
-            # trace_id was nullable under the old schema and is NOT NULL in
-            # the new one; re-inserting such a row verbatim raised
-            # IntegrityError and made the whole database unopenable. Fall back
-            # to the span's own id, which is what the ingest path does anyway.
+            # The inner list is DERIVED from the same names, with one change:
+            # trace_id was nullable under the old schema and is NOT NULL in the
+            # new one, so a null falls back to the span's own id (which is what
+            # the ingest path does anyway). Two hand-written lists is how
+            # `resource_json` ended up in the outer one only, making the
+            # database unopenable — a column can no longer be added to one list
+            # and missed in the other because there is only one list.
+            inner = ", ".join(
+                "COALESCE(trace_id, span_id) AS trace_id" if name == "trace_id"
+                else name for name in names)
             conn.execute(
                 f"INSERT OR REPLACE INTO spans ({columns})"
-                f" SELECT {columns} FROM ("
-                f"   SELECT span_id, COALESCE(trace_id, span_id) AS trace_id,"
-                f"          session_id, parent_span_id, adapter_id, kind, name,"
-                f"          status, start_ts, end_ts, duration_ms, model,"
-                f"          input_tokens, output_tokens, cache_read_tokens,"
-                f"          input_json, output_json, error_json,"
-                f"          attributes_json, privacy_json, source_json,"
-                f"          agent_version, synthetic, ended"
-                f"   FROM spans_old_key)")
+                f" SELECT {columns} FROM (SELECT {inner} FROM spans_old_key)")
             conn.execute("DROP TABLE spans_old_key")
 
     # ------------------------------------------------------------------
@@ -417,18 +418,23 @@ class TraceStore:
 
         with self._write_lock:
             conn = self._conn()
-            row = conn.execute(
-                "SELECT * FROM spans WHERE span_id = ? AND trace_id = ?",
-                (span_id, trace_id)).fetchone()
-            if row is None:
-                conn.execute(
-                    "INSERT INTO spans"
+            # INSERT-or-ignore FIRST, then merge if it was already there. The
+            # old shape was SELECT-then-INSERT, and two writers — the indexer
+            # thread in a running `agenttrace serve` and a one-shot
+            # `agenttrace index --full` — could both find no row and both
+            # insert, one of them dying on the UNIQUE constraint. SQLite
+            # decides the conflict atomically in one statement, so no window
+            # remains; the SELECT afterwards is only to read what the merge
+            # needs, and the row is guaranteed to exist by then.
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO spans"
                     " (span_id, trace_id, session_id, parent_span_id, adapter_id,"
                     "  kind, name, status, start_ts, end_ts, duration_ms, model,"
                     "  input_tokens, output_tokens, cache_read_tokens,"
                     "  input_json, output_json, error_json, attributes_json,"
-                    "  privacy_json, source_json, agent_version, synthetic, ended)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "  privacy_json, source_json, resource_json,"
+                    "  agent_version, synthetic, ended)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (span_id, trace_id,
                      event.get("session_id"), event.get("parent_span_id"),
                      event["adapter_id"], span.get("kind", "chain"),
@@ -447,10 +453,17 @@ class TraceStore:
                      _dump_or_none(attrs) if attrs else None,
                      _dump_or_none(event.get("privacy")),
                      _dump_or_none(event.get("source")),
+                     _dump_or_none(event.get("resource")),
                      event.get("agent_version"),
                      1 if attrs.get("synthetic") else 0,
                      0 if is_start else 1))
+            if cur.rowcount == 0:
+                row = conn.execute(
+                    "SELECT * FROM spans WHERE span_id = ? AND trace_id = ?",
+                    (span_id, trace_id)).fetchone()
             else:
+                row = None
+            if row is not None:
                 merged_attrs = _merge_json(row["attributes_json"], attrs)
                 usage = merged_attrs.get("usage") or {}
                 start_ts = row["start_ts"] or (ts if is_start else None)
@@ -499,6 +512,7 @@ class TraceStore:
                     " synthetic=CASE WHEN ? THEN 0 ELSE synthetic END,"
                     " privacy_json=COALESCE(privacy_json, ?),"
                     " source_json=COALESCE(source_json, ?),"
+                    " resource_json=COALESCE(resource_json, ?),"
                     " agent_version=COALESCE(agent_version, ?),"
                     " input_json=COALESCE(input_json, ?),"
                     " output_json=COALESCE(output_json, ?),"
@@ -517,6 +531,7 @@ class TraceStore:
                      (is_start and not incoming_synthetic),
                      _dump_or_none(event.get("privacy")),
                      _dump_or_none(event.get("source")),
+                     _dump_or_none(event.get("resource")),
                      event.get("agent_version"),
                      _dump_or_none(span.get("input")),
                      _dump_or_none(span.get("output")),
@@ -657,6 +672,20 @@ class TraceStore:
             "     AND json_extract(s.attributes_json, '$.cwd') IS NOT NULL"
             "   LIMIT 1)"
             " WHERE cwd IS NULL")
+
+    def clear_archive(self) -> None:
+        """Drop the archived events and every projection; keep USER data.
+
+        Datasets, experiments and their runs are the user's own work, not
+        derived from the traces, so a re-ingest must not touch them. Everything
+        else here is reproducible from the JSONL files, which is the whole point
+        of the archive being the truth: it can be thrown away.
+        """
+        with self._write_lock:
+            conn = self._conn()
+            for table in ("events", "spans", "sessions", "ingest_files"):
+                conn.execute(f"DELETE FROM {table}")
+            conn.commit()
 
     def rebuild_projections(self) -> None:
         """Drop and replay every projection from the events archive.

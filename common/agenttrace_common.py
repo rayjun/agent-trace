@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 from collections.abc import Callable, Mapping, Sequence
@@ -126,6 +127,106 @@ def validate_enabled() -> bool:
 #: RFC3339 UTC with milliseconds — the only shape `now_iso` emits and the only
 #: shape the reader's string comparisons (`--since`, sorting) can order.
 _TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
+
+
+# --------------------------------------------------------------------------
+# workspace
+# --------------------------------------------------------------------------
+
+GIT_ENV = "AGENTTRACE_GIT"          # metadata (default) | full | off
+GIT_CAP_ENV = "AGENTTRACE_GIT_MAX"  # bytes of diff to keep
+_GIT_DIFF_CAP = 20_000
+_GIT_TIMEOUT = 4.0
+
+
+def git_mode() -> str:
+    value = (os.environ.get(GIT_ENV) or "metadata").strip().lower()
+    return value if value in ("metadata", "full", "off") else "metadata"
+
+
+def workspace_snapshot(cwd, *, at: str = "capture") -> dict | None:
+    """The repository state of `cwd`, or None when there is nothing to say.
+
+    Lives here, not in the platform layer, because a deployed Hermes plugin is a
+    COPY of this file and can import nothing else; every adapter therefore gets
+    the same snapshot from one implementation.
+
+    Read-only (`--no-optional-locks`, so git never takes the user's index lock),
+    bounded (timeout, capped diff), and honest about when it looked: `at` is
+    "capture" when an adapter saw it live and "index" when it was read later,
+    because a months-old trace compared against today's diff is a wrong
+    conclusion waiting to happen. The diff is OFF by default — it can carry
+    source and credentials — and the snapshot says it withheld it.
+    """
+    mode = git_mode()
+    if mode == "off" or not cwd:
+        return None
+    try:
+        path = Path(str(cwd)).expanduser()
+    except (OSError, ValueError):
+        return None
+    if not path.is_dir():
+        return None
+
+    def git(args: list[str]) -> str | None:
+        try:
+            proc = subprocess.run(
+                ["git", "--no-optional-locks", *args], cwd=str(path),
+                capture_output=True, text=True, timeout=_GIT_TIMEOUT,
+                env={**os.environ, "GIT_OPTIONAL_LOCKS": "0",
+                     "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"})
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return proc.stdout if proc.returncode == 0 else None
+
+    root = git(["rev-parse", "--show-toplevel"])
+    if not root:
+        return None                       # not a repository: say nothing at all
+    out: dict = {"at": at, "root": root.strip()}
+
+    status = git(["status", "--porcelain=v1", "--branch"])
+    if status is not None:
+        lines = status.splitlines()
+        if lines:
+            head = lines[0][3:] if lines[0].startswith("## ") else ""
+            if head.startswith("HEAD"):
+                out["detached"] = True
+            elif head:
+                out["branch"] = head.split("...")[0].split()[0]
+        # `??` is untracked, which is exactly what an agent creating a file
+        # looks like, and a diff of tracked files would never show it.
+        changed = [line[3:] for line in lines[1:] if len(line) > 3]
+        if changed:
+            out["dirty"] = True
+            out["changed_count"] = len(changed)
+            out["changed_files"] = changed[:50]
+            if len(changed) > 50:
+                out["changed_files"].append(f"... and {len(changed) - 50} more")
+
+    sha = git(["rev-parse", "--short", "HEAD"])
+    if sha:
+        out["head"] = sha.strip()
+        subject = git(["log", "-1", "--pretty=%s"])
+        if subject:
+            out["subject"] = subject.strip()[:200]
+
+    if mode == "full":
+        diff = git(["diff", "--no-color", "HEAD"]) or ""
+        untracked = git(["ls-files", "--others", "--exclude-standard"])
+        if untracked:
+            diff += "\n" + "\n".join(f"?? {n}" for n in untracked.splitlines()[:50])
+        try:
+            cap = max(0, int(os.environ.get(GIT_CAP_ENV) or _GIT_DIFF_CAP))
+        except ValueError:
+            cap = _GIT_DIFF_CAP
+        if len(diff) > cap:
+            out["diff"] = diff[:cap]
+            out["diff_truncated"] = True
+        else:
+            out["diff"] = diff
+    else:
+        out["diff_withheld"] = True
+    return out
 
 
 # --------------------------------------------------------------------------

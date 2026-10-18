@@ -68,6 +68,33 @@ class Indexer:
     def __init__(self, store: TraceStore, dirs: list[Path]) -> None:
         self.store = store
         self.dirs = dirs
+        #: cwd -> workspace snapshot (or None when it is not a repository), so a
+        #: session's hundreds of events cost one `git status`.
+        self._workspaces: dict[str, dict[str, Any] | None] = {}
+
+    def _enrich(self, event: dict[str, Any]) -> dict[str, Any]:
+        """Attach the workspace when the adapter did not record one.
+
+        Recording it at capture time is better — it says what the agent SAW.
+        Most traces on disk predate that, and for those a snapshot read now is
+        still worth having, as long as it is labelled `at: index` so nobody
+        compares a months-old trace against today's diff and believes it.
+
+        The raw JSONL is not touched: this lands in the projection, which is
+        derived data by definition.
+        """
+        resource = event.get("resource")
+        cwd = (resource or {}).get("cwd") if isinstance(resource, dict) else None
+        if not cwd or (isinstance(resource, dict) and resource.get("git")):
+            return event
+        if cwd not in self._workspaces:
+            from core.workspace import snapshot
+            self._workspaces[cwd] = snapshot(cwd, at="index")
+        git = self._workspaces[cwd]
+        if not git:
+            self._workspaces[cwd] = None
+            return event
+        return {**event, "resource": {**resource, "git": git.to_dict()}}
 
     def scan_once(self) -> ScanReport:
         report = ScanReport()
@@ -95,8 +122,18 @@ class Indexer:
         return report
 
     def full_rebuild(self) -> ScanReport:
-        """Re-ingest everything from scratch (recovery / first run)."""
+        """Re-ingest everything from the JSONL files.
+
+        The archive is CLEARED first. Without that this was not a rebuild at
+        all: re-reading the files produced the same event ids, ingest dedups by
+        id, and the stored payloads kept whatever an older converter had
+        written — so a converter fix (a new attribute, a corrected field) never
+        reached a trace that was already indexed. The JSONL files are the truth
+        and they are still there, which is exactly why the archive may be
+        dropped.
+        """
         report = ScanReport()
+        self.store.clear_archive()
         before = self._counters()
         for path in iter_trace_files(self.dirs):
             report.files_seen += 1
@@ -178,7 +215,7 @@ class Indexer:
                     corrupt += 1
                     last_error = "line is not a JSON object"
                     continue
-                events = self._to_canonical(rec)
+                events = [self._enrich(e) for e in self._to_canonical(rec)]
                 source_line: int | None = lineno if full else None
                 for event in events:
                     # Counters live on the store (it is what knows why an

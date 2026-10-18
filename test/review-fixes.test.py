@@ -898,16 +898,41 @@ check("the same event in two files is added once and deduped once",
       str(r1.__dict__))
 check("a dedup is not a problem", r1.problems == [], str(r1.problems))
 
+# A full rebuild CLEARS the archive and re-reads the files. It used not to:
+# re-reading produced the same event ids, ingest dedups by id, and the stored
+# payloads kept whatever an OLDER converter had written — so a converter fix
+# never reached a trace that was already indexed. The counts below are therefore
+# "everything re-added, and the cross-file duplicate deduped once".
+ids_before = {r["event_id"] for r in c_store.query("SELECT event_id FROM events")}
 r2 = c_idx.full_rebuild()
-# Both files are re-read, so the shared event is presented twice and deduped
-# twice — the count is per presentation, which is the honest thing for a
-# counter that is meant to describe what the ingest actually saw.
-check("a full rebuild replays the archive as dedup, not as new events",
-      r2.events_added == 0 and r2.events_deduped == 2
+check("a full rebuild re-ingests from the files",
+      r2.events_added == 1 and r2.events_deduped == 1
       and r2.events_invalid == 0 and r2.event_id_conflicts == 0,
       str(r2.__dict__))
+check("...to the same event ids (the conversion is deterministic)",
+      {r["event_id"] for r in c_store.query("SELECT event_id FROM events")}
+      == ids_before)
 check("an unchanged scan is entirely quiet",
       c_idx.scan_once().__dict__["events_added"] == 0)
+
+# ...and the reason for clearing: a payload written by an older converter is
+# REPLACED. Simulated by overwriting what is on disk in the projection.
+c_store._conn().execute(
+    "UPDATE events SET payload = ? WHERE event_id = ?",
+    (json.dumps({"v": 2, "event_id": next(iter(ids_before)), "type": "event",
+                 "ts": TS % 1, "observed_at": TS % 1, "adapter_id": "hermes",
+                 "session_id": "s", "trace_id": "old",
+                 "event": {"name": "note", "attributes": {"text": "STALE"}}}),
+     next(iter(ids_before))))
+c_store._conn().commit()
+check("a stale stored payload is present before the rebuild",
+      "STALE" in c_store.one("SELECT payload FROM events WHERE event_id = ?",
+                            (next(iter(ids_before)),))["payload"])
+c_idx.full_rebuild()
+check("a full rebuild REPLACES a payload an older converter wrote",
+      "STALE" not in c_store.one("SELECT payload FROM events WHERE event_id = ?",
+                                (next(iter(ids_before)),))["payload"],
+      "the archive was cleared, so the file's version won")
 
 # same id, DIFFERENT payload is the one case that IS an adapter bug
 c_store.ingest({"v": 2, "event_id": shared and convert_record(shared)["event_id"],

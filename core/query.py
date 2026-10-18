@@ -149,10 +149,16 @@ def get_trace(store: TraceStore, trace_id: str) -> dict[str, Any] | None:
     has_usage = any(t is not None for s in spans
                     for t in (s["tokens"]["input"], s["tokens"]["output"],
                               s["tokens"]["cache_read"]))
+    workspace = None
+    for span in spans:
+        if span.get("resource"):
+            workspace = span["resource"]
+            break
     return {
         "trace_id": trace_id,
         "adapter_id": rows[0]["adapter_id"],
         "session_id": rows[0]["session_id"],
+        "workspace": workspace,
         "status": _trace_status(errors, unclosed),
         "start": first_ts,
         "end": last_ts,
@@ -197,6 +203,7 @@ def _row_to_span(row: sqlite3.Row) -> dict[str, Any]:
         "attributes": attrs,
         "privacy": _load(row["privacy_json"]),
         "source": _load(row["source_json"]),
+        "resource": _load(row["resource_json"]),
         "agent_version": row["agent_version"],
         "synthetic": bool(row["synthetic"]),
         "ended": bool(row["ended"]),

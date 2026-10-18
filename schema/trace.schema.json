@@ -131,6 +131,16 @@
       }
     },
 
+    "resource": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "description": "process/workspace context. `git` carries the repository state (root/branch/head/dirty/changed_files, and the diff only when AGENTTRACE_GIT=full). `at` says whether it was captured live or read later at index time.",
+      "properties": {
+        "cwd": { "type": ["string", "null"] },
+        "git": { "type": ["object", "null"], "additionalProperties": true }
+      }
+    },
+
     "source_file": {
       "type": "string",
       "description": "for file-derived adapters (codex rollout jsonl, pi session jsonl): the file this was parsed from"

@@ -40,6 +40,8 @@
  */
 
 import { appendFileSync, mkdirSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -120,6 +122,59 @@ function truncate(v: unknown): unknown {
 		return v.slice(0, MAX_CHARS) + `\n...[truncated ${v.length - MAX_CHARS} chars]`;
 	}
 	return v;
+}
+
+/**
+ * The repository the session is running against, captured ONCE per session.
+ *
+ * A trace without the code it worked on answers "the tests failed" and not "the
+ * tests failed on this branch, at this commit, after editing these files". Every
+ * git call is read-only and short: `--no-optional-locks` keeps git from taking
+ * the user's index lock, and a timeout keeps a slow filesystem from stalling the
+ * agent it observes. `AGENTTRACE_GIT=off` disables it, `=full` adds the diff.
+ */
+function gitSnapshot(cwd?: string): Record<string, unknown> | null {
+	const mode = (process.env.AGENTTRACE_GIT ?? "metadata").toLowerCase();
+	if (mode === "off" || !cwd) return null;
+	const git = (args: string[]): string | null => {
+		try {
+			return execFileSync("git", ["--no-optional-locks", ...args], {
+				cwd, timeout: 4000, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+				env: { ...process.env, GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" },
+			}).trim();
+		} catch {
+			return null;
+		}
+	};
+	const root = git(["rev-parse", "--show-toplevel"]);
+	if (!root) return null;                       // not a repo: say nothing
+	const snap: Record<string, unknown> = { at: "capture", root };
+	const status = git(["status", "--porcelain=v1", "--branch"]);
+	if (status !== null) {
+		const lines = status.split("\n");
+		const m = /^## (\S+|HEAD \(no branch\))/.exec(lines[0] ?? "");
+		if (m) {
+			if (m[1].startsWith("HEAD")) snap.detached = true;
+			else snap.branch = m[1];
+		}
+		const changed = lines.slice(1).filter(Boolean).map((l) => l.slice(3));
+		if (changed.length) {
+			snap.dirty = true;
+			snap.changed_count = changed.length;
+			snap.changed_files = changed.slice(0, 50);
+		}
+	}
+	const head = git(["rev-parse", "--short", "HEAD"]);
+	if (head) snap.head = head;
+	if (mode === "full") {
+		const diff = git(["diff", "--no-color", "HEAD"]) ?? "";
+		const cap = Number(process.env.AGENTTRACE_GIT_MAX ?? 20000);
+		snap.diff = diff.length > cap ? diff.slice(0, cap) : diff;
+		if (diff.length > cap) snap.diff_truncated = true;
+	} else {
+		snap.diff_withheld = true;
+	}
+	return snap;
 }
 
 function emit(rec: Record<string, unknown>): void {
@@ -316,8 +371,13 @@ export default function agentTrace(pi: ExtensionHost) {
 	 * session file, which is one span id for two different provider calls, and
 	 * the conformance kit rejected the stream. Request ids therefore have to be
 	 * unique within the SESSION, not within the run.
+	 *
+	 * A random id, NOT a clock slice: `Date.now().toString(36).slice(-5)` gives
+	 * two processes started in the same millisecond the SAME discriminator, which
+	 * is the collision this exists to prevent — and two agents opening one
+	 * session file at once is exactly that case.
 	 */
-	const runId = Date.now().toString(36).slice(-5);
+	const runId = randomUUID().replace(/-/g, "").slice(0, 10);
 	/**
 	 * request_id of the provider call this turn is currently on. Kept for the
 	 * WHOLE turn, not cleared when the response arrives: the tool calls that
@@ -340,13 +400,19 @@ export default function agentTrace(pi: ExtensionHost) {
 	const scopedToolId = (raw?: string) =>
 		raw ? `${turnRequestId ?? `turn${turnIndex ?? 0}`}:${raw}` : undefined;
 
+	// Captured once, not per event: the repository state at the START of the
+	// session is what a reader needs in order to interpret it, and a snapshot
+	// per event would put a `git status` on the agent's hot path.
+	let git: Record<string, unknown> | null = null;
 	pi.on("session_start", (event, ctx) => {
 		sessionFile = pickSessionId(ctx);
+		git = gitSnapshot(ctx?.cwd);
 		emit({
 			event: "session_start",
 			session_id: sessionFile,
 			cwd: ctx?.cwd,
 			mode: ctx?.mode,
+			resource: git ? { cwd: ctx?.cwd, git } : undefined,
 			note: `reason=${event?.reason ?? "startup"}`,
 		});
 	});

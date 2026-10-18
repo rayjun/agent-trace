@@ -290,6 +290,22 @@ def _shape_tool_calls(raw) -> list[dict]:
 # write
 # --------------------------------------------------------------------------
 
+_workspace_cache: dict = {}
+
+
+def _workspace() -> dict | None:
+    """The workspace, captured once per process for this plugin instance."""
+    if "value" not in _workspace_cache:
+        try:
+            cwd = os.getcwd()
+        except OSError:
+            cwd = None
+        snap = common.workspace_snapshot(cwd) if cwd else None
+        _workspace_cache["value"] = (
+            {"cwd": cwd, "git": snap} if cwd else None)
+    return _workspace_cache["value"]
+
+
 def _write(record: dict) -> None:
     """Append one record to the profile's daily trace file.
 
@@ -492,11 +508,18 @@ def on_session_start(**kw) -> None:
     so there is no request-side content to record — it exists so a reader can
     see a session open even when no LLM call follows it (empty turn, refusal,
     or a run that dies before the first request).
+
+    It is also the ONE place the workspace is captured: the hook carries no cwd,
+    so `os.getcwd()` is used — this plugin runs inside the agent's process, so
+    that IS the directory the agent is working in. Once per session, because a
+    snapshot per event would put a `git status` on the request path.
     """
+    resource = _workspace()
     _emit(
         "session_start",
         session_id=kw.get("session_id"),
         model=kw.get("model"),
+        resource=resource,
         note=f"platform={kw.get('platform')}",
     )
 

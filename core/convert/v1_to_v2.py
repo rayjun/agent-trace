@@ -43,6 +43,7 @@ from typing import Any, Iterable, Iterator
 
 from core.schema.model import (SCHEMA_V2, derive_event_id,
                                event_event_id, span_event_id)
+from core.workspace import file_of_tool_call
 
 
 def _digest(rec: dict[str, Any]) -> str:
@@ -79,6 +80,9 @@ def _trace_id(adapter: str, session: str, turn: str | None) -> str:
 def _base(rec: dict[str, Any], etype: str) -> dict[str, Any]:
     """The envelope every converted event shares."""
     adapter = rec.get("agent") or "unknown"
+    resource = rec.get("resource")
+    if not isinstance(resource, dict) and rec.get("cwd"):
+        resource = {"cwd": rec["cwd"]}
     return {
         "v": SCHEMA_V2,
         "type": etype,
@@ -89,6 +93,9 @@ def _base(rec: dict[str, Any], etype: str) -> dict[str, Any]:
         "adapter_id": adapter,
         "agent_name": adapter,
         "session_id": rec.get("session_id"),
+        # The workspace travels on the envelope, not on one span: it describes
+        # the session, and every trace in it inherits the same repository.
+        "resource": resource,
         "source": (
             {"file": rec["source_file"]} if rec.get("source_file") else None
         ),
@@ -161,6 +168,12 @@ def _convert_span_pair(rec: dict[str, Any]) -> dict[str, Any] | None:
         span["name"] = tool.get("name") or "tool_call"
         span["input"] = {"args": tool.get("args")}
         span["status"] = "running"
+        # Which file this call touched, when the arguments name one. It is the
+        # difference between "an edit failed" and "the edit of src/config.py
+        # failed", and it lets a reader follow one file through a whole trace.
+        touched = file_of_tool_call(tool.get("args"))
+        if touched:
+            attributes["file"] = touched
     else:  # tool_result
         tool = rec.get("tool") or {}
         status = tool.get("status") or "ok"
