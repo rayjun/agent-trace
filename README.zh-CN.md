@@ -84,6 +84,20 @@ agenttrace index                   # 一次性重建索引，输出报告
 agenttrace index --full            # 从原始归档重建全部投影
 ```
 
+## 「agent 在跑，但页面上什么都没有」
+
+live 型适配器只在 agent **启动时**加载，所以装好扩展对已经在运行的会话没有
+影响 —— 需要重启 agent（Pi 用 `/reload` 也可以）。Dashboard 现在会自己说明
+这一点：如果有 session 在适配器安装之后启动却没有 trace，它会直接告警。
+
+已经丢掉的历史，对留有 transcript 的 agent 可以回填：
+
+```bash
+python3 pi/pi_import.py            # Pi：回填所有没有 live trace 的会话
+python3 codex/codex_import.py <rollout.jsonl>
+agenttrace adapter coverage         # 缺什么、为什么缺（有近期缺口时退出码 1）
+```
+
 ## 适配器
 
 内置五个：**hermes**、**codex**、**pi**，以及 **otlp**（导入/导出任何接入

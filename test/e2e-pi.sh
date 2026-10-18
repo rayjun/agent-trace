@@ -77,17 +77,28 @@ run_with_timeout() {
 # ${PI_ARGS[@]+...}: bash 3.2 (macOS /bin/bash) treats "${PI_ARGS[@]}" on an
 # empty array as unbound under `set -u`. The expansion guard is the portable
 # form and a no-op on newer bash.
-if ! run_with_timeout 240 pi ${PI_ARGS[@]+"${PI_ARGS[@]}"} -p "$PROMPT" >/dev/null 2>&1; then
-  echo "FAIL — pi -p exited non-zero (model=${PI_E2E_MODEL:-default}; pass PI_E2E_MODEL if the default is unavailable)"
-  exit 1
-fi
+# The agent's own exit status is not the adapter's: a provider failure makes
+# `pi -p` exit non-zero while the adapter still records the attempt. The gate
+# below is the record count, not the agent's status.
+PI_LOG=$(mktemp)
+pi_rc=0
+run_with_timeout 240 pi ${PI_ARGS[@]+"${PI_ARGS[@]}"} -p "$PROMPT" \
+  >"$PI_LOG" 2>&1 || pi_rc=$?
 sleep 1
 
 after=$(count_records "$TRACE_DIR")
 if [ "$after" -le "$before" ]; then
   echo "FAIL — no new records (before=$before after=$after)"
+  [ "$pi_rc" -ne 0 ] && { echo "       (and pi itself failed:)"; \
+    tail -3 "$PI_LOG" | sed 's/^/       /'; }
   exit 1
 fi
+if [ "$pi_rc" -ne 0 ]; then
+  echo "NOTE — pi exited $pi_rc and the adapter recorded the attempt anyway"
+  grep -iE "404|401|403|429|expired|quota|rate limit|not found" "$PI_LOG" \
+    | head -2 | sed 's/^/       /' || true
+fi
+rm -f "$PI_LOG"
 
 # Locate THIS conversation's session id by the exact prompt (session_id is
 # ctx.sessionManager.getSessionFile() — a full path string).

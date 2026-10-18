@@ -13,6 +13,13 @@ set -euo pipefail
 # fired because `cat` failed, so the two-line value then made
 # `[ "$after" -le "$before" ]` error out ("integer expression expected") and
 # the gate silently stopped gating.
+
+# The agent's own exit status is NOT the adapter's. A provider failure (an
+# expired key, a rate limit, a model that no longer exists) makes `hermes chat`
+# exit non-zero while the adapter does its job perfectly — it records the failed
+# attempt, which is exactly what a tracer is for. Failing the suite on that
+# trains people to ignore it, so the two are reported separately: the gate is
+# "did the adapter write records", and the agent's failure is stated as context.
 count_records() {
   local dir="$1" total=0 f
   for f in "$dir"/*.jsonl; do
@@ -43,16 +50,30 @@ fi
 before=$(count_records "$TRACES")
 # ${HERMES_ARGS[@]+...}: portable empty-array expansion — bash 3.2 (macOS)
 # errors on "${HERMES_ARGS[@]}" under `set -u` when the array is empty.
-hermes ${HERMES_ARGS[@]+"${HERMES_ARGS[@]}"} chat -q "Reply with exactly: E2E-OK" >/dev/null 2>&1
+AGENT_LOG=$(mktemp)
+# `|| agent_rc=$?` rather than a bare call: this script runs under `set -e`, so
+# a failing agent would abort before the exit status is ever examined.
+agent_rc=0
+hermes ${HERMES_ARGS[@]+"${HERMES_ARGS[@]}"} chat -q "Reply with exactly: E2E-OK" \
+  >"$AGENT_LOG" 2>&1 || agent_rc=$?
 sleep 1
 after=$(count_records "$TRACES")
 
 if [ "$after" -le "$before" ]; then
   echo "FAIL — hermes produced no new trace records (before=$before after=$after)"
   echo "       profile=$PROFILE traces=$TRACES"
+  [ "$agent_rc" -ne 0 ] && { echo "       (and the agent itself failed:)"; \
+    tail -3 "$AGENT_LOG" | sed 's/^/       /'; }
   exit 1
 fi
 echo "PASS — hermes (profile=$PROFILE) wrote $((after - before)) new trace records"
+if [ "$agent_rc" -ne 0 ]; then
+  echo "NOTE — the agent exited $agent_rc, and the adapter recorded the attempt"
+  echo "       anyway (that is what a tracer is for). Provider-side cause:"
+  grep -iE "404|401|403|429|expired|quota|rate limit|not found" "$AGENT_LOG" \
+    | head -2 | sed 's/^/       /' || true
+fi
+rm -f "$AGENT_LOG"
 
 # Locate the session that produced the reply BEFORE rendering. The render
 # scopes itself via latest_session — the trace file's LAST record — and any

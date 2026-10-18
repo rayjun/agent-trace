@@ -273,7 +273,8 @@ def overview(store: TraceStore) -> dict[str, Any]:
     }
 
 
-def list_adapters(store: TraceStore) -> dict[str, Any]:
+def list_adapters(store: TraceStore, *,
+                  index_ready: bool = True) -> dict[str, Any]:
     """Registry declarations + what the data actually shows. Both, side by
     side — the Integrations page's job is to make drift between the two
     visible, not to hide it.
@@ -283,6 +284,28 @@ def list_adapters(store: TraceStore) -> dict[str, Any]:
     A claim without a test renders as `unverified` rather than being hidden.
     """
     from adapter_sdk import compatibility, discovery
+    from core import coverage as coverage_mod
+
+    # Coverage answers a question the registry cannot: "the adapter is
+    # installed" and "the adapter is capturing" are different facts. A live
+    # hook is loaded at PROCESS START, so an agent that was already running
+    # when the adapter was installed keeps writing nothing at all.
+    # Index-backed: the indexer already stores (session_id, adapter_id) for
+    # every event, so this is one indexed SELECT. Reading the raw trace files
+    # here meant re-parsing 1.1 GB inside a request, which timed out the
+    # dashboard's own adapters page.
+    #
+    # Until the first index pass finishes, the honest answer is "not yet": the
+    # sessions projection is written at the END of a pass, so mid-pass every
+    # adapter whose file has not been read looks like it captures nothing.
+    if index_ready:
+        provider = coverage_mod.store_session_provider(store.path)
+        cov = {c.adapter_id: c for c in coverage_mod.cached(traced_provider=provider)}
+        coverage_note = None
+    else:
+        cov = {}
+        coverage_note = ("the index is still building its first pass; coverage "
+                         "will be judged once it finishes")
 
     observed = {
         r["adapter_id"]: dict(r)
@@ -304,12 +327,20 @@ def list_adapters(store: TraceStore) -> dict[str, Any]:
         adapters.append({
             **entry.to_dict(),
             "observed": observed.get(entry.adapter_id),
+            "coverage": cov[entry.adapter_id].to_dict()
+            if entry.adapter_id in cov else None,
             "compatibility": ({"target": compat.target,
                                "status": compat.status,
                                "verified_by": compat.verified_by,
                                "notes": compat.notes} if compat else None),
         })
-    return {"adapters": adapters, "ingest_files": files}
+    return {
+        "adapters": adapters,
+        "ingest_files": files,
+        "coverage_ready": index_ready,
+        "coverage_note": coverage_note,
+        "coverage_warnings": [c.warning() for c in cov.values() if c.warning()],
+    }
 
 
 def _load(raw: str | None) -> Any:

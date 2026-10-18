@@ -595,6 +595,12 @@ def build_parser() -> argparse.ArgumentParser:
     adapter_sub = p_adapter.add_subparsers(dest="adapter_cmd", required=True)
     p_al = adapter_sub.add_parser("list", help="every known adapter, with source")
     p_al.add_argument("--json", action="store_true")
+    p_ac = adapter_sub.add_parser(
+        "coverage",
+        help="does an installed adapter actually have traces for the sessions "
+             "its agent ran? (exit 1 when a recent session is missing)")
+    p_ac.add_argument("--json", action="store_true")
+    p_ac.add_argument("--fresh", action="store_true", help="bypass the cache")
     p_at = adapter_sub.add_parser(
         "test",
         help="run the conformance kit over an event stream, or an adapter's "
@@ -700,6 +706,55 @@ def cmd_index(args) -> int:
     return 0
 
 
+def _coverage_rows(fresh: bool = False):
+    """Coverage, from the index when there is one and from the files otherwise.
+
+    The index is one indexed SELECT; the file fallback re-reads every trace
+    line and only exists so the check still works before an index is built (or
+    when it is deliberately absent).
+    """
+    from core import coverage as cov_mod
+    from server.main import platform_dir
+
+    db = Path(os.environ.get("AGENTTRACE_DB") or platform_dir() / "agenttrace.db")
+    if db.exists():
+        provider = cov_mod.store_session_provider(db)
+        return cov_mod.check(traced_provider=provider) if fresh else \
+            cov_mod.cached(traced_provider=provider)
+    return cov_mod.check() if fresh else cov_mod.cached()
+
+
+def _print_coverage_summary(json_out: bool = False) -> bool:
+    """Print what the adapters are ACTUALLY capturing; True when all is well.
+
+    Two separate facts, and only one of them is in the registry: an adapter can
+    be installed, verified and enabled while capturing nothing at all. A live
+    hook is loaded at PROCESS START, so an agent that was already running when
+    the adapter was installed writes nothing until it restarts — which is how
+    53 of 63 Pi sessions went missing with nothing anywhere saying so.
+    """
+    covs = _coverage_rows()
+    if json_out:
+        print(json.dumps([c.to_dict() for c in covs], indent=2))
+        return all(c.ok for c in covs)
+
+    gaps = [c for c in covs if c.sessions_known or c.untraced_recent]
+    if not gaps:
+        return True
+    print("\ncoverage (sessions the agent ran vs. traces we hold):")
+    for c in gaps:
+        mark = "ok " if c.ok else "!! "
+        print(f"  {mark}{c.adapter_id:<8} {c.sessions_covered}/{c.sessions_known} traced"
+              + (f", {len(c.untraced_recent)} recent gap(s)" if c.untraced_recent else "")
+              + (f", {c.untraced_historical} historical" if c.untraced_historical else ""))
+    for c in gaps:
+        if c.note:
+            print(f"     note: {c.note}")
+    for w in [c.warning() for c in covs if c.warning()]:
+        print(f"\n  WARNING: {w}")
+    return all(c.ok for c in covs)
+
+
 def cmd_adapter(args) -> int:
     from adapter_sdk import compatibility, discovery
 
@@ -732,9 +787,39 @@ def cmd_adapter(args) -> int:
                 print(f"{'':14} partial:   {', '.join(sorted(partial))}")
         print(f"\n{len(entries)} adapter(s). "
               f"Manifests: {discovery.manifest_dir()}")
+        _print_coverage_summary()
         print("Discovery reads metadata only; nothing is imported "
               "until `agenttrace adapter test <id>`.")
         return 0
+
+    if args.adapter_cmd == "coverage":
+        from core import coverage as cov_mod
+
+        covs = _coverage_rows(fresh=args.fresh)
+        if args.json:
+            print(json.dumps([c.to_dict() for c in covs], indent=2))
+            return 1 if any(not c.ok for c in covs) else 0
+        print(f"{'adapter':<10}{'sessions':>9}{'traced':>8}{'recent gaps':>13}"
+              f"{'historical':>11}  source")
+        for c in covs:
+            print(f"{c.adapter_id:<10}{c.sessions_known:>9}{c.sessions_covered:>8}"
+                  f"{len(c.untraced_recent):>13}{c.untraced_historical:>11}"
+                  f"  {c.source}")
+            if c.untraced_unknown_age:
+                print(f"{'':<10}{c.untraced_unknown_age} untraced session(s) of "
+                      f"unknown age (no install marker to compare against)")
+            if c.error:
+                print(f"{'':<10}coverage unknown: {c.error}")
+            if c.note:
+                print(f"{'':<10}note: {c.note}")
+            if c.undecided:
+                print(f"{'':<10}verdict withheld (no index yet)")
+            for name, started in c.untraced_recent[:5]:
+                print(f"{'':<10}  recent gap: {started}  {name[:60]}")
+        for w in [c.warning() for c in covs if c.warning()]:
+            print()
+            print(f"WARNING: {w}")
+        return 1 if any(not c.ok for c in covs) else 0
 
     # adapter test <events.jsonl | adapter_id>
     from adapter_sdk.testing import check_stream

@@ -127,6 +127,51 @@ check("corrupt line quarantined",
 
 check("non-v1 record returns None", convert_record({"v": 99}) is None)
 
+# ---- convert_stream: a trace split across files gets ONE task span ---------
+# An agent's daily files split a session across days, and the task span is
+# derived from a trace's children. Synthesizing per FILE emitted one task span
+# per file for the same trace — same span id, different bounds — which the
+# conformance kit rejected as a duplicate.
+import tempfile as _tempfile  # noqa: E402
+
+from adapter_sdk.testing import check_stream  # noqa: E402
+from core.convert.v1_to_v2 import convert_file, convert_stream  # noqa: E402
+
+_split = Path(_tempfile.mkdtemp())
+day1, day2 = _split / "day1.jsonl", _split / "day2.jsonl"
+day1.write_text(json.dumps(v1("llm_request", 1, request_id="a", model="m")) + "\n",
+                encoding="utf-8")
+day2.write_text(json.dumps(v1("llm_response", 2, request_id="a", model="m",
+                              response={"content": "x"})) + "\n",
+                encoding="utf-8")
+
+per_file = list(convert_file(day1)) + list(convert_file(day2))
+tasks_per_file = [e for e in per_file
+                  if e["type"] == "span_start" and e["span"]["kind"] == "task"]
+check("per-file conversion emits one task span PER FILE (the bug)",
+      len(tasks_per_file) == 2
+      and tasks_per_file[0]["span_id"] == tasks_per_file[1]["span_id"],
+      str([t["span_id"][:12] for t in tasks_per_file]))
+
+stream = list(convert_stream([day1, day2]))
+tasks_stream = [e for e in stream
+                if e["type"] == "span_start" and e["span"]["kind"] == "task"]
+check("convert_stream synthesizes the task span ONCE for the whole trace",
+      len(tasks_stream) == 1, str(len(tasks_stream)))
+check("...and the whole split trace still validates",
+      all(not validate_event(e) for e in stream))
+
+# the stream's own conformance, which is what caught it
+_stream_file = _split / "stream.jsonl"
+_stream_file.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in per_file)
+                        + "\n", encoding="utf-8")
+check("the per-file stream FAILS conformance (duplicate span id)",
+      not check_stream(_stream_file).ok)
+_stream_file.write_text("\n".join(json.dumps(e, ensure_ascii=False) for e in stream)
+                        + "\n", encoding="utf-8")
+check("the cross-file stream PASSES conformance",
+      check_stream(_stream_file, adapter_id="hermes").ok)
+
 print()
 if fails:
     print(f"{len(fails)} FAILURES", file=sys.stderr)

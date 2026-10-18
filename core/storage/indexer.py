@@ -131,7 +131,18 @@ class Indexer:
         # own shrink happens later in the same pass would compare its new size
         # against 0, look "unchanged", and keep its stale events forever.
         baseline = state["size"] if state is not None else 0
-        if state is not None and stat.st_size < baseline:
+        replaced = False
+        if state is not None:
+            # A file swapped for a DIFFERENT one is not an append, even when it
+            # is bigger: the stored offset then lands in the middle of a record
+            # and the tail read ingests fragments. Size alone could not see it.
+            if "inode" in state.keys() and state["inode"] is not None \
+                    and getattr(stat, "st_ino", None) is not None \
+                    and state["inode"] != stat.st_ino:
+                replaced = True
+            elif stat.st_mtime < (state["mtime"] or 0):
+                replaced = True      # restored from a backup
+        if state is not None and (stat.st_size < baseline or replaced):
             self.store.invalidate_file(key)
             report.files_invalidated += 1
             state = None
@@ -176,7 +187,8 @@ class Indexer:
                                       source_line=source_line)
         stat = path.stat()
         self.store.note_file(key, stat.st_size, stat.st_mtime, stat.st_size,
-                             corrupt_lines=corrupt, last_error=last_error)
+                             corrupt_lines=corrupt, last_error=last_error,
+                             inode=getattr(stat, "st_ino", None))
         report.corrupt_lines += corrupt
         report.files_ingested += 1
 

@@ -352,7 +352,19 @@ async function renderSessions() {
 
 async function renderAdapters() {
   const data = await api("adapters");
-  app.innerHTML = data.adapters.map(a => `
+  // Coverage first: an adapter can be installed, verified and enabled while
+  // capturing NOTHING, because a live hook is loaded at process start and an
+  // agent already running when it was installed writes nothing until it
+  // restarts. That is what an empty dashboard looks like from the inside.
+  const building = data.coverage_ready === false
+    ? `<div class="panel"><p class="dim">${esc(data.coverage_note || "index still building")}</p></div>`
+    : "";
+  const warn = (data.coverage_warnings || []).length
+    ? `<div class="panel alert">
+         <h1>⚠ adapters are not capturing everything</h1>
+         ${data.coverage_warnings.map(w => `<p>${esc(w)}</p>`).join("")}
+       </div>` : "";
+  app.innerHTML = building + warn + data.adapters.map(a => `
     <div class="panel">
       <h1 class="mono">${esc(a.adapter_id)} <span class="badge kind">${esc(a.kind)}</span>
         <span class="badge ${a.compatibility ? esc(a.compatibility.status === "verified" ? "ok" : "unknown") : "unknown"}">${esc(a.compatibility ? a.compatibility.status : "unverified")}</span>
@@ -363,6 +375,7 @@ async function renderAdapters() {
         ${a.module ? `<dt>module</dt><dd class="mono">${esc(a.module)}</dd>` : ""}
         ${a.compatibility ? `<dt>verified by</dt><dd class="mono dim">${esc(a.compatibility.target)}<br>${esc(a.compatibility.verified_by)}</dd>` : ""}
         ${a.observed ? `<dt>observed</dt><dd class="mono">${a.observed.spans} spans, last ${esc(a.observed.last_activity || "—")}${a.observed.unclosed ? `, ${a.observed.unclosed} open` : ""}</dd>` : "<dt>observed</dt><dd class='dim'>no data yet</dd>"}
+        ${coverageRow(a)}
       </dl>
       <table class="cap-table" style="margin-top:8px"><tbody>
         ${Object.entries(a.capabilities).map(([cap, info]) => `
@@ -376,6 +389,33 @@ async function renderAdapters() {
        <tr><td class="mono dim">${esc(f.path)}</td><td class="mono">${fmtTok(f.indexed_bytes)}</td>
        <td class="mono ${f.corrupt_lines ? "" : "dim"}">${f.corrupt_lines}${f.last_error ? ` (${esc(f.last_error.slice(0, 40))})` : ""}</td>
        <td class="mono dim">${esc(fmtTs(f.updated_at))}</td></tr>`).join("")}</tbody></table></div>`;
+}
+
+function coverageRow(a) {
+  const c = a.coverage;
+  if (!c) return "";
+  const recent = c.untraced_recent_count || 0;
+  if (c.error) {
+    return `<dt>coverage</dt><dd class="dim">unknown — ${esc(c.error)}</dd>`;
+  }
+  if (!c.sessions_known) {
+    return `<dt>coverage</dt><dd class="dim">no session artefacts found at
+      <span class="mono">${esc(c.source || "")}</span></dd>`;
+  }
+  const state = recent
+    ? `<span class="badge error">${recent} recent gap(s)</span>`
+    : `<span class="badge ok">complete</span>`;
+  const detail = [];
+  if (c.untraced_historical) detail.push(`${c.untraced_historical} older than the install`);
+  if (c.untraced_unknown_age) detail.push(`${c.untraced_unknown_age} of unknown age (no install marker)`);
+  if (c.sessions_traced_only) detail.push(`${c.sessions_traced_only} traced with no artefact left`);
+  if (recent && c.backfill_hint) detail.push(`recover: <code>${esc(c.backfill_hint)}</code>`);
+  return `<dt>coverage</dt><dd>${state}
+      <span class="mono">${c.sessions_covered}/${c.sessions_known} sessions traced</span>
+      ${c.installed_at ? `<span class="dim">(adapter since ${esc(c.installed_at.slice(0, 16))})</span>` : ""}
+      ${detail.length ? `<br><span class="dim">${detail.join(" · ")}</span>` : ""}
+      ${recent ? `<br><span class="mono dim">oldest gap: ${esc(c.untraced_recent[0].started)} ${esc(c.untraced_recent[0].session.slice(0, 46))}</span>` : ""}
+    </dd>`;
 }
 
 /* ------------------------------------------------------------------ */

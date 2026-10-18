@@ -90,6 +90,21 @@ agenttrace index                   # one-shot reindex, prints the report
 agenttrace index --full            # rebuild projections from the raw archive
 ```
 
+## "My agent is running but nothing shows up"
+
+A live adapter is loaded when the agent starts, so registering one does nothing
+for a session that is already running — restart the agent (Pi: `/reload` also
+works). The dashboard now says so itself: it warns when a session started after
+the adapter was installed has no traces.
+
+Already-lost history can be recovered for agents that keep a transcript:
+
+```bash
+python3 pi/pi_import.py            # Pi: every session with no live traces
+python3 codex/codex_import.py <rollout.jsonl>
+agenttrace adapter coverage         # what is missing, and why (exit 1 on a gap)
+```
+
 ## Adapters
 
 Five adapters ship: **hermes**, **codex**, **pi**, plus **otlp** (import and

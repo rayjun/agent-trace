@@ -179,7 +179,13 @@ assert.ok(recs.some((r) => r.event === "session_end"));
 const tcall = recs.find((r) => r.event === "tool_call");
 assert.ok(tcall, "tool_execution_start emitted a tool_call (the ⚙ line)");
 assert.equal(tcall.tool.name, "read");
-assert.equal(tcall.tool.call_id, "call_1");
+// The call id is SCOPED by the request that produced it, because a provider's
+// tool-call ids are unique only within one API response: the same id appearing
+// twice in a session gave the v2 tree two spans sharing one id.
+assert.match(tcall.tool.call_id, /^pi-[a-z0-9]+-0-1:call_1$/,
+	"tool call id is scoped by its request");
+assert.equal(tcall.tool.provider_call_id, "call_1",
+	"the provider's own id is kept, so it stays greppable");
 assert.equal(tcall.tool.args.path, "src/config.py", "args carried through (schema allows objects)");
 const tres = recs.find((r) => r.event === "tool_result");
 assert.equal(tres.tool.name, "read");
@@ -200,13 +206,40 @@ assert.ok(treq.request_id, "llm_request carries a request_id");
 // non-vacuous: turn_id comes from Pi's turn_start index and must be present,
 // else the two halves would "agree" by both being undefined.
 assert.equal(treq.turn_id, "0", "turn_id comes from turn_start's turnIndex");
-assert.equal(treq.request_id, "pi-0-1", "request id is turn + per-turn sequence");
+// runId-turn-seq: the turn index restarts at 0 in a new process, and a session
+// can be resumed, so the run itself has to be part of the identity.
+assert.match(treq.request_id, /^pi-[a-z0-9]+-0-1$/,
+	"request id is run + turn + per-turn sequence");
 assert.equal(tres.request_id, treq.request_id, "tool result joins its turn's request");
 const tresp = recs.find((r) => r.event === "llm_response");
 assert.equal(tresp.request_id, treq.request_id, "llm_response pairs with its request");
 assert.equal(tresp.turn_id, treq.turn_id, "both halves agree on the turn");
 assert.match(tresp.note, /response_id=chatcmpl-abc123/,
 	"Pi's own provider response id kept for cross-referencing");
+
+// ---------------------------------------------------------------------------
+// A turn_start WITHOUT a numeric turnIndex must still yield distinct request
+// ids. Both turns used to fall back to `pi-0-1`, which is one request id — and
+// therefore one llm span id — for two different provider calls in one trace.
+// ---------------------------------------------------------------------------
+const beforeNoIndex = recs.length;
+await fire("turn_start", { type: "turn_start" });        // no turnIndex at all
+await fire("before_provider_request", { type: "before_provider_request",
+	payload: { messages: [{ role: "user", content: "x" }], tools: [] } });
+await fire("turn_end", { type: "turn_end" });
+await fire("turn_start", { type: "turn_start" });        // and again
+await fire("before_provider_request", { type: "before_provider_request",
+	payload: { messages: [{ role: "user", content: "y" }], tools: [] } });
+await fire("turn_end", { type: "turn_end" });
+const noIndex = readFileSync(traceFile, "utf8").trim().split("\n")
+	.map((l) => JSON.parse(l)).slice(beforeNoIndex)
+	.filter((r) => r.event === "llm_request");
+assert.equal(noIndex.length, 2, "both provider calls were emitted");
+assert.notEqual(noIndex[0].request_id, noIndex[1].request_id,
+	"two turns without a turnIndex must not share a request id");
+assert.equal(noIndex[0].turn_id, "0");
+assert.equal(noIndex[1].turn_id, "1",
+	"the fallback turn counter must advance");
 
 // session identity: env first (this run), then the runner context
 for (const r of recs) {

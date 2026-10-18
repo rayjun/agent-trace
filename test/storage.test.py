@@ -10,6 +10,7 @@ incomplete, and self-heals when the end arrives).
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -146,6 +147,35 @@ check("old events gone after shrink",
 check("projections rebuilt after shrink",
       store.one("SELECT COUNT(*) AS n FROM spans WHERE span_id='llm:fresh'")["n"] == 1
       and store.one("SELECT COUNT(*) AS n FROM spans WHERE span_id='llm:r1'")["n"] == 0)
+
+# A file REPLACED by a different, larger one is not an append. Size alone only
+# catches truncation: the stored offset then pointed into the middle of the new
+# file's records and the tail read ingested fragments of them (measured: 6 junk
+# events from a regenerated trace file).
+replace_dir = td / "replace"
+replace_dir.mkdir()
+target = replace_dir / "t.jsonl"
+write(target, [v1("note", 0, note="original")])
+r_store = TraceStore(td / "replace.db")
+r_idx = Indexer(r_store, [replace_dir])
+r_idx.scan_once()
+check("the original file ingested one event",
+      r_store.one("SELECT COUNT(*) AS n FROM events")["n"] == 1)
+# a NEW file, larger, at the same path — a rewrite, a re-export, a re-import
+replacement = replace_dir / "t2.jsonl"
+write(replacement, [v1("note", 1, note=f"replacement {i}") for i in range(5)])
+os.replace(replacement, target)
+r_idx.scan_once()
+notes = set()
+for row in r_store.query("SELECT payload FROM events"):
+    payload = json.loads(row["payload"])
+    text = ((payload.get("event") or {}).get("attributes") or {}).get("text")
+    if text:
+        notes.add(text)
+check("a replaced file's old records are gone, not merged",
+      "original" not in notes, str(sorted(notes)))
+check("...and every record of the new file is present exactly once",
+      notes == {f"replacement {i}" for i in range(5)}, str(sorted(notes)))
 
 # v2-native file: no conversion needed
 f2 = traces_dir / "v2-native.jsonl"

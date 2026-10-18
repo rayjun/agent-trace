@@ -92,6 +92,42 @@ manifest declares. `load()` — reached only via an explicit command — is the
 first time code runs, and `test/discovery.test.py` pins this with a manifest
 whose module raises on import: it must be *listable* and *not* imported.
 
+## When an adapter captures nothing
+
+Two facts that look identical from the dashboard and are not: "installed" and
+"capturing". A native adapter is loaded when its host process starts, so
+registering it does nothing for a session already running — and a session that
+ended before it was installed is gone unless the agent kept a transcript.
+
+```bash
+agenttrace adapter coverage          # sessions the agent ran vs. traces we hold
+agenttrace adapter coverage --json
+```
+
+| adapter | session inventory | recovery |
+|---|---|---|
+| `pi` | `~/.pi/agent/sessions/**/*.jsonl` (a full transcript per session) | `python3 pi/pi_import.py` |
+| `codex` | `~/.codex/sessions/**/rollout-*.jsonl` | `python3 codex/codex_import.py <rollout>` |
+| `hermes` | the `sessions` table in `~/.hermes/state.db` | none: Hermes keeps no wire transcript |
+| `otlp`, `langgraph` | not inventoried (the producer decides) | n/a |
+
+The check splits untraced sessions by age against the adapter's install marker:
+**after** the install is a defect and warns; **before** it is a backfill
+candidate; unknown age stays silent, because a check that warns on every fresh
+install is one nobody reads.
+
+Backfilled records are marked `note="backfill=session"`, use their own
+`request_id` namespace (`pi-bf-*`) and their own turn namespace (`bf-<n>`, so a
+partly-live session cannot collide with its own live turns). The request side of
+a backfilled turn is *rebuilt from the transcript* and says so — Pi does not
+persist the wire payload it sent.
+
+A live adapter needs the agent to be restarted (or reloaded) before it observes
+anything, and a reload in some hosts leaves the previous instance attached: Pi
+was observed emitting every event twice, once per instance, until the adapter
+was fixed to scope its ids per run. If a stream shows doubled turns after a
+reload, that is the cause.
+
 ## Compatibility
 
 A claim without a test is `unverified`. `adapter_sdk/compatibility.py` holds

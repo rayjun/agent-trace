@@ -63,6 +63,13 @@ tr.clickable:hover td { background: #1c2129; }
 .badge.unknown { background: #21262d; color: var(--dim); }
 /* no signal / unscored: neither a pass nor a failure — say so visually */
 .badge.no_signal, .badge.unscored, .badge.no_trace, .badge.running { background: #21262d; color: var(--dim); }
+
+/* A gap in coverage is a defect, not information — it needs to be impossible
+   to skim past (an empty dashboard looks the same whether nothing happened or
+   nothing was captured). */
+.panel.alert { border-color: var(--warn); background: #221c08; }
+.panel.alert h1 { color: var(--warn); }
+.panel.alert p { margin: 6px 0 0; }
 .badge.kind { background: #21262d; color: var(--dim); }
 
 .filters { display: flex; gap: 8px; margin-bottom: 12px; align-items: center; }

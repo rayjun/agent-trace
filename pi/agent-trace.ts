@@ -300,7 +300,24 @@ export default function agentTrace(pi: ExtensionHost) {
 	// context-overflow re-request) inside one turn gets a distinct id instead
 	// of overwriting the previous one's pairing.
 	let turnIndex: number | undefined;
+	/**
+	 * A turn counter that ALWAYS advances, used when Pi's `turn_start` event
+	 * carries no numeric `turnIndex`. Without it two turns both fell back to
+	 * `pi-0-1` — the same request id, and therefore the same llm span id, in
+	 * one trace.
+	 */
+	let turnFallback = -1;
 	let requestSeq = 0;
+	/**
+	 * Identifies THIS run of the process inside the session.
+	 *
+	 * `turnIndex` restarts at 0 in every new process, and a session can be
+	 * resumed — two runs ten minutes apart both produced `pi-0-1` for the same
+	 * session file, which is one span id for two different provider calls, and
+	 * the conformance kit rejected the stream. Request ids therefore have to be
+	 * unique within the SESSION, not within the run.
+	 */
+	const runId = Date.now().toString(36).slice(-5);
 	/**
 	 * request_id of the provider call this turn is currently on. Kept for the
 	 * WHOLE turn, not cleared when the response arrives: the tool calls that
@@ -311,6 +328,17 @@ export default function agentTrace(pi: ExtensionHost) {
 	 */
 	let turnRequestId: string | undefined;
 	const currentTurnId = () => (turnIndex === undefined ? undefined : String(turnIndex));
+	/**
+	 * A tool call's identity, scoped to the request that produced it.
+	 *
+	 * `toolCallId` alone is only unique within one API response: a resumed or
+	 * retried turn can reuse an id, and the resulting pair of spans then shared
+	 * one span id. The request id is already unique per provider call, so
+	 * scoping by it is uniqueness by construction; the raw id stays readable
+	 * after the separator.
+	 */
+	const scopedToolId = (raw?: string) =>
+		raw ? `${turnRequestId ?? `turn${turnIndex ?? 0}`}:${raw}` : undefined;
 
 	pi.on("session_start", (event, ctx) => {
 		sessionFile = pickSessionId(ctx);
@@ -324,8 +352,18 @@ export default function agentTrace(pi: ExtensionHost) {
 	});
 
 	pi.on("turn_start", (event: any, ctx) => {
-		if (typeof event?.turnIndex === "number") turnIndex = event.turnIndex;
-		requestSeq = 0;
+		if (typeof event?.turnIndex === "number") {
+			turnIndex = event.turnIndex;
+		} else {
+			turnFallback += 1;
+			turnIndex = turnFallback;
+		}
+		// `requestSeq` is NOT reset here. A turn can start more than once in a
+		// run — Pi retries a turn after a context-overflow compaction — and
+		// resetting the sequence gave the second attempt the same request id as
+		// the first (`pi-joh84-0-1` twice), which is one span id for two
+		// provider calls. Monotonic per run keeps every id unique; the turn
+		// index stays in the id for readability.
 		turnRequestId = undefined;
 		const m = ctx?.model;
 		if (m) {
@@ -360,7 +398,7 @@ export default function agentTrace(pi: ExtensionHost) {
 		requestSeq += 1;
 		// Unique per session and stable enough to be grepped by eye; the
 		// session is prepended because `agenttrace show` searches all files.
-		const requestId = `pi-${turnIndex ?? 0}-${requestSeq}`;
+		const requestId = `pi-${runId}-${turnIndex ?? 0}-${requestSeq}`;
 		turnRequestId = requestId;
 		emit({
 			event: "llm_request",
@@ -484,7 +522,13 @@ export default function agentTrace(pi: ExtensionHost) {
 			cwd: ctx?.cwd,
 			tool: {
 				name: event?.toolName,
-				call_id: event?.toolCallId,
+				// Scoped by the request that produced it. Provider tool-call ids
+				// are unique within ONE API response, not within a session or a
+				// turn — the same id was observed twice in one real turn, which
+				// gave the v2 tree two spans with one id. The provider's raw id
+				// is kept after the separator so it stays greppable.
+				call_id: scopedToolId(event?.toolCallId),
+				provider_call_id: event?.toolCallId,
 				args: truncate(event?.args),
 			},
 		});
@@ -502,7 +546,8 @@ export default function agentTrace(pi: ExtensionHost) {
 			cwd: ctx?.cwd,
 			tool: {
 				name: event?.toolName,
-				call_id: event?.toolCallId,
+				call_id: scopedToolId(event?.toolCallId),
+				provider_call_id: event?.toolCallId,
 				status: event?.isError ? "error" : "ok",
 				exit_code: exitCode,
 			},
@@ -516,9 +561,8 @@ export default function agentTrace(pi: ExtensionHost) {
 	// Turn boundary: clears the request id so a tool event that arrives after
 	// turn_end (there should be none) cannot claim the previous turn's call.
 	pi.on("turn_end", (event: any) => {
-		requestSeq = 0;
 		turnRequestId = undefined;
-		if (event?.turnIndex !== undefined) turnIndex = event.turnIndex;
+		if (typeof event?.turnIndex === "number") turnIndex = event.turnIndex;
 	});
 
 	pi.on("agent_end", (_event, ctx) => {

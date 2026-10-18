@@ -125,6 +125,34 @@ The unit is part of the field name and is not negotiable: convert at the edge
 (`_ms` for seconds, `_ms_int` for values already in milliseconds — running one
 through the other inflates tool timings by 1000× or truncates them to 0).
 
+#### A trace split across files gets ONE task span
+
+`convert_file` synthesizes a trace's task span from its children, per file. An
+agent's daily files split one session across days, so the same trace produced
+one task span per file — same `span_id`, different bounds, which the
+conformance kit correctly rejected as a duplicate. `convert_stream(paths)`
+converts many files as one stream and synthesizes each trace once; that is the
+form any stream-level consumer should use. `convert_file` keeps its per-file
+behaviour and documents the difference.
+
+#### Backfilled turns are namespaced `bf-<n>`
+
+The live adapter numbers turns by provider turn and a backfill numbers them by
+user message, so both start at 0 for the same session. The trace key is
+(adapter, session, turn), so an unnamespaced backfill met the live records in
+one `trace_id` — two task roots and one span id twice. Backfilled turns carry a
+`bf-` prefix, which also makes the provenance legible in a trace name.
+
+#### `tool.provider_call_id` is added, and `call_id` is scoped
+
+A provider's tool-call ids are unique within ONE API response, not within a
+session or even a turn: one real Pi turn contained `call_319025` twice (two
+separate provider calls), so two tool spans derived from `tool:<call_id>`
+shared an id and the v2 conformance kit rejected the stream. Writers now scope
+the pairing id by the request that produced it (`pi-0-1:call_319025`), which is
+uniqueness by construction, and keep the provider's own id in the new optional
+`tool.provider_call_id` so it stays greppable.
+
 #### `tool.exit_code` is populated (it used to be declared and empty)
 
 `span.attributes.exit_code` is documented as the tool convention in

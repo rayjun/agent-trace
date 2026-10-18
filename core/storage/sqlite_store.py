@@ -45,6 +45,10 @@ CREATE TABLE IF NOT EXISTS ingest_files (
   path TEXT PRIMARY KEY,
   size INTEGER NOT NULL,
   mtime REAL NOT NULL,
+  -- Identity of the file, so a REPLACEMENT is detected. Size alone only catches
+  -- truncation: a file swapped for a different, LARGER one looked like an
+  -- append, and the offset then landed in the middle of a record.
+  inode INTEGER,
   indexed_bytes INTEGER NOT NULL,
   corrupt_lines INTEGER NOT NULL DEFAULT 0,
   last_error TEXT,
@@ -212,6 +216,7 @@ def _spans_key_is_wrong(conn: sqlite3.Connection) -> bool:
 #: column would make get_trace() hand out spans with missing keys — so the
 #: migration is explicit and additive.
 _MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("ingest_files", "inode INTEGER"),
     ("spans", "privacy_json TEXT"),
     ("spans", "source_json TEXT"),
     ("spans", "agent_version TEXT"),
@@ -682,21 +687,23 @@ class TraceStore:
             "SELECT * FROM ingest_files WHERE path = ?", (path,)).fetchone()
 
     def note_file(self, path: str, size: int, mtime: float, indexed_bytes: int,
-                  corrupt_lines: int = 0, last_error: str | None = None) -> None:
+                  corrupt_lines: int = 0, last_error: str | None = None,
+                  inode: int | None = None) -> None:
         with self._write_lock:
             conn = self._conn()
             conn.execute(
                 "INSERT INTO ingest_files"
-                " (path, size, mtime, indexed_bytes, corrupt_lines, last_error,"
-                "  updated_at)"
-                " VALUES (?,?,?,?,?,?,?)"
+                " (path, size, mtime, inode, indexed_bytes, corrupt_lines,"
+                "  last_error, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(path) DO UPDATE SET"
                 "   size=excluded.size, mtime=excluded.mtime,"
+                "   inode=excluded.inode,"
                 "   indexed_bytes=excluded.indexed_bytes,"
                 "   corrupt_lines=excluded.corrupt_lines,"
                 "   last_error=excluded.last_error, updated_at=excluded.updated_at",
-                (path, size, mtime, indexed_bytes, corrupt_lines, last_error,
-                 now_iso()))
+                (path, size, mtime, inode, indexed_bytes, corrupt_lines,
+                 last_error, now_iso()))
             conn.commit()
 
     def invalidate_file(self, path: str) -> None:

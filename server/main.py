@@ -101,6 +101,11 @@ class ServerState:
         self.cond = threading.Condition()
         self.last_scan = ScanReport()
         self.scanning = False
+        #: Passes that finished. A coverage verdict computed from an index that
+        #: has not completed its first pass is not "the adapter captures
+        #: nothing", it is "we do not know yet" — and reporting the former is a
+        #: false alarm on every fresh start.
+        self.scans_completed = 0
         self._stop = threading.Event()
 
     def indexer_loop(self) -> None:
@@ -110,11 +115,25 @@ class ServerState:
             except Exception as exc:  # never let the loop die silently
                 report = ScanReport(errors=[f"scan failed: {exc}"])
             self.last_scan = report
+            with self.cond:
+                self.scans_completed += 1
+                self.cond.notify_all()
             if report.changed:
                 with self.cond:
                     self.version += 1
                     self.cond.notify_all()
             self._stop.wait(self.scan_interval)
+
+    def wait_for_first_scan(self, timeout: float = 60.0) -> bool:
+        """Block until the index can answer a coverage question."""
+        deadline = time.monotonic() + timeout
+        with self.cond:
+            while self.scans_completed == 0:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self.cond.wait(timeout=remaining)
+        return True
 
     def stop(self) -> None:
         self._stop.set()
@@ -382,6 +401,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({
                 "ok": True,
                 "version": self.state.version,
+                "building": self.state.scans_completed == 0,
                 "uptime_s": int(time.time() - self.state.started_at),
                 "last_scan": {"files": scan.files_seen,
                               "events_added": scan.events_added,
@@ -411,7 +431,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/sessions":
             self._send_json(list_sessions(store, limit=_int(qs, "limit", 100)))
         elif path == "/api/adapters":
-            self._send_json(list_adapters(store))
+            self._send_json(list_adapters(
+                store, index_ready=self.state.scans_completed > 0))
         elif path == "/api/evaluators":
             from evaluation.evaluators import all_evaluators
             self._send_json({"evaluators": [
@@ -562,6 +583,24 @@ def serve(*, host: str, port: int, db_path: Path, dirs: list[Path],
     url = f"http://{host}:{server.server_address[1]}/?token={token}"
     print(f"agent-trace dashboard: {url}", flush=True)
     print(f"indexing {len(dirs)} trace dir(s); Ctrl-C to stop", flush=True)
+    # Say it once, at startup: an agent that was already running when its
+    # adapter was installed writes nothing, and the dashboard looks merely
+    # empty rather than broken. WAIT for the first index pass first — a verdict
+    # computed from a half-built index reports "capturing nothing" for every
+    # adapter whose sessions have not been ingested yet, which is a false alarm
+    # on every fresh start.
+    try:
+        if server.state.wait_for_first_scan():
+            from core import coverage as _cov
+            _provider = _cov.store_session_provider(db_path)
+            for line in [c.warning() for c in _cov.check(traced_provider=_provider)
+                         if c.warning()]:
+                print(f"WARNING: {line}", flush=True)
+        else:
+            print("(coverage check deferred: the first index pass is still "
+                  "running)", flush=True)
+    except Exception as exc:                    # noqa: BLE001
+        print(f"(coverage check unavailable: {exc})", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

@@ -311,8 +311,50 @@ def synthesize_task_spans(records: Iterable[dict[str, Any]]
             }
 
 
+def convert_stream(paths: Iterable[str | Path]) -> Iterator[dict[str, Any]]:
+    """Convert MANY v1 files as one stream, synthesizing each trace ONCE.
+
+    Task spans are derived from a trace's children, and an agent's daily files
+    split a session across days: synthesizing per FILE emitted one task span per
+    file for the same trace — same span id, different bounds, which the
+    conformance kit correctly rejected as a duplicate. The union of the files is
+    the smallest view that can see a whole trace, so that is where the
+    synthesis belongs.
+    """
+    records: list[dict[str, Any]] = []
+    for path in paths:
+        for _, _, rec in _iter_v1(path):
+            records.append(rec)
+            converted = convert_record(rec)
+            if converted is not None:
+                yield converted
+    yield from synthesize_task_spans(records)
+
+
+def _iter_v1(path: str | Path):
+    """(path, lineno, record) for the well-formed v1 records in one file."""
+    with open(path, encoding="utf-8") as fh:
+        for lineno, line in enumerate(fh, 1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(rec, dict):
+                yield path, lineno, rec
+
+
 def convert_file(path: str | Path) -> Iterator[dict[str, Any]]:
     """Stream one v1 JSONL file as v2 events: converted lines, then task spans.
+
+    NOTE for callers: the synthesized task spans at the end are for STREAM-LEVEL
+    consumers (a v2 stream must have a task root per trace, which is what the
+    conformance kit checks). The indexer deliberately does NOT ingest them — it
+    feeds `convert_record` per line and lets the store's projection derive task
+    rows from the children — so re-ingesting a `convert_file` stream adds those
+    task spans as events. Same records, two different products, on purpose.
 
     Corrupt lines are skipped, not fatal — the same quarantine-and-continue
     rule the indexer follows. A line that fails to parse was never a valid

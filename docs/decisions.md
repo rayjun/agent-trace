@@ -310,3 +310,130 @@ comparison erred out and stopped gating anything.
 **The lesson, now recorded twice:** a test suite that passes on fixtures proves
 the fixtures. The e2e tests were SKIPPED on this machine for their entire
 existence, which is why three review rounds never saw any of this.
+
+## D21 — Recovering what a live-only adapter cannot have seen
+
+The Pi adapter is a live hook: it sees the exact wire payload and the exact
+response, which is why it is the most complete of the three — and it can only
+record turns that happen while it is loaded. It is loaded at PROCESS START, so
+registering it does nothing for an agent that is already running. On this
+machine that meant 53 of 63 sessions (1,877 assistant messages, 16.6M tokens)
+had no traces at all, and the only signal was an empty dashboard.
+
+Two additions, because "why is it empty" and "what did I lose" are different
+problems:
+
+**`pi/pi_import.py` — backfill from the transcript.** Pi keeps a full session
+transcript, so the missing turns are recoverable: real usage, model, provider,
+`durationMs`, `responseId`, tool results and per-entry timestamps are all read
+verbatim. Two things are reconstructed and *said to be* reconstructed: the
+request side (Pi does not persist the wire payload, so the conversation chain
+up to that message is rebuilt) and turn boundaries (session entries carry no
+turn markers). Backfilled records carry `note="backfill=session"` and
+`request_id="pi-bf-<entry id>"`, so a reader can tell them from observed
+records and the two id namespaces cannot collide. A session that already has
+live traces is skipped unless `--force`; the cursor is separate
+(`--reimport` rewrites).
+
+**`core/coverage.py` — the gap reports itself.** Each adapter declares where its
+agent leaves session artefacts (Pi and Codex: files; Hermes: a row in its own
+`state.db`, read-only), and that inventory is compared against the sessions we
+hold traces for. The comparison is split by age relative to the adapter's
+install marker, because the two halves mean opposite things:
+
+* a session AFTER the install with no traces is a defect — something is wrong
+  now, and the warning names the likely cause and the recovery command;
+* a session BEFORE it is expected for a new install, and is a backfill
+  candidate.
+
+Collapsing those into one number is what makes a warning get skimmed past, and
+treating "age unknown" (no install marker) as a defect would make every fresh
+install warn about its own history — so unknown age is its own silent bucket.
+Surfaced by `agenttrace adapter list` / `adapter coverage`, in the dashboard's
+Adapters page, and once at `serve` startup.
+
+Two things this exposed that were worth fixing on their own:
+
+* **Tool-call ids are unique within one API response, not within a session.**
+  The same `call_319025` occurred twice in one real turn (two separate provider
+  calls), so keying the span on it alone gave the v2 tree two spans with one
+  id — the conformance kit caught it. Both the live adapter and the backfill now
+  scope the id by the request that produced it (`pi-0-1:call_319025`), keeping
+  the provider's raw id beside it.
+* **The coverage check was reading 1.1 GB of JSONL inside a request**, once per
+  adapter, which timed out the dashboard's own adapters page once the trace
+  history grew. It now reads the `sessions` projection the indexer already
+  maintains (8.5 ms instead of ~16 s), with a single-pass file scan as the
+  no-index fallback.
+
+## D22 — Three review rounds on D21, and what they cost
+
+The backfill and coverage work was reviewed adversarially twice (the first
+architecture reviewer was interrupted mid-run and produced no report; its
+partial transcript still contained one finding, which is counted below). The
+findings were almost entirely about *silent* wrongness, and one of them was
+mine in a way tests could not see: an earlier version of `test/coverage.test.py`
+wrote its fixture's fake install time into the real
+`~/.agenttrace/coverage.json`, which reclassified 127 of the user's Hermes
+sessions as "started after the install".
+
+| finding | change |
+|---|---|
+| a trailing transcript entry with no `id`/`parentId` collapsed the whole chain walk and stored `last_entry_id=None`, so every later run rewrote the same two records | the walk starts from the last entry that HAS an id, and `_last_entry_id` returns one |
+| a DANGLING `parentId` (truncated transcript) discarded every real ancestor | damage is distinguished from a branch: a dangling link, a missing `parentId` field, or a cycle keeps the whole file; a clean root still excludes other branches |
+| an id-less entry was forced to the end of the chain, reordering the conversation | the include-set is sorted by FILE position |
+| `session_id_of` used the path as spelled, so `slug/s.jsonl` and its absolute form were two sessions | resolved, and the live-traced comparison canonicalises both sides (`/var` is a symlink to `/private/var` on macOS) |
+| usage with only cache figures was dropped, and a negative count broke `input >= cache` | any figure makes the usage real; counts are clamped at 0 |
+| a missing timestamp fell through to the import clock; then a future mtime fabricated a multi-year trace | entry ts → previous ts → header ts → the session file's own mtime, clamped at "now" |
+| the install marker's mtime moved forward on a touch, hiding real gaps | the earliest observed line is persisted (`~/.agenttrace/coverage.json`), keyed by `adapter_id|marker_path`, bounded to `(0, min(marker, now)]`, and the origin is reported (`marker mtime` / `persisted (not corroborated)` / `persisted (a later marker was observed)`) |
+| a copied old session looked recent (file mtime used as its start) | the start comes from the artefact's OWN name timestamp, mtime only as a fallback |
+| a header-only transcript produced an unclearable warning | an artefact with no message entry is not a session |
+| a source that yielded nothing read as a clean bill of health | it carries a `note` naming the path |
+| two cache slots could report different verdicts at the same moment | ONE slot; the data source is the caller's choice |
+| an empty/lagging index reported "not capturing" | reported as undecided, with the inventory it did find, and never dressed as a warning |
+| `unscoped:<call_id>` collided across provenance, and the store silently dropped the loser | the fallback carries the result entry's id |
+| **request ids were unique per PROCESS, not per session** — a resumed session produced `pi-0-1` twice for two different provider calls, and the conformance kit rejected the stream | the live adapter includes a per-run discriminator |
+| `ingest_files` tracked size alone, so a file REPLACED by a larger one read from the old offset and ingested fragments | identity is tracked by inode, plus a backward mtime for restores |
+
+The last two came from my own verification rather than from a reviewer: the
+request-id one surfaced while checking the regenerated history, and the
+replacement one while re-indexing it. Both are the same lesson as D17/D18 — the
+identity of a thing (a run, a file) is not the identity of the container it
+happens to live in, and every place we assumed otherwise produced silent data
+loss rather than an error.
+
+Verification status, stated plainly: the reviewer's round-3 verdict was "safe to
+rely on for recovering a user's history, with two damaged-file caveats" — and
+both caveats (a missing `parentId` field, a future mtime) were fixed AFTER that
+verdict, together with the request-id and file-replacement bugs. They are
+covered by tests and by a full re-import of the real 8,587-event history, but
+not by a fourth review round.
+
+## D23 — Live verification found four more, and one of them was mine
+
+Verifying `/reload` on the running agent (D21's fix) turned into four more
+defects, all found by looking at what the live adapter actually wrote:
+
+| finding | change |
+|---|---|
+| **request ids were unique per RUN, not per session** — a resumed session restarted `turnIndex` at 0, so `pi-0-1` named two different provider calls and the conformance kit rejected the stream | the live adapter includes a per-run discriminator |
+| **the per-turn request sequence was reset by every `turn_start`** — a turn that restarts (Pi retries after a context-overflow compaction) reused its own id, giving one span id two provider calls | the sequence is monotonic per run |
+| **a session split across daily files got one task span PER FILE** — same span id, different bounds, because the synthesis was per file and a trace's children were in two of them | `convert_stream()` synthesizes over the union of files; `convert_file` keeps its single-file behaviour and says so |
+| backfilled turns shared the live turn namespace, so a session that was both live-traced and backfilled met in one `trace_id` (two task roots, colliding spans) | backfilled turns are namespaced `bf-<n>` |
+
+And one that was my own, in the cleanup rather than the code: pruning the
+already-written collisions with a key of `(session, request_id)` deleted
+**6,284 records including every `llm_response`** — because `request_id` is
+deliberately SHARED between a request and its response; that is the field's
+purpose. Restored from the backup and redone with `(session, id, event kind)`,
+which dropped exactly the 2 colliding records. The lesson is the same one this
+file keeps recording: a bulk edit over data whose identity rules you have not
+fully restated is a data-loss bug waiting to happen, and the backup existed only
+because the previous edit had been destructive too.
+
+Also changed: the e2e scripts no longer treat the AGENT's exit status as the
+ADAPTER's. Hermes' API key expired during this session (HTTP 401), so
+`hermes chat` exits 1 while the adapter correctly records the failed attempt —
+which is what a tracer is for. The gate is now "did the adapter write records",
+with the agent's own failure reported as context. Failing the suite on an
+expired key trains people to ignore the suite.
