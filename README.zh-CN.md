@@ -27,27 +27,56 @@ agenttrace serve                   # Dashboard
 ## 架构
 
 ```mermaid
-flowchart LR
-    agents["Hermes · Codex CLI · Pi<br/>OTel 应用 · LangGraph"]
-    adapters["适配器层<br/>能力声明 · 一致性测试"]
-    jsonl[("JSONL<br/>唯一真源")]
-    sqlite[("SQLite<br/>可重建投影")]
-    api["本地 API + SSE"]
-    surfaces["Dashboard · CLI · TUI · 评估"]
+flowchart TB
+    subgraph L1["L1 · agents —— 我们不拥有的宿主进程"]
+        A["Hermes · Codex CLI · Pi<br/>OTel 应用 · LangGraph"]
+    end
+    subgraph L2["L2 · 适配器层 —— 每个 agent 一个"]
+        B["能力：supported · partial · unsupported · unknown<br/>对产出的事件流跑一致性测试"]
+    end
+    subgraph L3["L3 · 管道"]
+        C1["采集<br/>校验 → 脱敏 → 追加"]
+        C2["索引<br/>去重 → 排序 → 物化"]
+    end
+    subgraph L4["L4 · 存储"]
+        D1[("JSONL<br/>真源 · 只追加")]
+        D2[("SQLite<br/>派生 · 可重建")]
+    end
+    subgraph L5["L5 · 本地 API"]
+        E["只读查询 + SSE<br/>回环 · Host/Origin · token"]
+    end
+    subgraph L6["L6 · 使用面"]
+        F["Dashboard · CLI · TUI · 评估"]
+    end
 
-    agents --> adapters
-    adapters -->|"采集: 校验 → 脱敏 → 追加"| jsonl
-    jsonl -->|"索引: 去重 → 排序 → 物化"| sqlite
-    sqlite --> api --> surfaces
+    L1 --> L2
+    L2 --> C1
+    C1 --> D1
+    D1 --> C2
+    C2 --> D2
+    D2 --> E
+    E --> L6
+    L6 -. "可以新增 dataset 与评分，<br/>绝不修改 trace" .-> D2
 ```
 
-三条边界才是关键：
+那条**不存在的箭头**才是关键：**没有任何东西会写回 trace 流。** dataset 和评分是独立的表；一次已录制的执行是不可变的 —— 这正是几个月后重跑实验仍然可复现的原因。
 
-* **契约是 wire format**（`schema/events.schema.json`），不是某个语言的接口。Pi 适配器是跑在 Pi 进程里的 TypeScript，不 import 这里的任何代码也符合契约；`adapter_sdk/testing.py` 校验的是**产出的事件流**，与用什么语言写无关。
-* **脱敏发生在采集时**，在适配器内、写入磁盘之前。不存在"先写后擦"的路径。
-* **JSONL 是真源，SQLite 是派生数据。** 索引损坏就重建、绝不修补 —— 这也是转换器的改进能到达已索引数据的方式（`agenttrace index --full`）。
+## 架构原则
 
-共享代码（`common/`、`core/`、`adapter_sdk/`）只依赖标准库：部署的 Hermes 插件是一个单文件的拷贝，跑在别人的进程里，那里引入第三方依赖等于埋一颗版本冲突的炸弹。
+下面每一条都在代码里有强制点，不只是意图 —— 右列标出位置。
+
+| 原则 | 具体做法 |
+|---|---|
+| **Local-first** | 数据不出本机：无云端、无账号、无遥测。回环绑定、`Host` 白名单、不发 CORS 头、检查 `Origin`、bearer token 权限 0600（`server/main.py`） |
+| **契约是 wire format** | 是 `schema/events.schema.json`，不是某个语言的接口。Pi 适配器是 TypeScript，不 import 这里的任何东西也符合契约；一致性工具校验的是**产出的事件流**（`adapter_sdk/testing.py`） |
+| **JSONL 是真源，索引是派生** | 索引损坏或过期就重建、绝不修补 —— 这也是转换器改进能到达已索引数据的方式（`core/storage/`、`agenttrace index --full`） |
+| **先脱敏再落盘** | 脱敏在适配器内、追加之前完成。不存在"先写后擦"的路径（`core/privacy.py`、`common/agenttrace_common.py`） |
+| **采集失败开放** | 丢一个事件可以接受，阻塞 agent 不行。sink 吞掉 I/O 错误并计数（`adapter_sdk/event_sink.py`） |
+| **能力诚实** | 四级声明；缺失字段显示为「该接入方式未提供」，而不是空字符串（`adapter_sdk/capabilities.py`） |
+| **要证据，不要分数** | 评估器返回证据与置信度；轨迹信号分开报告、永不加总（`evaluation/`） |
+| **失败要可见** | 空 Dashboard 必须自己解释：覆盖率缺口、"索引仍在构建"、以及带路由名的错误（`core/coverage.py`、`server/static/app.js`） |
+
+每条原则的由来（包括那些在 review 之后被推翻重来的）见 [docs/decisions.md](docs/decisions.md)。
 
 ## 命令
 

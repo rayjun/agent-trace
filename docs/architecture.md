@@ -16,6 +16,28 @@ L5  PLATFORM API        FastAPI · SSE · trace/session query · dataset · eval
 L6  SURFACES            Web UI (optional) · CLI/TUI (default) · SDK
 ```
 
+## Principles
+
+Each is enforced in code, not merely intended. The column on the right is where
+to look when a change would violate one.
+
+| principle | enforced by |
+|---|---|
+| **Local-first** — no cloud, no account, no telemetry | loopback bind, `Host` allowlist, no CORS, `Origin` check, bearer token 0600 (`server/main.py`) |
+| **The contract is the wire format** — not a language interface | `schema/events.schema.json` + `adapter_sdk/testing.py`; the Pi adapter is TypeScript and conforms without importing Python |
+| **JSONL is truth, the index is derived** — rebuild, never repair | `core/storage/` (offset ingest, shrink/inode invalidation, `clear_archive`), `agenttrace index --full` |
+| **Redact before disk** — no write-then-scrub path | `core/privacy.py`, `common/agenttrace_common.py` |
+| **Capture fails open** — a lost event is acceptable, a blocked agent is not | `adapter_sdk/event_sink.py` (I/O errors counted, never raised), `append_line` |
+| **Capability honesty** — `supported`/`partial`/`unsupported`/`unknown` | `adapter_sdk/capabilities.py`; a gap renders as "not captured", never as empty |
+| **Evidence, not scores** — signals reported separately | `evaluation/model.py` (`Score.evidence`, `Score.confidence`), `evaluation/report.py` |
+| **Fail visibly** — an empty view must explain itself | `core/coverage.py`, `/api/health.building`, the dashboard's error panel naming its route |
+| **Non-invasive by construction** — no write-back into the trace stream | datasets and scores are separate tables; a recorded execution is immutable |
+
+Two of these were reversed after review rather than followed from the start:
+the OTLP export used to be "lossless" only in prose (D13/D16), and the coverage
+warning used to fire on every fresh install (D22). The reasoning is in
+decisions.md.
+
 ## The boundaries
 
 | component | owns | does NOT own |

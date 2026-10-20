@@ -33,35 +33,60 @@ agenttrace serve                   # the dashboard
 ## Architecture
 
 ```mermaid
-flowchart LR
-    agents["Hermes · Codex CLI · Pi<br/>OTel apps · LangGraph"]
-    adapters["Adapter layer<br/>capabilities · conformance kit"]
-    jsonl[("JSONL<br/>source of truth")]
-    sqlite[("SQLite<br/>rebuildable projection")]
-    api["Local API + SSE"]
-    surfaces["Dashboard · CLI · TUI · Evaluation"]
+flowchart TB
+    subgraph L1["L1 · agents — host processes we do not own"]
+        A["Hermes · Codex CLI · Pi<br/>OTel apps · LangGraph"]
+    end
+    subgraph L2["L2 · adapter layer — one per agent"]
+        B["capabilities: supported · partial · unsupported · unknown<br/>conformance kit over the emitted stream"]
+    end
+    subgraph L3["L3 · pipeline"]
+        C1["capture<br/>validate → redact → append"]
+        C2["index<br/>dedup → order → materialize"]
+    end
+    subgraph L4["L4 · storage"]
+        D1[("JSONL<br/>truth · append-only")]
+        D2[("SQLite<br/>derived · rebuildable")]
+    end
+    subgraph L5["L5 · local API"]
+        E["read queries + SSE<br/>loopback · Host/Origin · token"]
+    end
+    subgraph L6["L6 · surfaces"]
+        F["Dashboard · CLI · TUI · Evaluation"]
+    end
 
-    agents --> adapters
-    adapters -->|"capture: validate → redact → append"| jsonl
-    jsonl -->|"index: dedup → order → materialize"| sqlite
-    sqlite --> api --> surfaces
+    L1 --> L2
+    L2 --> C1
+    C1 --> D1
+    D1 --> C2
+    C2 --> D2
+    D2 --> E
+    E --> L6
+    L6 -. "may add datasets and scores,<br/>never edits a trace" .-> D2
 ```
 
-Three boundaries do the real work:
+The arrow that does not exist is the important one: **nothing writes back into the
+trace stream.** Datasets and scores are separate tables; a recorded execution is
+immutable, which is what makes an experiment reproducible months later.
 
-* **The contract is the wire format** (`schema/events.schema.json`), not an
-  interface. The Pi adapter is TypeScript inside Pi's process and conforms
-  without importing any of this; `adapter_sdk/testing.py` checks emitted
-  streams, whatever language produced them.
-* **Redaction happens at capture time**, in the adapter, before a value reaches
-  disk. There is no path that writes first and scrubs later.
-* **JSONL is truth, SQLite is derived.** A corrupt or stale index is rebuilt,
-  never repaired — which is also how a converter change reaches traces that were
-  already indexed (`agenttrace index --full`).
+## Architecture principles
 
-Shared code (`common/`, `core/`, `adapter_sdk/`) imports the standard library
-only: the deployed Hermes plugin is a copy of one file running inside someone
-else's process, where a third-party import is a version bomb.
+Each of these is enforced somewhere in the code, not just intended — the right
+column names where.
+
+| principle | in practice |
+|---|---|
+| **Local-first** | nothing leaves the machine: no cloud, no account, no telemetry. Loopback bind, `Host` allowlist, no CORS, `Origin` check, bearer token at 0600 (`server/main.py`) |
+| **The contract is the wire format** | `schema/events.schema.json`, not a language interface. The Pi adapter is TypeScript and conforms without importing any of this; the kit checks emitted streams (`adapter_sdk/testing.py`) |
+| **JSONL is truth, the index is derived** | a corrupt or stale index is rebuilt, never repaired — which is also how a converter change reaches already-indexed traces (`core/storage/`, `agenttrace index --full`) |
+| **Redact before disk** | redaction runs inside the adapter, before the append. There is no path that writes first and scrubs later (`core/privacy.py`, `common/agenttrace_common.py`) |
+| **Capture fails open** | one lost event is acceptable; a blocked agent is not. The sink swallows I/O errors and counts them (`adapter_sdk/event_sink.py`) |
+| **Capability honesty** | four levels, and an absent field renders as "this adapter did not provide it", never as an empty string (`adapter_sdk/capabilities.py`) |
+| **Evidence, not scores** | evaluators return evidence and confidence; trajectory signals are reported separately and never summed (`evaluation/`) |
+| **Fail visibly** | an empty dashboard must explain itself: coverage gaps, "index still building", and errors that name the route they came from (`core/coverage.py`, `server/static/app.js`) |
+
+The reasoning behind each, including the ones that were reversed after review,
+is in [docs/decisions.md](docs/decisions.md).
 
 ## Commands
 
