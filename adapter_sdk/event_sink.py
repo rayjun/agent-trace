@@ -16,12 +16,18 @@ Rules kept from v1, because they are what made the traces trustworthy:
 * Validation is ON here (unlike v1's opt-in): this sink serves new code where
   the cost of one check per event is fine, and catching a contract violation
   at the write site is how it gets fixed at the source.
+* A dropped event leaves a record. Counting it in memory dies with the host
+  process, and "the dashboard is empty" is then indistinguishable from "the
+  agent was idle". `record_fault` writes one throttled line to
+  ~/.agenttrace/ingest-faults.jsonl, outside every trace dir so a full disk
+  can still be reported.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 from pathlib import Path
 from typing import Any
@@ -30,6 +36,9 @@ try:                      # POSIX append locking; optional so tests still run
     import fcntl
 except ImportError:       # pragma: no cover - non-POSIX
     fcntl = None  # type: ignore[assignment]
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "common"))
+import agenttrace_common as common  # noqa: E402
 
 from core.privacy import redact_event
 from core.schema.model import validate_event
@@ -74,6 +83,7 @@ class JsonlEventSink:
         if self.redact:
             event = redact_event(event)
             self.redacted_events += 1
+        adapter_id = str(event.get("adapter_id") or "unknown")
         if self.validate:
             problems = validate_event(event)
             if problems:
@@ -83,12 +93,16 @@ class JsonlEventSink:
                 self.write_errors += 1
                 self.violations.extend(
                     f"{event.get('event_id', '?')}: {p}" for p in problems)
+                common.record_fault(adapter_id, "contract",
+                                    "; ".join(problems[:3]), self.path)
                 return False
         line = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
         try:
             self._append(line)
-        except OSError:
+        except OSError as exc:
             self.write_errors += 1
+            common.record_fault(adapter_id, "write",
+                                f"{type(exc).__name__}: {exc}", self.path)
             return False
         self.events_written += 1
         return True

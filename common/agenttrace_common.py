@@ -31,6 +31,7 @@ import threading
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 try:                      # POSIX append locking; optional so tests still run
     import fcntl
@@ -497,22 +498,159 @@ def validate_record(record: object) -> list[str]:
     return problems
 
 
-def redact_line(line: str, extra: Callable[[str], str] | None = None) -> str:
-    """Scrub secrets out of an already-serialised record line.
-
-    `extra` is an optional host-provided redactor (Hermes' `redact_sensitive_text`)
-    layered on top of the built-in pattern, so adapters with a richer redactor
-    keep it without every adapter reimplementing the base one.
-    """
+def redact_string(value: str, extra: Callable[[str], str] | None = None) -> str:
+    """Scrub one string: built-in pattern first, then the host's redactor."""
     if not redact_enabled():
-        return line
-    line = _SECRET_RE.sub("sk-***", line)
+        return value
+    out = _SECRET_RE.sub("sk-***", value)
     if extra is not None:
         try:
-            line = extra(line)
-        except Exception:
+            out = extra(out)
+        except Exception:  # noqa: BLE001 - never drop a field over redaction
+            return out
+    return out
+
+
+def redact_record(record: dict, extra: Callable[[str], str] | None = None) -> dict:
+    """Redact one record's VALUES, then serialise. Never the serialised line.
+
+    This used to run on the finished JSON line, and that is a data-corruption
+    bug, not a style choice: a redactor is a text transformer, and a pattern
+    that ends inside a JSON escape (`...Bearer abc\\"` ) can consume the
+    closing backslash. The replacement then leaves a bare quote, the line
+    stops being JSON, and every reader silently skips it — which is exactly
+    how five `llm_request` records on a real machine became unparseable while
+    the agent kept writing.
+
+    Structure is json.dumps' job alone; secrets are removed from the values
+    before that. Cost is the same walk either way (one pass over the strings).
+    """
+    if not redact_enabled():
+        return record
+
+    def walk(value: Any) -> Any:
+        if isinstance(value, str):
+            return redact_string(value, extra)
+        if isinstance(value, dict):
+            return {k: walk(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [walk(v) for v in value]
+        return value
+
+    out = walk(record)
+    return out if isinstance(out, dict) else record
+
+
+# --------------------------------------------------------------------------
+# ingest faults — the one place an event can disappear
+# --------------------------------------------------------------------------
+
+#: 0/false/no turns the fault log off. On by default: an observability layer
+#: that silently drops the event it was asked to record is worse than none.
+FAULTS_ENV = "AGENTTRACE_FAULTS"
+#: One line per (adapter, kind) per window. A full disk fails EVERY event;
+#: writing one line per failure writes thousands of lines to a failing disk.
+FAULT_WINDOW_S = 60.0
+#: Bounded so a week-long outage cannot fill the disk it is reporting about.
+#: One rotation (`.1`) is enough history for a doctor check.
+FAULT_MAX_BYTES = 256 * 1024
+
+_fault_lock = threading.Lock()
+_last_fault: dict[tuple[str, str], float] = {}
+
+
+def faults_enabled() -> bool:
+    return _truthy_default_on(FAULTS_ENV)
+
+
+def platform_dir() -> Path:
+    """`~/.agenttrace` — the platform's own directory, never a trace directory.
+
+    The SQLite index, the server token and this fault log live here. Trace
+    dirs are scanned for `*.jsonl`; a log written inside one would be indexed
+    as a trace. `AGENTTRACE_PLATFORM_DIR` overrides, and is the same variable
+    server/main.py reads — one location, not two.
+    """
+    override = os.environ.get("AGENTTRACE_PLATFORM_DIR")
+    return Path(override).expanduser() if override else Path.home() / ".agenttrace"
+
+
+def faults_path() -> Path:
+    return platform_dir() / "ingest-faults.jsonl"
+
+
+def record_fault(adapter_id: str, kind: str, error: str,
+                 path: str | Path | None = None) -> bool:
+    """Append one line saying an event was NOT written. Never raises.
+
+    Why a separate file, and why outside every trace dir: the condition being
+    recorded is usually "this filesystem is full or read-only", so the record
+    of it has to be able to live on another one.
+
+    Throttling is checked twice, because both shapes occur in this repo:
+    in-process (Hermes runs the plugin on its own threads) via `_last_fault`,
+    and cross-process (the Codex hook is a fresh process per event) by reading
+    the file's last line. Without the second check a failing codex hook emits
+    one fault line per dropped event anyway.
+
+    Returns True when a line was written (so tests can assert the throttle).
+    """
+    if not faults_enabled():
+        return False
+    now = datetime.now(timezone.utc).timestamp()
+    key = (str(adapter_id), str(kind))
+    try:
+        with _fault_lock:
+            last = _last_fault.get(key)
+            if last is not None and now - last < FAULT_WINDOW_S:
+                return False
+            dest = faults_path()
+            _last_fault[key] = now
+            if _recent_on_disk(dest, key, now):
+                return False
+            return _append_fault(dest, adapter_id, kind, error, path)
+    except Exception:  # noqa: BLE001 - the fault log must never break an agent
+        return False
+
+
+def _recent_on_disk(dest: Path, key: tuple[str, str], now: float) -> bool:
+    """True when the file's last line already reports this key inside the window."""
+    try:
+        with dest.open("rb") as fh:
+            fh.seek(0, 2)
+            fh.seek(max(0, fh.tell() - 1024))
+            tail = fh.read().decode("utf-8", "replace").splitlines()
+        rec = json.loads(tail[-1])
+        if (rec.get("adapter_id"), rec.get("kind")) != key:
+            return False
+        prev = datetime.strptime(rec["ts"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+            tzinfo=timezone.utc).timestamp()
+        return now - prev < FAULT_WINDOW_S
+    except (OSError, ValueError, KeyError, TypeError, IndexError):
+        return False
+
+
+def _append_fault(dest: Path, adapter_id: str, kind: str, error: str,
+                  path: str | Path | None) -> bool:
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if dest.stat().st_size > FAULT_MAX_BYTES:
+                os.replace(dest, dest.with_suffix(dest.suffix + ".1"))
+        except OSError:
             pass
-    return line
+        rec: dict[str, object] = {
+            "ts": now_iso(),
+            "adapter_id": str(adapter_id),
+            "kind": str(kind),
+            "error": str(error)[:300],
+        }
+        if path:
+            rec["path"] = str(path)
+        append_line(dest, json.dumps(rec, ensure_ascii=False))
+        return True
+    except OSError:
+        return False
 
 
 # --------------------------------------------------------------------------
@@ -567,16 +705,24 @@ def emit_record(trace_dir: Path, file_prefix: str, record: dict,
         # Never raises: this reports into stderr while the agent keeps running.
         for problem in validate_record(rec):
             print(f"agent-trace[{file_prefix}]: {problem}", file=sys.stderr)
+    rec = redact_record(rec, extra_redact)
     try:
         line = json.dumps(rec, ensure_ascii=False, default=str)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as exc:
+        # An unserialisable field is an adapter bug, and the record is gone.
+        # Recording it is the difference between "this trace is incomplete"
+        # and "there is no trace and no reason why".
+        record_fault(file_prefix, "serialise", f"{type(exc).__name__}: {exc}")
         return None
-    line = redact_line(line, extra_redact)
     day = datetime.now(timezone.utc).strftime("%Y%m%d")
     path = trace_dir / f"{file_prefix}-{day}.jsonl"
     try:
         trace_dir.mkdir(parents=True, exist_ok=True)
         append_line(path, line)
-    except OSError:
+    except OSError as exc:
+        # Full disk, read-only dir, permissions: the event is gone. Say so
+        # somewhere that outlives this process — see `record_fault`.
+        record_fault(file_prefix, "write", f"{type(exc).__name__}: {exc}",
+                     path=path)
         return None
     return path

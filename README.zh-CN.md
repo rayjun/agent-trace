@@ -89,6 +89,7 @@ flowchart TB
 | `agenttrace watch` | agent 运行时的实时全屏面板 |
 | `agenttrace serve` | 索引进程 + 本地 API + Dashboard（`--daemon`、`--status`、`--stop`） |
 | `agenttrace index [--full]` | 从 JSONL 文件（重）建 SQLite 索引 |
+| `agenttrace doctor` | 为什么没有数据：安装、采集、磁盘、丢弃的事件、索引 |
 | `agenttrace adapter list\|test\|coverage` | 注册表 · 一致性测试 · 采集缺口 |
 | `agenttrace otlp import\|export` | OTLP 导入与导出 |
 
@@ -126,6 +127,13 @@ agenttrace report --limit 100 --verbose
 
 ## 「装好了，但什么都没有」
 
+```bash
+agenttrace doctor                   # 一次列出所有可能原因，有问题时退出码 1
+agenttrace doctor --json            # 同样的检查，给脚本用
+```
+
+它检查造成空页面的八件事：目录不可写、磁盘没空间、最近没有记录、schema 版本未知、部署的插件是旧拷贝、索引落后于文件、采集路径写失败的事件、agent 跑过但没有 trace 的会话。每条警告都给出对应的修复命令。
+
 适配器在其宿主进程启动时加载，所以对已经在运行的会话不起作用 —— 需要重启 agent，Pi 可以 `/reload`。Dashboard 会自己说明这一点：
 
 ```bash
@@ -144,7 +152,8 @@ python3 codex/codex_import.py <rollout.jsonl>
 ## 隐私
 
 * 数据不离开本机：没有云端、没有账号、没有遥测。
-* 脱敏在适配器内、落盘之前完成（`AGENTTRACE_REDACT=0` 关闭）；`AGENTTRACE_CAPTURE=metadata` 保留结构而去掉正文。
+* 脱敏在适配器内、落盘之前完成（`AGENTTRACE_REDACT=0` 关闭）；`AGENTTRACE_CAPTURE=metadata` 保留结构而去掉正文。密钥是在序列化**之前**从记录的字段值里清掉的，而不是在成品 JSON 行上跑正则 —— 后者会让一条记录不再能被解析。
+* 写不进去的事件不会静默消失：每个适配器、每种失败类型最多每分钟一行，落在 `~/.agenttrace/ingest-faults.jsonl`（在所有 trace 目录之外，上限 256 KiB），`agenttrace doctor` 会报出来。
 * 本地 API **不被默认为可信**：仅绑定回环、`Host` 白名单（防 DNS rebinding）、不发送 CORS 头、检查 `Origin`、bearer token 权限 0600。
 * 工作区采集是只读的，绝不拿你的 git index 锁；diff 默认不抓（`AGENTTRACE_GIT=full` 才开启），并且快照会记录读取时刻，避免几个月前的 trace 被当成本地当前分支去解读。
 

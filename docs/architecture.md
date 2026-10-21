@@ -99,6 +99,9 @@ back to the raw artefact. Field reference: docs/schema.md.
   pinned evaluator versions, playback scoring, per-evaluator evidence +
   confidence, cost via a dated pricing registry (unknown stays unknown)
 * `agenttrace serve` / `agenttrace index` — the entry points
+* `core/doctor.py` + `core/ingest_faults.py` — one command that explains an
+  empty view (dirs, disk, recency, schema, faults, index, deployment,
+  coverage), and the log of events the capture path could not write
 
 * `adapters/otlp/` — OTLP/HTTP+JSON import + export; GenAI semantic
   conventions out, `agent_trace.*` namespace for what OTel cannot express

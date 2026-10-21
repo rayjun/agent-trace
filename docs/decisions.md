@@ -563,3 +563,57 @@ was wrong three times — and the stubbed payloads are minimal-but-valid, so a
 renderer that throws on an empty dataset fails there too (the fresh-install
 case). `test/server.test.py` covers the other half: a session id with slashes
 resolves single- and double-escaped, and an unknown one still 404s.
+
+## D27 — A dropped event must leave a trace, and `doctor` to read it
+
+Capture fails open by design (D7): a blocked agent is worse than a lost event.
+What was never decided is what a lost event leaves BEHIND. It left nothing.
+`emit_record` returned `None` on `OSError`, the caller ignored it, and the
+event was gone — no line, no counter, no reason. The dashboard then looked
+exactly like an idle agent. Two adapters (Hermes, Codex) and one importer (Pi
+backfill) all shared that hole.
+
+The fix is a fault log, `~/.agenttrace/ingest-faults.jsonl`:
+
+* **Outside every trace directory.** The condition usually being reported is
+  "this filesystem is full or read-only"; a log inside it would fail with it.
+* **Throttled per (adapter, kind) over a 60 s window**, checked both in-process
+  and by reading the file's last line. The Codex hook is a fresh process per
+  event; an in-process-only throttle would still write one line per dropped
+  event there. A full disk must not provoke thousands of writes.
+* **Bounded** at 256 KiB with one rotation. A week-long outage cannot fill the
+  disk it is reporting about.
+* **Never raises.** It runs on the agent's hot path, like the append it failed
+  to do.
+
+`agenttrace doctor` reads it, together with the things a user cannot check by
+hand: are the trace dirs actually writable (a real probe, not `os.access`),
+is there disk left, did anything land recently, which schema version are those
+records, is the index current, does the deployed plugin still match this
+checkout, and did the agents run sessions we hold no traces for. Exit is 0
+only when nothing is a `warn`/`fail`; `info` ("not installed", "no index yet")
+is an answer, not a defect — otherwise a Codex-only user would get a red exit
+for not having Pi.
+
+The check found two real defects on this machine within a minute of existing:
+
+1. **Unparseable `llm_request` records** in one day's 34 MB file — five in the
+   first sample, and the count kept climbing (70 by the time the fix landed)
+   because the process that ran the old code was still alive. The error was
+   `Expecting ',' delimiter` at a bare quote inside a tool's `arguments`
+   string, all of them containing `Authorization: Bearer ...\\"`.
+   Cause: v1 redaction ran on the SERIALISED LINE. A redactor is a text
+   transformer, and the host's `redact_sensitive_text` consumed the `\\"` that
+   closed a JSON escape — leaving a bare quote and a line no reader could
+   parse. Fixed by redacting the record's VALUES before `json.dumps`
+   (`redact_record`): a redactor may still alter text, but it can no longer
+   alter structure. `test/redaction-integrity.test.py` asserts both halves —
+   that the old order breaks, and that the new order does not.
+2. **A stale deployment looked identical to a healthy one.** The plugin is a
+   byte copy; `install.sh status` knew, but only if you ran it. `doctor`
+   compares the deployed bytes against the checkout and names the command.
+
+Deliberately NOT in doctor: repair. It reports and names the command that
+fixes the problem (`agenttrace index`, `install.sh hermes default`). A doctor
+that silently mutates storage is a second failure mode, and rebuilding an index
+is already a supported, explicit action.

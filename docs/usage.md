@@ -16,6 +16,7 @@ agenttrace session <id>            one conversation: every turn with its duratio
 agenttrace watch                   live full-screen panel
 agenttrace serve                   indexer + local API + dashboard
 agenttrace index [--full]          (re)build the SQLite index
+agenttrace doctor [--json]         why is nothing showing up
 agenttrace report [--verbose]      efficiency report across recent traces
 agenttrace adapter list|test|cov   adapter registry, conformance, coverage
 agenttrace otlp import|export      OTLP in / out
@@ -112,6 +113,41 @@ extra tokens can be the price of a harder task. `no_signal` counts the traces
 where an evaluator could not tell — those are not failures. `--verbose` adds
 the evidence behind each flagged trace.
 
+## `doctor`: why an empty view is empty
+
+```bash
+agenttrace doctor          # checks in order, exit 1 if any is warn/fail
+agenttrace doctor --json   # same checks, stable keys, for a script
+agenttrace doctor --fast   # skip the adapter-coverage scan
+```
+
+| check | question it answers |
+|---|---|
+| Trace dirs | do the known dirs exist, and can we *actually* write to them (a real probe, not `os.access`) |
+| Disk | how much space is left on the tightest one (below 1 GiB is a warning, because the next append is the one that fails) |
+| Capture | the newest record's age, plus any unparseable line in the last 2000 (a crash mid-write, or a redactor that ate an escape) |
+| Schema | `v1` (read through the converter), `v2`, or a version this build does not know |
+| Ingest faults | events the capture path could NOT write — see below |
+| Index | SQLite quick_check, schema_version, counts, and how many trace files are newer than their indexed offset |
+| Adapters | the deployed Hermes plugin against this checkout (byte compare), Codex hook, Pi registration |
+| Coverage | sessions an agent ran that we hold no traces for (same data as `adapter coverage`) |
+
+`info` ("not installed", "no index yet") is not a defect and does not fail the
+command; `warn` and `fail` do. The command reports, it does not repair: every
+warning names the command that fixes it.
+
+## When an event cannot be written
+
+Capture fails open — a blocked agent is worse than a lost event. But a lost
+event is now recorded: one line in `~/.agenttrace/ingest-faults.jsonl` per
+(adapter, kind) per minute, capped at 256 KiB with one rotation, outside every
+trace dir so a full disk can still be reported. `agenttrace doctor` surfaces
+them; `AGENTTRACE_FAULTS=0` turns the log off.
+
+`kind` is `write` (an `OSError` from the append), `contract` (the sink refused
+an event that violates the schema), or `serialise` (a field `json.dumps` could
+not represent).
+
 ## Adapters
 
 ```bash
@@ -155,7 +191,8 @@ there is nothing to recover there.
 | `AGENTTRACE_GIT` | `metadata` | `full` records the diff (capped), `off` captures no workspace |
 | `AGENTTRACE_GIT_MAX` | 20000 | bytes of diff to keep |
 | `AGENTTRACE_DB` | `~/.agenttrace/agenttrace.db` | index location |
-| `AGENTTRACE_PLATFORM_DIR` | `~/.agenttrace` | where the db, pid, log and token live |
+| `AGENTTRACE_PLATFORM_DIR` | `~/.agenttrace` | where the db, pid, log, token and fault log live |
+| `AGENTTRACE_FAULTS` | on | `0` disables the ingest-fault log |
 | `AGENTTRACE_TOKEN` | generated | bearer token for the local API |
 | `AGENTTRACE_JUDGE_BASE_URL` / `_MODEL` | — | a local OpenAI-compatible endpoint for LLM-as-judge |
 
@@ -166,5 +203,6 @@ there is nothing to recover there.
 | `~/.hermes/traces/`, `~/.pi/agent/traces/`, `~/.codex/traces/` | the JSONL traces |
 | `~/.cache/agent-trace/` | the CLI's incremental index |
 | `~/.agenttrace/agenttrace.db` | the SQLite projection |
+| `~/.agenttrace/ingest-faults.jsonl` | events the capture path could not write (throttled, 256 KiB cap) |
 | `~/.agenttrace/server.{pid,log,token}` | dashboard process, log, API token |
 | `~/.agenttrace/coverage.json` | the earliest install line observed per adapter |

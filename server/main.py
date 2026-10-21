@@ -37,6 +37,7 @@ import hmac
 import json
 import os
 import secrets
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -47,6 +48,13 @@ from urllib.parse import parse_qs, unquote, urlparse
 from core.query import get_trace, list_adapters, list_sessions, list_traces, overview
 from core.storage.indexer import Indexer, ScanReport
 from core.storage.sqlite_store import TraceStore
+
+# The platform directory has ONE definition, in common/ — the capture path is
+# byte-copied into host processes and needs the same location for its fault
+# log, so the shared module is where it can live. Re-exported here because the
+# CLI and the server both import `platform_dir` from this module.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "common"))
+import agenttrace_common as common  # noqa: E402
 
 DEFAULT_PORT = 8741
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
@@ -60,11 +68,14 @@ TOKEN_PLACEHOLDER = "__AGENTTRACE_TOKEN_VALUE__"
 
 
 def platform_dir() -> Path:
-    """~/.agenttrace — DB, token, future server state. Distinct from the
-    ~/.agent-trace trace dir (which is scanned for *.jsonl; the DB must not
-    live inside its own scan scope)."""
-    override = os.environ.get("AGENTTRACE_PLATFORM_DIR")
-    return Path(override).expanduser() if override else Path.home() / ".agenttrace"
+    """~/.agenttrace — DB, token, fault log, server state.
+
+    Delegates to the shared module so the capture path's fault log and the
+    platform's DB can never disagree about where "the platform directory" is.
+    Distinct from the ~/.agent-trace trace dir (which is scanned for *.jsonl;
+    the DB must not live inside its own scan scope).
+    """
+    return common.platform_dir()
 
 
 def load_or_create_token() -> str:

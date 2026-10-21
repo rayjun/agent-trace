@@ -56,9 +56,17 @@ def default_trace_dirs(home: Path | None = None) -> list[Path]:
 
 
 def iter_trace_files(dirs: list[Path]) -> Iterator[Path]:
-    """Every *.jsonl under the given dirs, stable order."""
+    """Every *.jsonl under the given dirs, stable order.
+
+    `ingest-faults.jsonl` is skipped by name: it lives outside every trace dir
+    by design, but AGENTTRACE_PLATFORM_DIR (or a user passing a path) can put
+    it inside one, and a fault log must never be read as a trace.
+    """
     for d in dirs:
         try:
-            yield from sorted(d.rglob("*.jsonl"))
+            for path in sorted(d.rglob("*.jsonl")):
+                if path.name.startswith("ingest-faults"):
+                    continue
+                yield path
         except OSError:
             continue

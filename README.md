@@ -99,6 +99,7 @@ is in [docs/decisions.md](docs/decisions.md).
 | `agenttrace watch` | live full-screen panel while the agent runs |
 | `agenttrace serve` | indexer + local API + dashboard (`--daemon`, `--status`, `--stop`) |
 | `agenttrace index [--full]` | (re)build the SQLite index from the JSONL files |
+| `agenttrace doctor` | why is nothing showing up: install, capture, disk, dropped events, index |
 | `agenttrace adapter list\|test\|coverage` | registry · conformance kit · capture gaps |
 | `agenttrace otlp import\|export` | OTLP in and out |
 
@@ -156,6 +157,17 @@ imported**; code runs only when you explicitly ask. See
 
 ## "I installed it and nothing shows up"
 
+```bash
+agenttrace doctor                       # every reason at once, exit 1 on a defect
+agenttrace doctor --json                # the same checks, for a script
+```
+
+It checks the eight things that produce an empty view — dirs that exist but
+are not writable, no disk left, no recent records, an unknown schema version, a
+stale deployed plugin, an index behind the files, events the capture path could
+not write, and sessions an agent ran with no traces. Each warning names the
+command that fixes it.
+
 An adapter loads when its host process starts, so it does nothing for a session
 that is already running — restart the agent, or `/reload` in Pi. The dashboard
 says so itself:
@@ -180,7 +192,12 @@ observed ones, and the request side is rebuilt from the transcript — and says 
 
 * Nothing leaves the machine: no cloud, no account, no telemetry.
 * Redaction happens in the adapter, before disk (`AGENTTRACE_REDACT=0` disables
-  it); `AGENTTRACE_CAPTURE=metadata` keeps structure and drops bodies.
+  it); `AGENTTRACE_CAPTURE=metadata` keeps structure and drops bodies. Secrets
+  are scrubbed from record **values** before serialisation, never from the
+  finished JSON line, so a redactor cannot corrupt a record's structure.
+* An event that cannot be written is not lost silently: one throttled line per
+  adapter and failure kind lands in `~/.agenttrace/ingest-faults.jsonl` (outside
+  every trace dir, capped at 256 KiB), and `agenttrace doctor` reports it.
 * The local API is **not** implicitly trusted: loopback bind, `Host` allowlist
   (DNS rebinding), no CORS headers, `Origin` check, bearer token at mode 0600.
 * Workspace capture is read-only and never takes your git index lock; diffs are
@@ -199,7 +216,8 @@ test/run-all.sh                    # everything (SKIP_E2E=1 to skip real model c
 cd pi && npm ci && npm run typecheck
 ```
 
-~29 test files: per-adapter fixtures, the conformance kit, dashboard routing,
-the two end-to-end tests, and `test/review-fixes.test.py`, which holds every
-finding from the review rounds — including the ones the fixes themselves
-introduced. CI runs lint, types and the suite on every push.
+~31 test files: per-adapter fixtures, the conformance kit, dashboard routing,
+the two end-to-end tests, doctor and the ingest-fault log, redaction integrity,
+and `test/review-fixes.test.py`, which holds every finding from the review
+rounds — including the ones the fixes themselves introduced. CI runs lint,
+types and the suite on every push.

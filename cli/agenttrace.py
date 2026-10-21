@@ -601,6 +601,16 @@ def build_parser() -> argparse.ArgumentParser:
                          help="rebuild projections from the raw archive")
     _dirs(p_index)
 
+    p_doctor = sub.add_parser(
+        "doctor",
+        help="diagnose install, capture, index and dropped events "
+             "(exit 1 on a problem)")
+    p_doctor.add_argument("--json", action="store_true")
+    p_doctor.add_argument("--fast", action="store_true",
+                          help="skip the adapter-coverage scan")
+    p_doctor.add_argument("--db", type=Path, default=None)
+    _dirs(p_doctor)
+
     # Adapter ecosystem (M4): discovery + conformance, no shared filters.
     p_adapter = sub.add_parser("adapter", help="list / inspect / test adapters")
     adapter_sub = p_adapter.add_subparsers(dest="adapter_cmd", required=True)
@@ -713,6 +723,24 @@ def cmd_serve(args) -> int:
     return 0
 
 
+def cmd_doctor(args) -> int:
+    """One command that answers "why is nothing showing up?".
+
+    Deliberately not a pile of independent scripts: the answer depends on
+    cross-checking them (a writable dir with no records is a different problem
+    from records the index has not seen). Exit 1 when a check is a warn/fail,
+    so it can gate a first-run script.
+    """
+    from core.doctor import render, run
+    from server.main import platform_dir
+
+    db = args.db or Path(os.environ.get("AGENTTRACE_DB")
+                         or platform_dir() / "agenttrace.db")
+    report = run(args.dirs, db_path=db, fast=args.fast)
+    print(render(report, as_json=args.json))
+    return 0 if report.ok else 1
+
+
 def cmd_index(args) -> int:
     """One-shot indexing: scan once (or full rebuild) and print the report."""
     from core.storage.indexer import Indexer
@@ -815,8 +843,6 @@ def cmd_adapter(args) -> int:
         return 0
 
     if args.adapter_cmd == "coverage":
-        from core import coverage as cov_mod
-
         covs = _coverage_rows(fresh=args.fresh)
         if args.json:
             print(json.dumps([c.to_dict() for c in covs], indent=2))
@@ -1069,7 +1095,7 @@ def main(argv=None) -> int:
     return {
         "ls": cmd_ls, "show": cmd_show, "search": cmd_search,
         "sessions": cmd_sessions, "stats": cmd_stats, "watch": cmd_watch,
-        "serve": cmd_serve, "index": cmd_index,
+        "serve": cmd_serve, "index": cmd_index, "doctor": cmd_doctor,
         "adapter": cmd_adapter, "otlp": cmd_otlp, "report": cmd_report,
         "session": cmd_session,
     }[args.cmd](args)

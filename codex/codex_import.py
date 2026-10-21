@@ -125,7 +125,6 @@ def parse_rollout(path: Path, since_line: int = 0) -> tuple[int, list[dict], dic
     meta: dict = {"session_id": None, "cwd": None, "model": None,
                   "system_prompt": None, "cli_version": None, "provider": None}
     turn_id = None
-    turn_started_at = None
     pending_tool: dict[str, str] = {}   # call_id -> tool name
     n = 0
 
@@ -302,7 +301,6 @@ def parse_rollout(path: Path, since_line: int = 0) -> tuple[int, list[dict], dic
                     new_turn = payload.get("turn_id")
                     if new_turn and new_turn != turn_id:
                         turn_id = new_turn
-                    turn_started_at = payload.get("started_at")
                     turn_key = open_turn(turn_id, meta["model"], meta["cwd"], None)
                 elif ptype == "user_message":
                     # Any record naming a NEW turn id opens that turn. A rollout

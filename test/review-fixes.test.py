@@ -22,7 +22,7 @@ sys.path.insert(0, str(ROOT))
 from adapters.otlp import export_trace, import_payload  # noqa: E402
 from adapter_sdk.capabilities import Capability, SupportLevel  # noqa: E402
 from adapter_sdk.testing import check_stream  # noqa: E402
-from core.convert.v1_to_v2 import convert_file, convert_record  # noqa: E402
+from core.convert.v1_to_v2 import convert_record  # noqa: E402
 from core.pricing import cost_usd  # noqa: E402
 from core.query import get_trace, list_traces, overview  # noqa: E402
 from core.schema.model import validate_event  # noqa: E402
@@ -874,7 +874,7 @@ before_e = endonly.one("SELECT COUNT(*) AS n FROM events")["n"]
 added_e = sum(1 for e in import_payload(export_trace(t_e)) if endonly.ingest(e))
 check("an end-only span round-trips without inventing a span_start",
       added_e == 0, f"{added_e} event(s) invented")
-check("the archive did not grow", 
+check("the archive did not grow",
       endonly.one("SELECT COUNT(*) AS n FROM events")["n"] == before_e)
 endonly.close()
 
