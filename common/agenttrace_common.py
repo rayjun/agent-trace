@@ -145,7 +145,21 @@ def git_mode() -> str:
     return value if value in ("metadata", "full", "off") else "metadata"
 
 
-def workspace_snapshot(cwd, *, at: str = "capture") -> dict | None:
+def git_diff_cap() -> int:
+    """Bytes of diff to keep — `AGENTTRACE_GIT_MAX`, else the built-in 20 KB.
+
+    The cap is a property of the snapshot this module owns: an adapter records
+    its own workspace at capture time and core/workspace.py reads one at index
+    time, and both must stop at the same number.
+    """
+    try:
+        return max(0, int(os.environ.get(GIT_CAP_ENV) or _GIT_DIFF_CAP))
+    except ValueError:
+        return _GIT_DIFF_CAP
+
+
+def workspace_snapshot(cwd: str | os.PathLike[str] | None, *,
+                       at: str = "capture") -> dict | None:
     """The repository state of `cwd`, or None when there is nothing to say.
 
     Lives here, not in the platform layer, because a deployed Hermes plugin is a
@@ -216,10 +230,7 @@ def workspace_snapshot(cwd, *, at: str = "capture") -> dict | None:
         untracked = git(["ls-files", "--others", "--exclude-standard"])
         if untracked:
             diff += "\n" + "\n".join(f"?? {n}" for n in untracked.splitlines()[:50])
-        try:
-            cap = max(0, int(os.environ.get(GIT_CAP_ENV) or _GIT_DIFF_CAP))
-        except ValueError:
-            cap = _GIT_DIFF_CAP
+        cap = git_diff_cap()
         if len(diff) > cap:
             out["diff"] = diff[:cap]
             out["diff_truncated"] = True

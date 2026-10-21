@@ -93,8 +93,14 @@ def _entry_points() -> list[DiscoveryEntry]:
     out: list[DiscoveryEntry] = []
     try:
         eps = entry_points()
-        selected = (eps.select(group="agent_trace.adapters")
-                    if hasattr(eps, "select") else eps.get("agent_trace.adapters", []))
+        select = getattr(eps, "select", None)
+        legacy = getattr(eps, "get", None)
+        if callable(select):
+            selected = list(select(group="agent_trace.adapters"))
+        elif callable(legacy):       # py3.9: a dict of group -> EntryPoints
+            selected = list(legacy("agent_trace.adapters", []) or [])
+        else:
+            selected = []
     except Exception:  # noqa: BLE001 - a broken dist must not break discovery
         return []
     for ep in selected:

@@ -41,7 +41,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "common"))
 import agenttrace_common as _common  # noqa: E402
 
 GIT_ENV = "AGENTTRACE_GIT"          # metadata (default) | full | off
-CAP_ENV = "AGENTTRACE_GIT_MAX"      # bytes of diff to keep
 #: Kept for callers that pass it through; the shared implementation owns the
 #: real timeout so an adapter and the platform cannot drift.
 DEFAULT_TIMEOUT = 5.0
@@ -99,13 +98,6 @@ class GitSnapshot:
     @property
     def is_repo(self) -> bool:
         return self.root is not None
-
-
-def _cap() -> int:
-    try:
-        return max(0, int(os.environ.get(CAP_ENV) or DEFAULT_DIFF_CAP))
-    except ValueError:
-        return DEFAULT_DIFF_CAP
 
 
 def snapshot(cwd: str | os.PathLike[str] | None, *,

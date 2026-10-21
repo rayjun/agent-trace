@@ -205,11 +205,12 @@ def _convert_discrete(rec: dict[str, Any]) -> dict[str, Any]:
     adapter = rec.get("agent") or "unknown"
     session = rec.get("session_id") or "-"
     turn = rec.get("turn_id")
-    name = rec.get("event")
+    name = str(rec.get("event") or "event")
+    ts = rec.get("ts") if isinstance(rec.get("ts"), str) else None
 
     out = _base(rec, "event")
     out["event_id"] = event_event_id(adapter, _trace_id(adapter, session, turn),
-                                     name, rec.get("ts"), _digest(rec))
+                                     name, ts, _digest(rec))
 
     attributes: dict[str, Any] = {}
     if name == "user_prompt":
@@ -344,7 +345,7 @@ def convert_stream(paths: Iterable[str | Path]) -> Iterator[dict[str, Any]]:
     yield from synthesize_task_spans(records)
 
 
-def _iter_v1(path: str | Path):
+def _iter_v1(path: str | Path) -> Iterator[tuple[str | Path, int, dict[str, Any]]]:
     """(path, lineno, record) for the well-formed v1 records in one file."""
     with open(path, encoding="utf-8") as fh:
         for lineno, line in enumerate(fh, 1):

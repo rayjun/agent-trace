@@ -23,11 +23,14 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from core.convert.v1_to_v2 import convert_record
 from core.storage.discovery import iter_trace_files
 from core.storage.sqlite_store import TraceStore
+
+if TYPE_CHECKING:
+    from core.workspace import GitSnapshot
 
 
 @dataclass
@@ -70,7 +73,7 @@ class Indexer:
         self.dirs = dirs
         #: cwd -> workspace snapshot (or None when it is not a repository), so a
         #: session's hundreds of events cost one `git status`.
-        self._workspaces: dict[str, dict[str, Any] | None] = {}
+        self._workspaces: dict[str, GitSnapshot | None] = {}
 
     def _enrich(self, event: dict[str, Any]) -> dict[str, Any]:
         """Attach the workspace when the adapter did not record one.
@@ -94,7 +97,8 @@ class Indexer:
         if not git:
             self._workspaces[cwd] = None
             return event
-        return {**event, "resource": {**resource, "git": git.to_dict()}}
+        base_resource = resource if isinstance(resource, dict) else {}
+        return {**event, "resource": {**base_resource, "git": git.to_dict()}}
 
     def scan_once(self) -> ScanReport:
         report = ScanReport()

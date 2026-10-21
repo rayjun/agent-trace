@@ -32,6 +32,7 @@ import hashlib
 import json
 import os
 import sys
+from typing import Any
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -450,7 +451,7 @@ def parse_rollout(path: Path, since_line: int = 0) -> tuple[int, list[dict], dic
 # hook entry point
 # --------------------------------------------------------------------------
 
-_workspace_cache: dict = {}
+_workspace_cache: dict[str, dict[str, Any] | None] = {}
 
 
 def _workspace(cwd: str | None) -> dict | None:
@@ -461,6 +462,8 @@ def _workspace(cwd: str | None) -> dict | None:
     `at: index` unless the file it came from was written today. A codex rollout
     can be months old and a diff of it would be a fiction.
     """
+    if not cwd:
+        return None
     if cwd in _workspace_cache:
         return _workspace_cache[cwd]
     # Always `at: index`: a rollout is a transcript we are re-reading, so any

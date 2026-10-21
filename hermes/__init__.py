@@ -21,6 +21,7 @@ import json
 import os
 import sys as _sys
 from pathlib import Path
+from typing import Any
 
 # --------------------------------------------------------------------------
 # shared helpers
@@ -290,7 +291,7 @@ def _shape_tool_calls(raw) -> list[dict]:
 # write
 # --------------------------------------------------------------------------
 
-_workspace_cache: dict = {}
+_workspace_cache: dict[str, dict[str, Any] | None] = {}
 
 
 def _workspace() -> dict | None:

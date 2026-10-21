@@ -16,7 +16,7 @@ import os
 import re
 import urllib.error
 import urllib.request
-from typing import Any
+from typing import Any, cast
 
 from evaluation.model import Example, Score, TraceView
 
@@ -73,8 +73,9 @@ class TaskCompletionJudge:
         runs = trace.test_runs()
         last_test = "none"
         if runs:
-            verdict = trace.test_run_passed(runs[-1])
-            last_test = {True: "passed", False: "failed", None: "inconclusive"}[verdict]
+            test_verdict = trace.test_run_passed(runs[-1])
+            last_test = {True: "passed", False: "failed",
+                         None: "inconclusive"}[test_verdict]
         prompt = _PROMPT.format(
             task=json.dumps(example.inputs.get("task", ""), ensure_ascii=False),
             expected=json.dumps(example.expected, ensure_ascii=False),
@@ -123,7 +124,7 @@ class TaskCompletionJudge:
         if not match:
             return None
         try:
-            return json.loads(match.group(0))
+            return cast(dict[str, Any], json.loads(match.group(0)))
         except json.JSONDecodeError:
             return None
 

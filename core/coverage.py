@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -316,7 +317,7 @@ def _canon_path(value: str) -> str:
         return value
 
 
-def _canon_set(values) -> set[str]:
+def _canon_set(values: Iterable[str]) -> set[str]:
     return {_canon_path(v) for v in values}
 
 
@@ -402,7 +403,7 @@ def scan_trace_files(trace_dirs: list[Path]) -> dict[str, set[str]]:
     return out
 
 
-def store_session_provider(db: Path):
+def store_session_provider(db: Path) -> Callable[[], dict[str, set[str]]]:
     """A traced-session reader backed by the index instead of the raw files.
 
     The indexer already records (session_id, adapter_id) for every event it
@@ -465,14 +466,14 @@ def _install_line(adapter_id: str, marker: Path) -> tuple[float | None, str]:
     # Bound it: a value in the future is nonsense (a hand-edited or corrupted
     # state file must not be able to suppress the warning for months), and a
     # value AHEAD of the marker is ignored in favour of the marker itself.
-    usable = (isinstance(previous, (int, float))
-              and 0 < float(previous) <= min(current, time.time()))
-    if usable and float(previous) < current:
+    prev = previous if isinstance(previous, (int, float)) else None
+    usable = prev is not None and 0 < float(prev) <= min(current, time.time())
+    if usable and prev is not None and float(prev) < current:
         # We are looking at a marker that has moved forward since the line was
         # stored — a reinstall or a touch, observed. Only then is "earliest
         # observed" a true description of where this value came from; calling a
         # merely-stored value "earliest observed" overstates it.
-        return float(previous), "persisted (a later marker was observed)"
+        return float(prev), "persisted (a later marker was observed)"
     origin = ("persisted (not corroborated)" if usable else "marker mtime")
     if state.get(key) != current:
         state[key] = current
@@ -527,7 +528,8 @@ CACHE_TTL_SECONDS = 30.0
 
 
 def cached(trace_dirs: list[Path] | None = None,
-           traced_provider=None) -> list[Coverage]:
+           traced_provider: Callable[[], dict[str, set[str]]] | None = None
+           ) -> list[Coverage]:
     """Cached form for the request path (the dashboard refetches per SSE event).
 
     ONE slot, deliberately. An earlier version keyed the cache by data source,
@@ -540,7 +542,7 @@ def cached(trace_dirs: list[Path] | None = None,
     now = time.monotonic()
     entry = _CACHE.get("rows")
     if isinstance(entry, tuple) and now - entry[0] < CACHE_TTL_SECONDS:
-        return entry[1]                                    # type: ignore[return-value]
+        return entry[1]
     rows = check(trace_dirs=trace_dirs, traced_provider=traced_provider)
     _CACHE["rows"] = (now, rows)
     return rows
@@ -552,7 +554,8 @@ def _clear_cache() -> None:
 
 def check(sources_: list[SessionSource] | None = None,
           trace_dirs: list[Path] | None = None,
-          traced_provider=None) -> list[Coverage]:
+          traced_provider: Callable[[], dict[str, set[str]]] | None = None
+          ) -> list[Coverage]:
     """Compare each adapter's session inventory against its traces.
 
     `traced_provider` returns {adapter_id: session ids}; the server passes the

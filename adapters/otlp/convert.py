@@ -29,7 +29,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime, timezone
-from typing import Any, Iterator
+from typing import Any, Iterator, TypedDict
 
 from core.schema.model import (SCHEMA_V2, TERMINAL_STATUSES,
                                event_event_id, span_event_id)
@@ -385,7 +385,8 @@ def export_traces(traces: list[dict[str, Any]],
     merged: dict[str, Any] | None = None
     events_by_trace = events_by_trace or {}
     for trace in traces:
-        payload = export_trace(trace, events_by_trace.get(trace.get("trace_id")))
+        tid = trace.get("trace_id")
+        payload = export_trace(trace, events_by_trace.get(str(tid)) if tid else None)
         if merged is None:
             merged = payload
         else:
@@ -407,18 +408,34 @@ def _iter_otlp_spans(payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
                 yield {"span": span, "resource": resource_attrs}
 
 
+class _CanonicalIds(TypedDict):
+    """The four ids, with the two that are load-bearing typed as strings.
+
+    trace_id/span_id are ALWAYS strings here (derived when absent), while
+    session/parent are genuinely optional. An earlier single `dict[str, str |
+    None]` made every caller prove what the constructor already guarantees.
+    """
+
+    trace_id: str
+    span_id: str
+    parent_span_id: str | None
+    session_id: str | None
+
+
 def _canonical_ids(attrs: dict[str, Any], span: dict[str, Any],
-                   fallback_trace: str) -> dict[str, str | None]:
+                   fallback_trace: str) -> _CanonicalIds:
     """Prefer our original ids; derive from OTel ids for foreign data."""
+    trace_id = (attrs.get(f"{ATTR_PREFIX}trace_id")
+                or f"otlp:{span.get('traceId') or fallback_trace}")
+    span_id = attrs.get(f"{ATTR_PREFIX}span_id") or f"otlp:{span.get('spanId')}"
+    parent = (attrs.get(f"{ATTR_PREFIX}parent_span_id")
+              or (f"otlp:{span['parentSpanId']}" if span.get("parentSpanId") else None))
+    session = attrs.get(f"{ATTR_PREFIX}session_id")
     return {
-        "trace_id": attrs.get(f"{ATTR_PREFIX}trace_id")
-        or f"otlp:{span.get('traceId') or fallback_trace}",
-        "span_id": attrs.get(f"{ATTR_PREFIX}span_id")
-        or f"otlp:{span.get('spanId')}",
-        "parent_span_id": (attrs.get(f"{ATTR_PREFIX}parent_span_id")
-                           or (f"otlp:{span['parentSpanId']}"
-                               if span.get("parentSpanId") else None)),
-        "session_id": attrs.get(f"{ATTR_PREFIX}session_id"),
+        "trace_id": str(trace_id),
+        "span_id": str(span_id),
+        "parent_span_id": None if parent is None else str(parent),
+        "session_id": None if session is None else str(session),
     }
 
 

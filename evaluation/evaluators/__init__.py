@@ -5,7 +5,7 @@ being comparable (proposal §7.3: experiments pin evaluator versions).
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 from evaluation.evaluators.base import Evaluator
 from evaluation.evaluators import deterministic, llm_judge, trajectory
@@ -21,7 +21,7 @@ def get_evaluator(evaluator_id: str, config: dict | None = None) -> Evaluator:
     if evaluator_id not in _REGISTRY:
         raise KeyError(f"unknown evaluator: {evaluator_id}")
     factory = _REGISTRY[evaluator_id]
-    return factory(config or {}) if callable(factory) else factory
+    return cast(Evaluator, factory(config or {}) if callable(factory) else factory)
 
 
 def all_evaluators() -> list[Evaluator]:

@@ -689,7 +689,7 @@ def cmd_serve(args) -> int:
             print(f"pid file : {pid_file}")
             print(f"log      : {platform_dir() / 'server.log'}")
             return 0 if alive else 1
-        if not alive:
+        if not alive or pid is None:
             print("no running dashboard", file=sys.stderr)
             return 1
         os.kill(pid, signal.SIGTERM)
@@ -876,13 +876,14 @@ def cmd_adapter(args) -> int:
     adapter_id = args.adapter
     if not target.is_file():
         adapter_id = adapter_id or args.target
-        target = _fixture_stream_for(adapter_id)
-        if target is None:
+        fixture = _fixture_stream_for(adapter_id)
+        if fixture is None:
             print(f"no such stream file, and no fixture stream for "
                   f"adapter {adapter_id!r}.\nProduce one: point the adapter at "
                   "a temp file and run a small scenario, then pass the path.",
                   file=sys.stderr)
             return 2
+        target = fixture
         print(f"using fixture stream: {target}")
     report = check_stream(target, adapter_id=adapter_id)
     print(report.render())
@@ -918,7 +919,8 @@ def cmd_session(args) -> int:
     db = args.db or Path(os.environ.get("AGENTTRACE_DB")
                          or platform_dir() / "agenttrace.db")
     store = TraceStore(db)
-    if not store.one("SELECT COUNT(*) AS n FROM spans")["n"]:
+    span_count = store.one("SELECT COUNT(*) AS n FROM spans")
+    if not (span_count["n"] if span_count else 0):
         Indexer(store, args.dirs).scan_once()
 
     # Match the whole id or its tail: these ids are long paths for pi and
@@ -994,7 +996,8 @@ def cmd_report(args) -> int:
     db = args.db or Path(os.environ.get("AGENTTRACE_DB")
                          or platform_dir() / "agenttrace.db")
     store = TraceStore(db)
-    if not store.one("SELECT COUNT(*) AS n FROM spans")["n"]:
+    span_count = store.one("SELECT COUNT(*) AS n FROM spans")
+    if not (span_count["n"] if span_count else 0):
         # No index yet: build one from the dirs the user pointed at, so the
         # command works on a fresh machine without a separate `index` run.
         Indexer(store, args.dirs).scan_once()
@@ -1012,8 +1015,8 @@ def cmd_otlp(args) -> int:
     from server.main import platform_dir
 
     if args.otlp_cmd == "import":
-        events = list(import_file(args.file, args.adapter))
-        if not events:
+        imported = list(import_file(args.file, args.adapter))
+        if not imported:
             print("no spans found in the payload", file=sys.stderr)
             return 1
         out = args.out or (args.dirs[0] if args.dirs else None)
@@ -1029,7 +1032,7 @@ def cmd_otlp(args) -> int:
         # any credential the producer happened to include on disk verbatim.
         from adapter_sdk.event_sink import JsonlEventSink
         sink = JsonlEventSink(dest)
-        written = sink.emit_many(events)
+        written = sink.emit_many(imported)
         print(f"imported {written} event(s) -> {dest}")
         if sink.write_errors:
             print(f"{sink.write_errors} event(s) refused: "
@@ -1042,19 +1045,24 @@ def cmd_otlp(args) -> int:
     db = args.db or Path(os.environ.get("AGENTTRACE_DB")
                          or platform_dir() / "agenttrace.db")
     store = TraceStore(db)
+    traces: list[dict] = []
     if args.trace:
-        traces = [t for t in (get_trace(store, tid) for tid in args.trace) if t]
+        for tid in args.trace:
+            found = get_trace(store, tid)
+            if found is not None:
+                traces.append(found)
     else:
-        traces = [get_trace(store, t["trace_id"])
-                  for t in list_traces(store, limit=args.limit)["traces"]]
-        traces = [t for t in traces if t]
-    events = {t["trace_id"]: list(store.iter_events(t["trace_id"]))
-              for t in traces}
+        for summary in list_traces(store, limit=args.limit)["traces"]:
+            found = get_trace(store, summary["trace_id"])
+            if found is not None:
+                traces.append(found)
+    events_by_trace = {t["trace_id"]: list(store.iter_events(t["trace_id"]))
+                       for t in traces}
     store.close()
     if not traces:
         print("no traces to export (run `agenttrace index` first)", file=sys.stderr)
         return 1
-    print(json.dumps(export_traces(traces, events), ensure_ascii=False))
+    print(json.dumps(export_traces(traces, events_by_trace), ensure_ascii=False))
     return 0
 
 

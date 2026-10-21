@@ -30,9 +30,10 @@ import sqlite3
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, cast
 
 from core.schema.model import TERMINAL_STATUSES, now_iso, validate_event
+
 DB_SCHEMA_VERSION = 4
 
 _SCHEMA = """
@@ -612,7 +613,7 @@ class TraceStore:
                 # makes a reader distrust both numbers.
                 status = ("error" if bad else
                           "interrupted" if open_children else "ok")
-                attrs = {"synthetic": True}
+                attrs: dict[str, Any] = {"synthetic": True}
                 model = children["model"] if children else ""
                 if model:
                     attrs["model"] = model
@@ -712,8 +713,8 @@ class TraceStore:
     # ------------------------------------------------------------------
 
     def file_state(self, path: str) -> sqlite3.Row | None:
-        return self._conn().execute(
-            "SELECT * FROM ingest_files WHERE path = ?", (path,)).fetchone()
+        return cast(sqlite3.Row | None, self._conn().execute(
+            "SELECT * FROM ingest_files WHERE path = ?", (path,)).fetchone())
 
     def note_file(self, path: str, size: int, mtime: float, indexed_bytes: int,
                   corrupt_lines: int = 0, last_error: str | None = None,
@@ -764,7 +765,8 @@ class TraceStore:
         return list(self._conn().execute(sql, params).fetchall())
 
     def one(self, sql: str, params: tuple[Any, ...] = ()) -> sqlite3.Row | None:
-        return self._conn().execute(sql, params).fetchone()
+        return cast(sqlite3.Row | None,
+                    self._conn().execute(sql, params).fetchone())
 
     def iter_events(self, trace_id: str) -> Iterator[dict[str, Any]]:
         rows = self.query(

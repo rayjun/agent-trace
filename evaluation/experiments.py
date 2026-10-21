@@ -102,6 +102,8 @@ def run_experiment(store: TraceStore, experiment_id: str) -> dict[str, Any]:
                    meta["source_trace_id"])
 
     exp = get_experiment(store, experiment_id)  # refresh after auto-attach
+    if exp is None:                    # the id existed a statement ago
+        raise KeyError(f"unknown experiment: {experiment_id}")
     evaluators = [(eid, get_evaluator(eid))
                   for eid in (exp["evaluator_ids"] or {}).keys()]
     # The trace's own recorded model(s) are the billing truth; the

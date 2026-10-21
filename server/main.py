@@ -42,7 +42,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import parse_qs, unquote, urlparse
 
 from core.query import get_trace, list_adapters, list_sessions, list_traces, overview
@@ -156,6 +156,20 @@ def _json_body(obj: Any) -> bytes:
     return json.dumps(obj, ensure_ascii=False).encode("utf-8")
 
 
+class TraceHTTPServer(ThreadingHTTPServer):
+    """The one attribute carrier the handler reads.
+
+    Declared as a class instead of `setattr` on a bare ThreadingHTTPServer:
+    `self.server.state` was invisible to the type checker, so three call sites
+    carried `type: ignore[attr-defined]` and one of them still returned Any
+    from a typed property.
+    """
+
+    daemon_threads = True
+    state: ServerState
+    verbose: bool = False
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "agent-trace/2"
@@ -164,7 +178,7 @@ class Handler(BaseHTTPRequestHandler):
 
     @property
     def state(self) -> ServerState:
-        return self.server.state  # type: ignore[attr-defined]
+        return cast(TraceHTTPServer, self.server).state
 
     def log_message(self, fmt: str, *args: Any) -> None:
         if getattr(self.server, "verbose", False):
@@ -370,13 +384,13 @@ class Handler(BaseHTTPRequestHandler):
                 body = self._read_json()
                 if body is None:
                     return
-                ex = ds_mod.from_trace(store, dataset_id,
-                                       str(body.get("trace_id") or ""),
-                                       body.get("expected"))
-                if ex is None:
+                created = ds_mod.from_trace(store, dataset_id,
+                                            str(body.get("trace_id") or ""),
+                                            body.get("expected"))
+                if created is None:
                     self._send_json({"error": "trace not found"}, 404)
                     return
-                self._send_json(ex.__dict__, status=201)
+                self._send_json(created.__dict__, status=201)
                 return
             if action == "import":
                 body = self._read_json()
@@ -568,17 +582,11 @@ def _int(qs: dict[str, list[str]], key: str, default: int) -> int:
 
 def make_server(store: TraceStore, indexer: Indexer, *, host: str, port: int,
                 token: str, scan_interval: float = 1.0,
-                verbose: bool = False) -> ThreadingHTTPServer:
+                verbose: bool = False) -> TraceHTTPServer:
     state = ServerState(store, indexer, token, scan_interval)
-
-    class _Server(ThreadingHTTPServer):
-        daemon_threads = True
-
-    server = _Server((host, port), Handler)
-    # Attached post-construction: assigning `state = state` inside the class
-    # body compiles the name as LOAD_NAME, which skips the enclosing scope.
-    server.state = state  # type: ignore[attr-defined]
-    server.verbose = verbose  # type: ignore[attr-defined]
+    server = TraceHTTPServer((host, port), Handler)
+    server.state = state
+    server.verbose = verbose
     return server
 
 

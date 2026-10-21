@@ -17,7 +17,10 @@ the evidence behind each count is reachable (`agenttrace report --traces`).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from core.storage.sqlite_store import TraceStore
 
 #: The trajectory signals, in the order a reader should look at them: what the
 #: agent did (motion), then what it cost, then how it ended.
@@ -76,7 +79,7 @@ class Signal:
         }
 
 
-def report(store, *, limit: int = 200, agent: str | None = None,
+def report(store: TraceStore, *, limit: int = 200, agent: str | None = None,
            since: str | None = None) -> dict[str, Any]:
     """Aggregate the trajectory signals over the most recent traces."""
     from core.pricing import cost_usd

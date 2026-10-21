@@ -105,7 +105,8 @@ def list_traces(store: TraceStore, *, agent: str | None = None,
         outer_where = "WHERE first_ts >= ?"
         params.append(since)
     base = f"SELECT * FROM ({sql}) {outer_where}"
-    total = store.one(f"SELECT COUNT(*) AS n FROM ({base})", tuple(params))["n"]
+    total_row = store.one(f"SELECT COUNT(*) AS n FROM ({base})", tuple(params))
+    total = total_row["n"] if total_row else 0
     rows = store.query(
         base + "\nORDER BY first_ts DESC LIMIT ? OFFSET ?",
         tuple(params) + (limit, offset))
@@ -320,7 +321,7 @@ def session_detail(store: TraceStore, session_id: str) -> dict[str, Any] | None:
         kinds = sorted({c["kind"] for c in children})
         errors = sum(1 for c in children
                      if c["status"] in ("error", "interrupted", "cancelled"))
-        models = [c["model"] for c in children if c["model"]]
+        child_models = [c["model"] for c in children if c["model"]]
         # The work of this turn: its spans' own durations. Bounded by reality in
         # a way the span's start-end difference is not (a resume gap between a
         # request and its response is not time spent working).
@@ -336,7 +337,7 @@ def session_detail(store: TraceStore, session_id: str) -> dict[str, Any] | None:
             "spans": len(children),
             "kinds": kinds,
             "errors": errors,
-            "model": models[0] if models else None,
+            "model": child_models[0] if child_models else None,
             "tokens": {
                 "input": sum(c["input_tokens"] or 0 for c in children),
                 "output": sum(c["output_tokens"] or 0 for c in children),
@@ -415,7 +416,7 @@ def session_detail(store: TraceStore, session_id: str) -> dict[str, Any] | None:
 def overview(store: TraceStore) -> dict[str, Any]:
     # errors exclude synthetic task rows: a synthetic root only MIRRORS its
     # children's failure — counting it double-counts every real error.
-    totals = store.one(
+    totals_row = store.one(
         "SELECT COUNT(DISTINCT trace_id) AS traces, COUNT(*) AS spans,"
         " SUM(status IN ('error','interrupted','cancelled')"
         "     AND synthetic = 0) AS errors,"
@@ -423,7 +424,11 @@ def overview(store: TraceStore) -> dict[str, Any]:
         " COALESCE(SUM(input_tokens),0) AS in_tok,"
         " COALESCE(SUM(output_tokens),0) AS out_tok,"
         " COALESCE(SUM(cache_read_tokens),0) AS cache_tok"
-        " FROM spans") or {}
+        " FROM spans")
+    # Explicit dict, not the Row: this function reads nine keys and a Row's
+    # missing-key behaviour is an exception, so the shape is made total here
+    # once instead of trusted at every use.
+    totals: dict[str, Any] = dict(totals_row) if totals_row else {}
     per_agent = store.query(
         "SELECT adapter_id, COUNT(DISTINCT trace_id) AS traces,"
         " COUNT(*) AS spans,"
