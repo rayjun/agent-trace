@@ -204,9 +204,11 @@ observed ones, and the request side is rebuilt from the transcript — and says 
   off by default (`AGENTTRACE_GIT=full` opts in) and the snapshot records when it
   looked, so a months-old trace is not read against today's branch.
 
-Deliberately not here yet: retention/auto-delete policies, deleting a single
-trace or session, real agent replay (playback only), cross-machine aggregation.
-The reasoning behind each decision is in [docs/decisions.md](docs/decisions.md).
+Deliberately not here yet: retention/auto-delete policies, real agent replay
+(playback only), cross-machine aggregation. Deleting a trace is deleting its
+JSONL — the index follows the files on the next scan, and a file that vanished
+takes its rows with it. The reasoning behind each decision is in
+[docs/decisions.md](docs/decisions.md).
 
 ## Development
 

@@ -15,6 +15,13 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+
+#: The suite talks to a server on 127.0.0.1, and `urllib` sends that through
+#: `http_proxy` when the shell exports one — so the assertions were comparing
+#: against the proxy's answer (404/502) instead of the server's: a green suite
+#: on a clean shell, red on a laptop running a VPN client. Loopback is never
+#: proxied here, which is also what the product does (llm_judge._opener).
+_NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -63,7 +70,7 @@ def req(path: str, headers: dict[str, str] | None = None,
         method: str = "GET") -> tuple[int, dict | str]:
     r = urllib.request.Request(BASE + path, headers=headers or {}, method=method)
     try:
-        with urllib.request.urlopen(r, timeout=5) as resp:
+        with _NO_PROXY.open(r, timeout=5) as resp:
             body = resp.read().decode("utf-8")
             try:
                 return resp.status, json.loads(body)
@@ -150,7 +157,7 @@ if scripts:
           f"identifier x{body.count('__AGENTTRACE_TOKEN__')}, "
           f"value-placeholder present={'__AGENTTRACE_TOKEN_VALUE__' in body}")
 
-with urllib.request.urlopen(BASE + "/", timeout=5) as resp:
+with _NO_PROXY.open(BASE + "/", timeout=5) as resp:
     check("no Access-Control-Allow-Origin header",
           resp.headers.get("Access-Control-Allow-Origin") is None)
 
@@ -217,7 +224,7 @@ sse_result: dict[str, str] = {}
 
 def read_sse() -> None:
     try:
-        r = urllib.request.urlopen(BASE + "/api/stream?token=test-token",
+        r = _NO_PROXY.open(BASE + "/api/stream?token=test-token",
                                    timeout=5)
         # read1: return as soon as ANY bytes arrive — read(64) would park
         # until the buffer fills, which a heartbeat stream never does.

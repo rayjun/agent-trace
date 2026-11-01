@@ -15,10 +15,30 @@ import json
 import os
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, cast
 
 from evaluation.model import Example, Score, TraceView
+
+
+def _opener(url: str) -> urllib.request.OpenerDirector:
+    """An opener that never proxies a loopback endpoint.
+
+    `urllib` honours `http_proxy` for `127.0.0.1` too, so on a machine with a
+    proxy exported (a VPN client, a corporate shell) a judge pointed at a local
+    model was sent to the proxy instead. The failure is quiet: the judge reports
+    "endpoint unreachable" and a local-first project looks like it cannot do
+    local evaluation. Remote endpoints keep the environment's proxy, because
+    that is what it is for.
+    """
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    loopback = (host in ("localhost", "::1", "0.0.0.0")
+                or host.startswith("127.")
+                or host.endswith(".localhost"))
+    if loopback:
+        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return urllib.request.build_opener()
 
 _KIND = "llm_judge"
 
@@ -111,12 +131,13 @@ class TaskCompletionJudge:
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0,
         }).encode("utf-8")
+        url = self.base_url.rstrip("/") + "/chat/completions"
         req = urllib.request.Request(
-            self.base_url.rstrip("/") + "/chat/completions", data=body,
+            url, data=body,
             headers={"Content-Type": "application/json",
                      **({"Authorization": f"Bearer {self.api_key}"}
                         if self.api_key else {})})
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+        with _opener(url).open(req, timeout=self.timeout) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
         text = (payload.get("choices") or [{}])[0].get("message", {}).get("content") or ""
         # lenient parse: first {...} block in the reply

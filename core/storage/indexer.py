@@ -21,12 +21,13 @@ the file, and honesty about provenance beats a guessed number.
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from core.convert.v1_to_v2 import convert_record
-from core.storage.discovery import iter_trace_files
+from core.storage.discovery import iter_trace_files, resolved_path
 from core.storage.sqlite_store import TraceStore
 
 if TYPE_CHECKING:
@@ -38,6 +39,13 @@ class ScanReport:
     files_seen: int = 0
     files_ingested: int = 0
     files_invalidated: int = 0
+    #: indexed files whose source is gone (deleted, not merely unreadable) —
+    #: their rows are dropped in the same pass, because the projection follows
+    #: the archive and a trace nobody can re-read must not stay queryable.
+    files_dropped: int = 0
+    #: files whose stored key was respelled to the canonical (resolved) path —
+    #: a one-time migration for keys written before paths were canonicalised.
+    files_rekeyed: int = 0
     events_added: int = 0
     #: already present with the same payload — an idempotent re-read, i.e. the
     #: dedup working. NOT an error, and no longer counted as one.
@@ -51,7 +59,8 @@ class ScanReport:
 
     @property
     def changed(self) -> bool:
-        return self.events_added > 0 or self.files_invalidated > 0
+        return (self.events_added > 0 or self.files_invalidated > 0
+                or self.files_dropped > 0)
 
     @property
     def problems(self) -> list[str]:
@@ -104,6 +113,11 @@ class Indexer:
         report = ScanReport()
         before = self._counters()
         files = list(iter_trace_files(self.dirs))
+        present = {str(p) for p in files}
+        # Before the loop, not after: a key written under an older spelling has
+        # to be corrected first, or this pass reads the whole file again (a
+        # 1.6 GB trace) just to dedup it.
+        report.files_rekeyed = self._rekey(present)
         for path in files:
             report.files_seen += 1
             try:
@@ -121,9 +135,72 @@ class Indexer:
                     self._scan_file(Path(path), report)
                 except OSError as exc:
                     report.errors.append(f"{path}: {exc}")
-        self.store.refresh_projections()
+        report.files_dropped = self._drop_vanished(present)
+        # Counters BEFORE the refresh decision: `report.changed` reads
+        # events_added, which is a diff of the store's counters, so asking the
+        # question first and computing the diffs after silently answered "nothing
+        # changed" on every pass and the projection stopped updating entirely.
         self._report_counters(report, before)
+        # Refresh only when the projection can have changed. The refresh is not
+        # free (it re-derives every synthetic task and session row), and this
+        # runs on a timer: paying it on an idle tick made a 1s scan loop spend
+        # seconds per pass doing nothing.
+        if report.changed or report.files_rekeyed:
+            try:
+                self.store.refresh_projections()
+            except sqlite3.Error as exc:   # a read-only or locked index must not
+                report.errors.append(f"refresh_projections: {exc}")  # stop ingest
         return report
+
+    def _rekey(self, present: set[str]) -> int:
+        """One-time: move keys written before paths were canonicalised.
+
+        Only rows whose file is present under a different spelling are touched;
+        a row for a genuinely missing file is left to _drop_vanished.
+        """
+        present_resolved = {resolved_path(p) for p in present}
+        fixed = 0
+        for path in self.store.indexed_files():
+            canon = resolved_path(path)
+            if canon != path and canon in present_resolved:
+                self.store.rekey_file(path, canon)
+                fixed += 1
+        return fixed
+
+    def _drop_vanished(self, present: set[str]) -> int:
+        """Forget indexed files whose source no longer exists.
+
+        The index is a projection of the files, so a file that is gone has no
+        rows to project: without this, deleting a trace's JSONL left it
+        queryable forever and unreachable from `--full` (which only re-reads
+        files that exist).
+
+        The parent directory is the guard: a *file* missing from a directory
+        that is still there is a deletion, a whole directory missing is a
+        detached volume or an unmounted backup drive, and wiping the index
+        because a disk was unplugged would be the worse mistake.
+        """
+        gone = []
+        # Compare resolved paths. The stored key comes from whatever the indexer
+        # was given (`args.dirs` is resolved by the CLI), while a scan yields
+        # paths spelled as the directory was written — on macOS `/var` is a
+        # symlink to `/private/var`, so a raw string compare called a live file
+        # deleted, dropped its rows, and the next scan re-ingested them: a
+        # permanent drop/re-add loop instead of a no-op.
+        present_resolved = {resolved_path(p) for p in present}
+        for path in self.store.indexed_files():
+            if resolved_path(path) in present_resolved:
+                continue
+            parent = Path(path).parent
+            try:
+                if parent.is_dir():
+                    gone.append(path)
+            except OSError:
+                continue
+        if not gone:
+            return 0
+        self.store.drop_files(gone)
+        return len(gone)
 
     def full_rebuild(self) -> ScanReport:
         """Re-ingest everything from the JSONL files.
@@ -164,7 +241,7 @@ class Indexer:
 
     def _scan_file(self, path: Path, report: ScanReport) -> None:
         stat = path.stat()
-        key = str(path)
+        key = resolved_path(path)   # one spelling per file, whatever dir was passed
         state = self.store.file_state(key)
 
         # Compare against the file's last OBSERVED size, not `indexed_bytes`:
@@ -195,7 +272,7 @@ class Indexer:
 
     def _ingest_from(self, path: Path, offset: int, report: ScanReport,
                      full: bool) -> None:
-        key = str(path)
+        key = resolved_path(path)   # one spelling per file, whatever dir was passed
         corrupt = 0
         last_error: str | None = None
         lineno = 0

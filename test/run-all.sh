@@ -37,6 +37,7 @@ run "adapter coverage"      python3 test/coverage.test.py
 run "workspace snapshot"    python3 test/workspace.test.py
 run "dashboard routing"     node    test/dashboard-routing.test.mjs
 run "README diagrams"       node    test/readme-diagram.test.mjs
+run "hardening"             python3 test/hardening.test.py
 run "watch TUI (pty)"       python3 test/watch-tui.test.py
 if [ "${SKIP_E2E:-0}" != "1" ]; then
   run "hermes end-to-end"    bash    test/e2e-hermes.sh

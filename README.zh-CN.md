@@ -157,7 +157,7 @@ python3 codex/codex_import.py <rollout.jsonl>
 * 本地 API **不被默认为可信**：仅绑定回环、`Host` 白名单（防 DNS rebinding）、不发送 CORS 头、检查 `Origin`、bearer token 权限 0600。
 * 工作区采集是只读的，绝不拿你的 git index 锁；diff 默认不抓（`AGENTTRACE_GIT=full` 才开启），并且快照会记录读取时刻，避免几个月前的 trace 被当成本地当前分支去解读。
 
-目前**刻意还没有**：保留期限与自动删除、删除单条 trace/session、真正的 agent 重放（目前只有 playback）、跨机器聚合。每个决策的理由在 [docs/decisions.md](docs/decisions.md)。
+目前**刻意还没有**：保留期限与自动删除、真正的 agent 重放（目前只有 playback）、跨机器聚合。删除一条 trace 就是删掉它的 JSONL —— 索引会在下一次扫描时跟着更新，文件消失则对应的行一并消失。每个决策的理由在 [docs/decisions.md](docs/decisions.md)。
 
 ## 开发
 

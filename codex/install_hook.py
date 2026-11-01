@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -33,6 +34,57 @@ def codex_bin() -> str | None:
     return shutil.which("codex")
 
 
+#: Executable headers. A file starting with one of these can be searched for
+#: event names; anything else is a script and must be resolved first.
+_BINARY_MAGIC = (b"\x7fELF", b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe",
+                 b"\xca\xfe\xba\xbe", b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf",
+                 b"MZ")
+
+_ASSIGN = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=[\"']?([^\"'\s]+)[\"']?\s*$", re.M)
+_EXEC = re.compile(r"^\s*exec\s+(?:\"([^\"]+)\"|'([^']+)'|(\S+))", re.M)
+
+
+def _looks_like_binary(path: Path) -> bool:
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(4).startswith(_BINARY_MAGIC)
+    except OSError:
+        return False
+
+
+def _launcher_targets(script: Path) -> list[Path]:
+    """Follow a wrapper script to the executable it runs.
+
+    `codex` on PATH is frequently a launcher, not the binary: a node shim, or a
+    hand-written `exec "$BIN"` wrapper (what the documented pure-Rust install
+    produces). Reading a launcher's bytes finds no event names, so the target
+    has to be resolved first — otherwise every event probes as unsupported and
+    the installer silently wires nothing at all, which is exactly how a Codex
+    install ends up with zero traces and no error.
+    """
+    try:
+        text = script.read_text("utf-8", "replace")
+    except OSError:
+        return []
+    assignments = {m.group(1): m.group(2) for m in _ASSIGN.finditer(text)}
+
+    def expand(raw: str) -> str:
+        for _ in range(3):     # $PKG inside $BIN is normal, not pathological
+            new = re.sub(r"\$\{?(\w+)\}?",
+                         lambda m: assignments.get(m.group(1), m.group(0)), raw)
+            if new == raw:
+                break
+            raw = new
+        return raw
+
+    found: list[Path] = []
+    for match in _EXEC.finditer(text):
+        raw = next(g for g in match.groups() if g)
+        found.append(Path(expand(raw)))
+    found += [Path(expand(v)) for v in assignments.values()]
+    return [p for p in found if p.is_absolute() and p.is_file()]
+
+
 def codex_supported_events(events: list[str]) -> dict[str, bool]:
     """Probe the installed Codex binary for each event name.
 
@@ -40,31 +92,40 @@ def codex_supported_events(events: list[str]) -> dict[str, bool]:
     implements, so wiring a name the binary has never heard of yields a
     hooks.json entry that silently never runs. A name absent from the binary's
     strings is reported as unsupported instead of being installed.
+
+    The probe only reports `False` for a name when it found a real executable to
+    look in. If every candidate turns out to be a script it cannot resolve, the
+    answer is `True` ("could not probe, do not block the install") — refusing to
+    wire every event because the probe failed is the worse failure, because the
+    install then reports success while recording nothing.
     """
     exe = codex_bin()
     if not exe:
         return {e: True for e in events}   # cannot probe; do not block the install
 
-    # codex is a node shim; the real binary is the vendored native executable.
-    candidates = [exe]
+    candidates: list[Path] = [Path(exe)]
     real = Path(exe).resolve()
     if real.is_file():
-        vendored = list(real.parent.glob("../node_modules/@openai/*/vendor/*/bin/codex"))
-        candidates += [str(p.resolve()) for p in vendored]
+        # codex is often a node shim; the real binary is the vendored one.
+        candidates += [p.resolve() for p in
+                       real.parent.glob("../node_modules/@openai/*/vendor/*/bin/codex")]
+        if not _looks_like_binary(real):
+            candidates += _launcher_targets(real)
+
+    binaries = [p for p in dict.fromkeys(candidates) if _looks_like_binary(p)]
+    if not binaries:
+        return {e: True for e in events}
 
     blob = b""
-    for c in candidates:
+    for path in binaries:
         try:
-            blob += Path(c).read_bytes()
+            blob += path.read_bytes()
         except OSError:
             continue
     if not blob:
         return {e: True for e in events}
 
-    out: dict[str, bool] = {}
-    for e in events:
-        out[e] = e.encode("ascii") in blob
-    return out
+    return {e: e.encode("ascii") in blob for e in events}
 
 
 def enable_feature() -> str:

@@ -617,3 +617,44 @@ Deliberately NOT in doctor: repair. It reports and names the command that
 fixes the problem (`agenttrace index`, `install.sh hermes default`). A doctor
 that silently mutates storage is a second failure mode, and rebuilding an index
 is already a supported, explicit action.
+
+## D31. Quiet failures are the ones that cost days
+
+A review round that started from "how far is this from production" produced
+five defects, none of which threw anything. All five were found by running the
+code against the real install, and each one's shape is "the system reports
+success while doing nothing":
+
+| symptom the user saw | actual cause |
+|---|---|
+| codex recorded no traces, install said OK | `codex` on PATH was a launcher script; the event probe searched the script's bytes for hook names, found none, and concluded that *no* event is supported — so it wired none |
+| a deleted trace stayed in every list | the index only ever visited files that exist, so a deleted file's rows were never revoked, and no command could remove them |
+| `doctor` said "last event 30 d ago" on a live install | it aged the file with the newest **mtime**; `touch`, rsync and backup restores move mtime without moving time |
+| tests failed on a laptop that worked on CI | `urllib` sends `127.0.0.1` through `http_proxy`; the assertions were comparing against the proxy's 502 |
+| the daemon never idled | every scan refreshed projections unconditionally, and the refresh parsed all 19k payloads (4.2s) to look for `session_end` |
+
+Rules that follow, now enforced by tests:
+
+* **A probe that cannot run must not answer "no".** "Unsupported" and "could not
+  determine" are different answers, and the safe default for an *installer* is
+  the second one: wiring a hook that never fires is cheap, wiring nothing at all
+  is invisible.
+* **A projection follows its source, in both directions.** Appends already
+  worked; deletions did not. The guard that made this safe is that a missing
+  *file* in a directory that still exists is a deletion, while a missing
+  *directory* is a detached volume — wiping an index because a disk was
+  unplugged would be worse than the bug.
+* **One spelling per path.** Keys are the resolved path now, because `/var` is
+  `/private/var` on macOS and a trace dir may be a symlink. A key written by an
+  older build is respelled in place (`files_rekeyed`) and never re-read.
+* **Timers may not do work proportional to history.** The refresh runs only when
+  the archive changed, and its session_end test only reads `event` rows: 8.7s
+  per pass became 0.11s warm, and an idle index run is 0.7s over 19 files.
+* **Loopback is not proxied.** Not in tests, not for a local judge: a local-first
+  tool whose local evaluation path depends on the shell's proxy settings is not
+  local-first.
+
+What was checked and found *correct*, so it is not "fixed": the indexer's crash
+recovery. Killing it mid-file leaves the offset unadvanced, and the next run
+re-ingests from the last committed offset to the full count (verified at 120k
+records); only the `sessions` projection waits for a completed pass.

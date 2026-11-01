@@ -44,6 +44,12 @@ from core import ingest_faults
 #: "did the last write survive", not about auditing history — the indexer owns
 #: the full scan and its quarantine counts.
 SAMPLE_LINES = 2000
+#: How many files to sample when looking for the newest record, and how many
+#: lines of each. Both are small on purpose: payloads average tens of KB, so
+#: "sample everything to find the newest ts" would make `doctor` download
+#: gigabytes to print one line.
+SAMPLE_FILES = 5
+TAIL_RECORDS = 120
 #: A day without a single record is a defect on a machine whose agent runs.
 STALE_CAPTURE_H = 24.0
 #: Below this, the next append is likely to be the one that fails.
@@ -242,35 +248,55 @@ def _capture_check(files: list[Path]) -> tuple[Check, set[Any]]:
                       advice="run the agent once — adapters load at process start, "
                              "so a session already running when they were installed "
                              "writes nothing"), set())
-    newest = max(files, key=_mtime)
-    recs, bad = _tail(newest)
-    versions = {r.get("v") for r in recs}
-    last_ts = None
-    last_agent = None
-    for rec in reversed(recs):
-        if isinstance(rec.get("ts"), str):
-            # v1 records carry `agent`, v2 carry `adapter_id`; a file can hold
-            # both during a migration.
-            last_ts = rec["ts"]
-            last_agent = rec.get("agent") or rec.get("adapter_id")
-            break
+    # The newest RECORD, not the newest file's mtime. `touch`, rsync, a backup
+    # restore and a copy all move mtime without changing content, so picking the
+    # file by mtime reported a live install as "last event 30 d ago" (and exited
+    # 1) whenever an old file happened to be touched last. The window is bounded
+    # because a diagnostic must not read every file to look at its end.
+    newest_ts: str | None = None
+    newest_file: Path | None = None
+    newest_rec: dict[str, Any] = {}
+    newest_bad = 0
+    versions: set[Any] = set()
+    sampled: list[tuple[Path, list[dict]]] = []
+    for path in sorted(files, key=_mtime, reverse=True)[:SAMPLE_FILES]:
+        recs, bad = _tail(path, max_lines=TAIL_RECORDS)
+        sampled.append((path, recs))
+        for rec in recs:
+            versions.add(rec.get("v"))
+        for rec in reversed(recs):
+            ts = rec.get("ts")
+            if isinstance(ts, str) and (newest_ts is None or ts > newest_ts):
+                newest_ts, newest_file, newest_rec, newest_bad = ts, path, rec, bad
+    if newest_file is None or newest_ts is None:
+        first_path, first_recs = sampled[0] if sampled else (files[0], [])
+        return (Check("Capture", "warn",
+                      f"{first_path.name}: no timestamped record in the last "
+                      f"{len(first_recs)} lines",
+                      advice="a trace file with no record carrying `ts` cannot be "
+                             "ordered or aged; check the adapter's clock field"),
+                versions)
+    newest = newest_file
+    last_ts = newest_ts
+    # v1 records carry `agent`, v2 carry `adapter_id`; a file can hold both
+    # during a migration.
+    last_agent = newest_rec.get("agent") or newest_rec.get("adapter_id")
     age_s = None
-    if last_ts:
-        try:
-            when = datetime.strptime(last_ts, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
-                tzinfo=timezone.utc)
-            age_s = (_now() - when).total_seconds()
-        except ValueError:
-            age_s = None
+    try:
+        when = datetime.strptime(last_ts, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+            tzinfo=timezone.utc)
+        age_s = (_now() - when).total_seconds()
+    except ValueError:
+        age_s = None
     if age_s is None:
-        summary = f"{newest.name}: no timestamped record in the last {len(recs)} lines"
+        summary = f"{newest.name}: newest record has an unparseable ts"
     else:
         summary = f"last event {human_age(age_s)} ago ({last_agent}) in {newest.name}"
 
     problems = []
-    if bad:
+    if newest_bad:
         problems.append(
-            f"{bad} unparseable line(s) in the last {SAMPLE_LINES} lines of "
+            f"{newest_bad} unparseable line(s) in the last {TAIL_RECORDS} lines of "
             f"{newest.name} — a crash mid-write or a redactor that consumed a "
             "JSON escape leaves one; everything before it is still readable")
     if age_s is not None and age_s > STALE_CAPTURE_H * 3600:
@@ -355,11 +381,14 @@ def _index_check(db_path: Path | None, files: list[Path]) -> Check:
     conn.close()
 
     pending = 0
+    from core.storage.discovery import resolved_path
+
     for path in files:
-        # The indexer keys `ingest_files.path` by str(path), not by inode or
-        # realpath — matching that exactly is what makes "behind" mean
-        # "newer than its indexed offset" instead of "unknown".
-        entry = indexed.get(str(path))
+        # Same key function as the indexer (resolved path). Matching it exactly
+        # is what makes "behind" mean "newer than its indexed offset" instead of
+        # "unknown" — a spelling difference reported a fully indexed file as
+        # unindexed.
+        entry = indexed.get(resolved_path(path))
         if entry is None:
             pending += 1
             continue

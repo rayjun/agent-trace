@@ -55,6 +55,20 @@ def default_trace_dirs(home: Path | None = None) -> list[Path]:
     return out
 
 
+def resolved_path(path: str | Path) -> str:
+    """The one spelling of a path used as an index key.
+
+    Symlinked roots are normal (`/var` -> `/private/var` on macOS, `~/.pi` or a
+    trace dir pointing into a dotfiles repo), and the same file reached by two
+    spellings is the same file. Everything that stores or compares
+    `ingest_files.path` must agree on this, or a live file looks deleted.
+    """
+    try:
+        return str(Path(path).resolve())
+    except OSError:      # so broken it cannot be resolved: compare/store it raw
+        return str(path)
+
+
 def iter_trace_files(dirs: list[Path]) -> Iterator[Path]:
     """Every *.jsonl under the given dirs, stable order.
 

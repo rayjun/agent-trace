@@ -104,6 +104,12 @@ CREATE INDEX IF NOT EXISTS idx_spans_span ON spans(span_id);
 CREATE INDEX IF NOT EXISTS idx_spans_trace ON spans(trace_id, start_ts);
 CREATE INDEX IF NOT EXISTS idx_spans_session ON spans(session_id);
 CREATE INDEX IF NOT EXISTS idx_spans_parent ON spans(parent_span_id);
+-- Root detection asks "which traces have children" on every projection
+-- refresh (a timer-driven path). Covering the answer with
+-- (parent_span_id, trace_id) makes it an index-only scan: reading trace_id
+-- from the table instead dragged in each row's child bodies, 400ms of
+-- payload pages per refresh on a 3GB index.
+CREATE INDEX IF NOT EXISTS idx_spans_parent_trace ON spans(parent_span_id, trace_id);
 
 CREATE TABLE IF NOT EXISTS sessions (
   session_id TEXT NOT NULL,
@@ -203,6 +209,12 @@ CREATE INDEX IF NOT EXISTS idx_spans_span ON spans(span_id);
 CREATE INDEX IF NOT EXISTS idx_spans_trace_id ON spans(trace_id, start_ts);
 CREATE INDEX IF NOT EXISTS idx_spans_session ON spans(session_id);
 CREATE INDEX IF NOT EXISTS idx_spans_parent ON spans(parent_span_id);
+-- Root detection asks "which traces have children" on every projection
+-- refresh (a timer-driven path). Covering the answer with
+-- (parent_span_id, trace_id) makes it an index-only scan: reading trace_id
+-- from the table instead dragged in each row's child bodies, 400ms of
+-- payload pages per refresh on a 3GB index.
+CREATE INDEX IF NOT EXISTS idx_spans_parent_trace ON spans(parent_span_id, trace_id);
 """
 
 
@@ -647,18 +659,36 @@ class TraceStore:
             conn.commit()
 
     def _refresh_sessions(self, conn: sqlite3.Connection) -> None:
-        """Sessions from events; `ended` when a session_end event exists."""
+        """Sessions from events; `ended` when a session_end event exists.
+
+        Two statements rather than one, because the session_end test has to read
+        the payload (`json_extract`) and the bounds do not:
+
+        * bounds aggregate only small columns, so a scan never touches the
+          payload overflow pages — that alone was 7.6s of the 8.7s a refresh
+          cost on a 19k-event database;
+        * `ended` reads payloads, so it is restricted to `type = 'event'` rows,
+          the only ones that can be a session_end. 4.2s -> 10ms.
+
+        Wrapping the json_extract in a CASE was not enough: SQLite still read
+        every payload page to evaluate the surrounding row.
+        """
         conn.execute(
             "INSERT INTO sessions (session_id, adapter_id, first_ts, last_ts, ended)"
-            " SELECT session_id, adapter_id, MIN(ts), MAX(ts),"
-            "        MAX(CASE WHEN json_extract(payload, '$.event.name')"
-            "                  = 'session_end' THEN 1 ELSE 0 END)"
+            " SELECT session_id, adapter_id, MIN(ts), MAX(ts), 0"
             " FROM events WHERE session_id IS NOT NULL"
             " GROUP BY session_id, adapter_id"
             " ON CONFLICT(session_id, adapter_id) DO UPDATE SET"
             "   first_ts=MIN(first_ts, excluded.first_ts),"
-            "   last_ts=MAX(last_ts, excluded.last_ts),"
-            "   ended=MAX(ended, excluded.ended)")
+            "   last_ts=MAX(last_ts, excluded.last_ts)")
+        # Monotonic, like the MAX(... excluded.ended) it replaces: `ended` only
+        # ever flips to 1 here, and a truncation that removes the session_end
+        # goes through rebuild_projections(), which starts the table empty.
+        conn.execute(
+            "UPDATE sessions SET ended = 1 WHERE EXISTS ("
+            "  SELECT 1 FROM events e"
+            "  WHERE e.type = 'event' AND e.session_id = sessions.session_id"
+            "    AND json_extract(e.payload, '$.event.name') = 'session_end')")
         # model/cwd: first known per session, from llm/tool span projections
         conn.execute(
             "UPDATE sessions SET model = ("
@@ -735,6 +765,56 @@ class TraceStore:
                 (path, size, mtime, inode, indexed_bytes, corrupt_lines,
                  last_error, now_iso()))
             conn.commit()
+
+    def indexed_files(self) -> list[str]:
+        """Every source file the projection currently claims to have read."""
+        return [r[0] for r in self.query(
+            "SELECT path FROM ingest_files ORDER BY path")]
+
+    def rekey_file(self, old: str, new: str) -> None:
+        """Move a file's rows onto the canonical spelling of its path.
+
+        Index keys used to be whatever the caller spelled, so a database built
+        through a symlinked dir holds `~/.pi/...` while a scan resolves to
+        `/Users/.../...`. Left alone, that one file is re-read in full on every
+        start and reported as permanently "behind". Merging (not duplicating)
+        keeps one row per file.
+        """
+        with self._write_lock:
+            conn = self._conn()
+            if conn.execute("SELECT 1 FROM ingest_files WHERE path = ?",
+                            (new,)).fetchone() is None:
+                conn.execute("UPDATE ingest_files SET path = ? WHERE path = ?",
+                             (new, old))
+            else:
+                # Both spellings are indexed; the canonical row wins and the
+                # old one goes, so the file stops being counted twice.
+                conn.execute("DELETE FROM ingest_files WHERE path = ?", (old,))
+            conn.execute("UPDATE events SET source_file = ? WHERE source_file = ?",
+                         (new, old))
+            conn.commit()
+
+    def drop_files(self, paths: list[str]) -> int:
+        """Forget source files that no longer exist, and their rows with them.
+
+        Same shape as invalidate_file but batched, so deleting N files costs one
+        projection rebuild instead of N. Every surviving file is rewound for the
+        reason invalidate_file documents (an event deduped away from this file
+        lives on in another, whose offset is already past it).
+        """
+        if not paths:
+            return 0
+        dropped = 0
+        with self._write_lock:
+            conn = self._conn()
+            for path in paths:
+                cur = conn.execute("DELETE FROM events WHERE source_file = ?", (path,))
+                dropped += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                conn.execute("DELETE FROM ingest_files WHERE path = ?", (path,))
+            conn.execute("UPDATE ingest_files SET indexed_bytes = 0")
+            conn.commit()
+        self.rebuild_projections()
+        return dropped
 
     def invalidate_file(self, path: str) -> None:
         """A file shrank (rotation/truncation): drop what came from it.

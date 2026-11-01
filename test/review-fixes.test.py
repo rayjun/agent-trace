@@ -624,6 +624,13 @@ import threading  # noqa: E402
 import urllib.error  # noqa: E402
 import urllib.request  # noqa: E402
 
+#: The suite talks to a server on 127.0.0.1, and `urllib` sends that through
+#: `http_proxy` when the shell exports one — so the assertions were comparing
+#: against the proxy's answer (404/502) instead of the server's: a green suite
+#: on a clean shell, red on a laptop running a VPN client. Loopback is never
+#: proxied here, which is also what the product does (llm_judge._opener).
+_NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 srv_td = Path(tempfile.mkdtemp())
 (srv_td / "x.jsonl").write_text(json.dumps(v1("note", 0, note="n")) + "\n",
                                 encoding="utf-8")
@@ -638,7 +645,7 @@ def hit(path: str, host: str) -> int:
     r = urllib.request.Request(f"http://127.0.0.1:{port}{path}",
                                headers={"Host": host})
     try:
-        with urllib.request.urlopen(r, timeout=5) as resp:
+        with _NO_PROXY.open(r, timeout=5) as resp:
             return resp.status
     except urllib.error.HTTPError as e:
         return e.code
