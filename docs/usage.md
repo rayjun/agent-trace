@@ -67,7 +67,36 @@ agenttrace watch --history 200      # preload 200 records
 agenttrace watch --no-follow        # print current contents and exit
 ```
 
-Keys: `e` expand folded fields · `/` filter · `PgUp`/`PgDn` scroll · `q` quit.
+Keys: `m` metrics · `e` expand folded fields · `/` filter · `PgUp`/`PgDn` scroll · `q` quit.
+
+A performance row is always visible above the token row — latency (p50, and p95
+once five calls have been measured), output throughput, session cost, tool
+latency, and the share of turn time actually spent working. `m` opens the full
+breakdown:
+
+```
+ PERFORMANCE
+  calls 12 · p50 3.6s · p95 7.2s · max 21.4s
+  latency ▁▂▃▅▇▅▃▂ newest right
+  throughput 62 tok/s median · max 140
+ TOOLS
+  18 calls · p50 240ms · p95 1.4s · max 6.2s · slowest bash 6.2s
+ TURNS
+  #1 ████████████████░░░░  67% work 1.4s · wall 2.1s · outside 700ms · calls 2 · tools 3
+  ▸#2 ████████████████████ 100% work 900ms · wall 900ms · outside 0ms · calls 1 · tools 0
+ TOKENS & COST
+  in 48.2k · out 1.2k · cache 92.4% ████████
+  cost $0.42
+ INGEST
+  index 32,925 events · 15,404 spans · 215 sessions
+  4.4 GiB · 0 file(s) behind · newest event 2s ago
+```
+
+`▸` marks the turn still running. A third of a second outside the work is the
+human reading the diff, not the agent thinking — the two are never added
+together into one "duration". Figures are omitted rather than guessed: a p95
+needs five samples, and a model with no configured price shows `unknown` instead
+of `$0`.
 
 In a split terminal:
 

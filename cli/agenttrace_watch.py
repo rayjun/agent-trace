@@ -12,6 +12,7 @@ terminal without a ncurses terminfo dependency.
 
 Keys:
     q / Ctrl-C   quit
+    m             metrics: latency, throughput, turns, tokens, ingest health
     e             expand/collapse the focused long field
     f             toggle follow (pause = stop auto-scroll)
     PgUp/PgDn     scroll history
@@ -27,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import sys
 import time
@@ -35,9 +37,14 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "common"))
 from agenttrace import default_trace_dirs, iter_records  # noqa: E402,F401
-from agenttrace_common import AGENTS  # noqa: E402
+from agenttrace_common import AGENTS, platform_dir  # noqa: E402
 
 from panel.formatter import Formatter, _args_preview  # noqa: E402,F401
+from panel.metrics import (  # noqa: E402,F401
+    Accumulator, Health, Metrics, collect as collect_metrics,
+    health as index_health, render_line as metrics_line,
+    render_overlay as metrics_overlay,
+)
 from panel.scoring import grade_for, score_prompt  # noqa: E402,F401
 from panel.stats import session_stats  # noqa: E402,F401
 from panel.tailer import Tailer, latest_session, load_history  # noqa: E402,F401
@@ -198,6 +205,20 @@ def watch(args) -> int:
             search_cache[key] = hay
         return filter_text in hay
 
+    # Metrics are folded incrementally: an arriving record costs one record's
+    # work, not a re-walk of the window (55ms at 10k records, i.e. two cores at
+    # this repaint rate). A window that MOVES (trim at the front, scope or
+    # filter switch) restarts the fold, which is what the accumulator's
+    # head-identity check detects.
+    metrics_acc = Accumulator()
+    # Trim in blocks, not on every record: dropping one line at a time changed
+    # the window's head on every append, which forced a full re-fold each time.
+    trim_slack = max(200, max_lines // 4)
+    show_metrics = bool(getattr(args, "metrics", False))
+    db_path = (Path(os.environ.get("AGENTTRACE_DB"))
+               if os.environ.get("AGENTTRACE_DB")
+               else platform_dir() / "agenttrace.db")
+
     with Screen() as scr:
         last_frame: str | None = None
         last_size = (0, 0)
@@ -237,11 +258,12 @@ def watch(args) -> int:
                         scope, scope_last = sid, ts
                         scroll = 0
                 recs.append(rec)
-            if len(recs) > max_lines:
+            if len(recs) > max_lines + trim_slack:
                 recs = recs[-max_lines:]
 
             scr.resize()
-            visible = scr.height - 3   # header + stats row + footer
+            # header + performance row + stats row + footer
+            visible = scr.height - 4
             # Render at the real panel width so wrapping matches the terminal.
             fmt.width = max(40, scr.width - 1)
             # Scope filtering lives HERE (render time), not in the buffer:
@@ -266,8 +288,10 @@ def watch(args) -> int:
                 flags.append("expanded")
             flags.append("following" if not scroll else f"scroll -{scroll}")
             head += " · ".join(flags) + C_RESET
-            foot = (f" {C_DIM}{C_BOLD}q{C_DIM} quit · {C_BOLD}e{C_DIM} expand · "
-                    f"{C_BOLD}PgUp/PgDn{C_DIM} scroll · {C_BOLD}/{C_DIM} filter{C_RESET}")
+            foot = (f" {C_DIM}{C_BOLD}q{C_DIM} quit · {C_BOLD}m{C_DIM} "
+                    + ("stream" if show_metrics else "metrics")
+                    + f" · {C_BOLD}e{C_DIM} expand · {C_BOLD}PgUp/PgDn{C_DIM} scroll"
+                    f" · {C_BOLD}/{C_DIM} filter{C_RESET}")
 
             # Body is padded to the full height so the footer always sits on the
             # bottom row: without it the help line floats up as content arrives,
@@ -276,8 +300,23 @@ def watch(args) -> int:
             # average for the session currently on screen — recomputed from
             # `shown` each frame, so it follows every scope/filter switch.
             stats = session_stats(shown, fmt.width) or f"  {C_DIM}Σ —{C_RESET}"
-            rows = [head] + list(view)
-            rows += [""] * max(0, visible - len(view))
+            # Performance row: always on, because the question this panel is
+            # opened to answer ("is it slow? is it spending? is it keeping up?")
+            # should not need a second keypress. `m` opens the full breakdown.
+            # The window's composition is part of the accumulator key:
+            # widening the filter inserts records in the MIDDLE, which head
+            # identity cannot see.
+            m = metrics_acc.fold(shown, window_key=(scope, filter_text))
+            perf = metrics_line(m, fmt.width)
+            if show_metrics:
+                # Only while open: an idle stream view must not query SQLite.
+                body = metrics_overlay(m, index_health(db_path), fmt.width, visible)
+            else:
+                body = list(view)
+            rows = [head] + body
+            rows += [""] * max(0, visible - len(body))
+            if perf:
+                rows.append(perf)
             rows.append(stats)
             rows.append(foot)
 
@@ -308,12 +347,16 @@ def watch(args) -> int:
                 break
             if key == "e":
                 fmt.expand = not fmt.expand      # next frame re-renders from recs
+            elif key == "m":
+                show_metrics = not show_metrics
+            elif show_metrics and key in ("PGDN", "DOWN", "PGUP", "UP"):
+                continue        # the overlay is not scrollable; keep the view put
             elif key in ("PGUP", "UP"):
                 scroll += max(1, visible - 2)
             elif key in ("PGDN", "DOWN"):
                 scroll = max(0, scroll - max(1, visible - 2))
             elif key == "/":
-                scr.out.write("\x1b[2J\x1b[H" + C_BOLD + "filter: " + C_RESET)
+                scr.out.write("\x1b[H\x1b[J" + C_BOLD + "filter: " + C_RESET)
                 scr.out.flush()
                 if scr.tty_in and _HAVE_TERMIOS:
                     termios, _ = _termios()

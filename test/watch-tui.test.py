@@ -267,7 +267,43 @@ def run(timeout=6.0):
     assert "zebra-unique-token" in text, "filter removed the matching record"
     assert "17*23" not in text, f"filter failed to hide non-matching record; got:\n{text[-2000:]}"
 
-    # 6. 'q' must quit cleanly and restore the terminal.
+    # 6. 'm' opens the metrics view: latency, throughput, turns, tokens, ingest.
+    #    An empty filter line restores the unfiltered session first.
+    os.write(primary, b"/\n")
+    drain(0.6)
+    mark = len(buf)
+    os.write(primary, b"m")
+    drain(1.0)
+    text = ANSI.sub("", buf[mark:].decode("utf-8", "replace"))
+    for heading in ("PERFORMANCE", "TURNS", "TOKENS & COST"):
+        assert heading in text, \
+            f"metrics view missing {heading}; got:\n{text[-3000:]}"
+    # The always-on performance row keeps rendering above the stats row, so the
+    # numbers stay visible whether the overlay is open or not.
+    assert "lat" in text and "tok/s" in text, \
+        f"performance row missing from the metrics view; got:\n{text[-2000:]}"
+    # The footer advertises the way back, not the way in, while the view is open.
+    assert "m stream" in text, \
+        f"footer does not offer the way back to the stream; got:\n{text[-1200:]}"
+    # A short terminal keeps the headline and drops the tail of the overlay
+    # rather than wrapping past the footer.
+    assert "work" in text and "wall" in text, \
+        f"turn timing (work/wall) missing; got:\n{text[-2000:]}"
+
+    # 6b. 'm' again returns to the stream: the conversation, not the overlay.
+    mark = len(buf)
+    os.write(primary, b"m")
+    drain(1.0)
+    text = ANSI.sub("", buf[mark:].decode("utf-8", "replace"))
+    assert "PERFORMANCE" not in text, "second 'm' did not close the metrics view"
+    assert "m metrics" in text, \
+        f"footer does not offer the metrics view again; got:\n{text[-1200:]}"
+    # The stream scrolls to the newest records, so assert a rendered RECORD is
+    # back — not a specific earlier one that may have scrolled off.
+    assert "llm_request" in text or "tool_" in text, \
+        f"stream did not come back after closing metrics; got:\n{text[-2000:]}"
+
+    # 7. 'q' must quit cleanly and restore the terminal.
     os.write(primary, b"q")
     deadline = time.time() + 3
     while time.time() < deadline and proc.poll() is None:
@@ -278,7 +314,7 @@ def run(timeout=6.0):
     f.close()
 
     shutil.rmtree(tmp, ignore_errors=True)
-    print("PASS — pty harness: live render, multi-agent, filter, expand, clean quit")
+    print("PASS — pty harness: live render, multi-agent, filter, expand, metrics, clean quit")
 
 
 if __name__ == "__main__":
