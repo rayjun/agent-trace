@@ -397,6 +397,58 @@ for width in (32, 40, 60, 120):
           all(len(strip_ansi(r)) <= width for r in rows),
           str([len(strip_ansi(r)) for r in rows if len(strip_ansi(r)) > width]))
 
+# ---------------------------------------------------------------------------
+section("turn identity: adapters REUSE turn_id inside one session")
+# ---------------------------------------------------------------------------
+
+# A real pi session (550 records) contains several runs; each run restarts its
+# turn counter, so "0" appears more than once. Grouping by the key merged them
+# into 95 overlapping turns and reported a 45,710s wall for a 3,257s session.
+def turn_rec(turn_id, ts_off: float, tokens: int = 100) -> dict:
+    return {"v": 1, "ts": iso(ts_off), "agent": "pi", "event": "llm_response",
+            "session_id": "s", "turn_id": turn_id, "model": "claude-sonnet-4",
+            "duration_ms": 1000,
+            "response": {"usage": {"input_tokens": tokens, "output_tokens": 10}}}
+
+
+reused = [turn_rec("0", 0), turn_rec("1", 2),
+          turn_rec("0", 100), turn_rec("1", 102)]          # second run reuses 0,1
+m_reuse = collect(reused)
+check("a reused turn_id starts a NEW turn instead of merging",
+      len(m_reuse.turns) == 4, str([t.index for t in m_reuse.turns]))
+check("...so no turn spans the whole session",
+      all(t.wall_ms == 0 for t in m_reuse.turns),
+      str([t.wall_ms for t in m_reuse.turns]))
+check("...and the session envelope is the real span, not a sum of overlaps",
+      m_reuse.total_wall_ms == 102_000, str(m_reuse.total_wall_ms))
+check("...with work share near 1 rather than a fraction",
+      m_reuse.work_share == min(1.0, 4000 / 102_000) or m_reuse.work_share <= 1.0,
+      str(m_reuse.work_share))
+check("all four calls are still counted", m_reuse.calls == 4, str(m_reuse.calls))
+
+# Untagged records (session_end, notes) belong to the open turn, not a pseudo-turn.
+untagged = [turn_rec("0", 0), turn_rec("0", 2),
+            {"v": 1, "ts": iso(3), "agent": "pi", "event": "session_end",
+             "session_id": "s", "note": "done"}]
+m_untagged = collect(untagged)
+check("a record with no turn_id does not create a pseudo-turn",
+      len(m_untagged.turns) == 1, str([(t.index, t.key) for t in m_untagged.turns]))
+check("...it extends the turn that was open",
+      m_untagged.turns[0].last_ts == iso(3), str(m_untagged.turns[0].last_ts))
+
+# Overlapping windows are excluded from the work total (structural, D25).
+# Sequential cutting makes turns non-overlapping UNLESS a turn's records are
+# written in one burst with timestamps that bracket a turn written earlier —
+# which is what an async adapter does. Constructed that way on purpose.
+overlapping = [turn_rec("a", 0), turn_rec("a", 10), turn_rec("b", 5)]
+m_over = collect(overlapping)
+check("a turn whose window contains another turn's start is marked interrupted",
+      any(t.interrupted for t in m_over.turns),
+      str([(t.index, t.interrupted) for t in m_over.turns]))
+check("...and its wall clock is excluded from the work total",
+      m_over.total_work_ms < sum(t.work_ms for t in m_over.turns),
+      f"{m_over.total_work_ms} vs {sum(t.work_ms for t in m_over.turns)}")
+
 print()
 if FAILS:
     print(f"FAILED — {FAILS} check(s)")

@@ -157,6 +157,8 @@ class Turn:
     """One conversation turn, measured the way `agenttrace session` measures it."""
 
     index: int
+    #: the `turn_id` this block was cut on (None for a block of untagged records)
+    key: object = None
     first_ts: str | None = None
     last_ts: str | None = None
     wall_ms: float | None = None
@@ -166,6 +168,10 @@ class Turn:
     errors: int = 0
     models: list[str] = field(default_factory=list)
     open: bool = False
+    #: another turn starts inside this one's window. Structural, not a
+    #: threshold — the same test `agenttrace session` uses (D25) — and it means
+    #: this turn's wall clock is partly a gap, so it is excluded from the totals.
+    interrupted: bool = False
 
     @property
     def outside_ms(self) -> float:
@@ -200,6 +206,8 @@ class Metrics:
     turns: list[Turn] = field(default_factory=list)
     #: newest record timestamp, kept as a STRING (lexicographic == chronological)
     newest_ts: str | None = None
+    #: first record to last: the session's window (see _finish)
+    span_ms: float | None = None
 
     @property
     def newest_ts_ms(self) -> float | None:
@@ -243,13 +251,23 @@ class Metrics:
         return " ".join(sane(slow[0]).split())
 
     @property
+    def trusted_turns(self) -> list[Turn]:
+        """Turns whose wall clock is not partly a gap (see Turn.interrupted)."""
+        return [t for t in self.turns if not t.interrupted]
+
+    @property
     def total_work_ms(self) -> float:
-        return sum(t.work_ms for t in self.turns)
+        """Measured work. A floor, not an estimate: only measured spans count."""
+        return sum(t.work_ms for t in self.trusted_turns)
 
     @property
     def total_wall_ms(self) -> float:
-        walls = [t.wall_ms for t in self.turns if t.wall_ms]
-        return sum(walls) if walls else 0.0
+        """The session's own envelope, first record to last.
+
+        NOT the sum of per-turn spans: they can overlap, and summing them
+        reported a 14x longer wall than the session itself.
+        """
+        return self.span_ms or 0.0
 
     @property
     def outside_ms(self) -> float:
@@ -257,7 +275,7 @@ class Metrics:
 
     @property
     def work_share(self) -> float | None:
-        """Share of the measured window spent working, capped at 1.
+        """Share of the session window spent working, capped at 1.
 
         Reported durations can add up to more than the timestamps span (clock
         rounding, a resumed clock). The cap keeps the bar honest; the caller
@@ -287,25 +305,32 @@ class Metrics:
         return text
 
 
-def _fold(m: Metrics, turns: dict[str, Turn], order: list[str],
-          rec: dict[str, Any]) -> None:
+def _fold(m: Metrics, turns: list[Turn], rec: dict[str, Any]) -> None:
     """Fold ONE record into the metrics. The only place a record is interpreted.
 
     Timestamps stay STRINGS here: the format is fixed and lexicographic order is
     chronological order, so the per-turn wall clock needs two conversions per
     turn rather than one per record.
+
+    Turns are cut SEQUENTIALLY, from the record stream, not by grouping on
+    `turn_id`. Adapters restart their turn counter (a new run, a compaction, a
+    resumed process), so one session legitimately contains several turns called
+    "0". Grouping by key merged them: on a real 550-record session it produced 95
+    turns whose windows overlapped 1,462 ways, a "wall" of 45,710s against a
+    session span of 3,257s, and a work share of 7% where the truth was 99%.
     """
     m.events += 1
     ts = rec.get("ts")
     if isinstance(ts, str) and (m.newest_ts is None or ts > m.newest_ts):
         m.newest_ts = ts
 
-    key = str(rec.get("turn_id") or rec.get("request_id") or "turn-1")
-    turn = turns.get(key)
-    if turn is None:
-        turn = Turn(index=len(order) + 1)
-        turns[key] = turn
-        order.append(key)
+    key = rec.get("turn_id")
+    turn = turns[-1] if turns else None
+    # A record with no turn_id is not a turn of its own: session-level notes and
+    # the closing session_end belong to whatever turn was open.
+    if turn is None or (key is not None and key != turn.key):
+        turn = Turn(index=len(turns) + 1, key=key)
+        turns.append(turn)
     if isinstance(ts, str):
         if turn.first_ts is None or ts < turn.first_ts:
             turn.first_ts = ts
@@ -363,7 +388,7 @@ def _fold(m: Metrics, turns: dict[str, Turn], order: list[str],
         turn.errors += 1
 
 
-def _finish(m: Metrics, turns: dict[str, Turn], order: list[str]) -> Metrics:
+def _finish(m: Metrics, turns: list[Turn]) -> Metrics:
     """Derive the per-turn wall clock and the open marker. O(turns), not O(events).
 
     Rebuilt on every call so the result is a pure function of the folded
@@ -371,31 +396,45 @@ def _finish(m: Metrics, turns: dict[str, Turn], order: list[str]) -> Metrics:
     without the counters drifting.
     """
     m.turns = []
-    for key in order:
-        turn = turns[key]
+    for turn in turns:
         turn.wall_ms = None
         if turn.first_ts and turn.last_ts:
             start, end = _ts_ms(turn.first_ts), _ts_ms(turn.last_ts)
             if start is not None and end is not None and end >= start:
                 turn.wall_ms = end - start
         turn.open = False
+        turn.interrupted = False
         m.turns.append(turn)
     if m.turns:
         # The last turn is still running: its wall clock grows as you watch,
-        # and presenting it as a finished measurement makes "outside"
-        # meaningless.
+        # and presenting it as a finished measurement makes "outside" meaningless.
         m.turns[-1].open = True
+    starts = [t.first_ts for t in turns if t.first_ts]
+    for turn in turns:
+        begin, finish = turn.first_ts, turn.last_ts
+        if begin and finish:
+            turn.interrupted = any(begin < other < finish for other in starts)
+
+    # One envelope for the session, not the SUM of per-turn spans: spans can
+    # overlap (a resumed run, a late record), and summing them double-counts the
+    # overlap — it read 45,710s against a 3,257s session on real data.
+    firsts = [t.first_ts for t in turns if t.first_ts]
+    lasts = [t.last_ts for t in turns if t.last_ts]
+    m.span_ms = None
+    if firsts and lasts:
+        a, b = _ts_ms(min(firsts)), _ts_ms(max(lasts))
+        if a is not None and b is not None and b >= a:
+            m.span_ms = b - a
     return m
 
 
 def collect(recs: Iterable[dict[str, Any]]) -> Metrics:
     """Metrics for a whole window, from scratch."""
     m = Metrics()
-    turns: dict[str, Turn] = {}
-    order: list[str] = []
+    turns: list[Turn] = []
     for rec in recs:
-        _fold(m, turns, order, rec)
-    return _finish(m, turns, order)
+        _fold(m, turns, rec)
+    return _finish(m, turns)
 
 
 class Accumulator:
@@ -417,8 +456,7 @@ class Accumulator:
 
     def __init__(self) -> None:
         self._m = Metrics()
-        self._turns: dict[str, Turn] = {}
-        self._order: list[str] = []
+        self._turns: list[Turn] = []
         self._head: dict[str, Any] | None = None
         self._key: object = None
         self._n = 0
@@ -426,8 +464,7 @@ class Accumulator:
 
     def _reset(self) -> None:
         self._m = Metrics()
-        self._turns = {}
-        self._order = []
+        self._turns = []
         self._n = 0
         self.rebuilds += 1
 
@@ -450,16 +487,16 @@ class Accumulator:
                 self._reset()
                 self._head = None
                 self._key = None
-            return copy.copy(_finish(self._m, self._turns, self._order))
+            return copy.copy(_finish(self._m, self._turns))
         if (self._head is None or self._key != window_key
                 or recs[0] is not self._head or len(recs) < self._n):
             self._reset()
         self._head = recs[0]
         self._key = window_key
         for rec in recs[self._n:]:
-            _fold(self._m, self._turns, self._order, rec)
+            _fold(self._m, self._turns, rec)
         self._n = len(recs)
-        return copy.copy(_finish(self._m, self._turns, self._order))
+        return copy.copy(_finish(self._m, self._turns))
 
 
 # --------------------------------------------------------------------------

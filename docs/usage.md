@@ -92,6 +92,12 @@ breakdown:
   4.4 GiB · 0 file(s) behind · newest event 2s ago
 ```
 
+A turn here is a *contiguous block of the record stream*, not a `turn_id`:
+adapters restart their turn counter when the agent restarts, so one session
+legitimately contains several turns called `0`. `wall` is the session's own
+envelope (first record to last), never the sum of per-turn spans, which
+double-counts an overlap.
+
 `▸` marks the turn still running. A third of a second outside the work is the
 human reading the diff, not the agent thinking — the two are never added
 together into one "duration". Figures are omitted rather than guessed: a p95
