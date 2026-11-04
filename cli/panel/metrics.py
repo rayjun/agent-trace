@@ -326,11 +326,18 @@ def _fold(m: Metrics, turns: list[Turn], rec: dict[str, Any]) -> None:
 
     key = rec.get("turn_id")
     turn = turns[-1] if turns else None
-    # A record with no turn_id is not a turn of its own: session-level notes and
-    # the closing session_end belong to whatever turn was open.
     if turn is None or (key is not None and key != turn.key):
-        turn = Turn(index=len(turns) + 1, key=key)
-        turns.append(turn)
+        # A leading block of untagged records (session_start, an early note) is
+        # ADOPTED by the first tagged turn rather than shown as a zero-length
+        # turn of its own: one E2E session rendered as "#1 — work 0ms" followed
+        # by the real turn, which reads as a bug in the agent.
+        idle = (turn is not None and turn.key is None and not turn.calls
+                and not turn.tools and not turn.work_ms)
+        if idle and key is not None:
+            turn.key = key
+        else:
+            turn = Turn(index=len(turns) + 1, key=key)
+            turns.append(turn)
     if isinstance(ts, str):
         if turn.first_ts is None or ts < turn.first_ts:
             turn.first_ts = ts
@@ -586,6 +593,14 @@ def _pct_bar(pct: float, cells: int = 8) -> str:
     return _bar(pct, cells)
 
 
+def _wrap(text: str, width: int, *, indent: str = "", colour: str = "") -> list[str]:
+    """Wrap prose to the terminal, so an explanation is never cut mid-word."""
+    import textwrap
+    body_w = max(12, width - len(indent))
+    lines = textwrap.wrap(text, body_w) or [text]
+    return [f"{indent}{colour}{ln}{C_RESET}" for ln in lines]
+
+
 def _label(text: str, width: int) -> str:
     line = f" {C_BOLD}{text}{C_RESET}"
     return clip_plain(line, width)
@@ -647,35 +662,48 @@ def render_line(m: Metrics, width: int) -> str | None:
 
 
 def _turn_rows(m: Metrics, width: int, limit: int) -> list[str]:
+    """One row per turn, fitted by dropping whole segments.
+
+    `clip_plain` cuts at the terminal edge, which is how a live pane showed
+    "· calls 0 · t" — a label with no number. The bar shrinks first, then the
+    trailing counters drop, and `work`/`wall` (the reason the row exists) are the
+    last thing to go.
+    """
     rows: list[str] = []
-    turns = m.turns[-limit:]
-    if not turns:
-        return [f"  {C_DIM}no turns yet{C_RESET}"]
-    span = max(6, min(28, width - 46))
-    for turn in turns:
+    # A turn with no measured activity and no duration is an artifact of the
+    # record stream, not something a reader can act on.
+    shown = [t for t in m.turns if t.calls or t.tools or t.work_ms or t.wall_ms]
+    if not shown:
+        shown = m.turns[-limit:] if m.turns else []
+    for turn in shown[-limit:]:
         share = turn.work_share
-        if share is None:
-            bar = "·" * span
-            pct = "  —"
-        else:
-            filled = int(round(share * span))
-            bar = "█" * filled + "░" * (span - filled)
-            pct = f"{share * 100:3.0f}%"
+        pct = "  —" if share is None else f"{share * 100:3.0f}%"
         open_mark = f"{C_MAGENTA}▸{C_RESET}" if turn.open else " "
+        over = turn.wall_ms is not None and turn.work_ms > turn.wall_ms + 50
+        wall_txt = ("≥" if over else "") + human_ms(turn.wall_ms)
         badge = f" {C_RED}{turn.errors}✗{C_RESET}" if turn.errors else ""
-        # Reported durations can exceed the span their timestamps cover (a
-        # provider's duration_ms vs a clock that rounded, or a resumed clock).
-        # The share is capped, but a silent cap would present an impossible
-        # measurement as a clean 100%.
-        skew = (f" {C_YELLOW}⚠{C_RESET}"
-                if turn.wall_ms is not None and turn.work_ms > turn.wall_ms + 50
-                else "")
-        rows.append(
-            f" {open_mark}{C_BOLD}#{turn.index}{C_RESET} {bar} {pct}"
-            f" {C_DIM}work {human_ms(turn.work_ms)}"
-            f" · wall {human_ms(turn.wall_ms)}{skew}"
-            f"{C_DIM} · outside {human_ms(turn.outside_ms)}{C_RESET}"
-            f"{C_DIM} · calls {turn.calls} · tools {turn.tools}{C_RESET}{badge}")
+        lead = f" {open_mark}{C_BOLD}#{turn.index}{C_RESET}"
+        parts = [
+            f" {C_DIM}work {human_ms(turn.work_ms)} · wall "
+            f"{wall_txt}{C_RESET}",
+            f"{C_DIM} · outside {human_ms(turn.outside_ms)}{C_RESET}",
+            f"{C_DIM} · calls {turn.calls}{C_RESET}",
+            f"{C_DIM} · tools {turn.tools}{C_RESET}",
+        ]
+        line = ""
+        for span in (28, 22, 16, 12, 8, 5):
+            if share is None:
+                bar = "·" * span
+            else:
+                filled = int(round(share * span))
+                bar = "█" * filled + "░" * (span - filled)
+            line = f"{lead} {bar} {pct}{parts[0]}"
+            for part in parts[1:]:
+                if vlen(strip_ansi(line + part + badge)) <= width:
+                    line += part
+            if vlen(strip_ansi(line + badge)) <= width:
+                break
+        rows.append(clip_plain(line + badge, width))
     return rows
 
 
@@ -740,10 +768,12 @@ def render_overlay(m: Metrics, health_: Health | None, width: int,
 
     turn_rows = _turn_rows(m, w, 8)
     turns: list[str] = ["", _label("TURNS", w)] + turn_rows
-    if any(t.wall_ms is not None and t.work_ms > t.wall_ms + 50 for t in m.turns):
-        turns.append(f"  {C_YELLOW}⚠{C_RESET}{C_DIM} work exceeds wall: the reported "
-                     f"durations cover more time than the records' timestamps "
-                     f"(clock rounding, or a resumed clock){C_RESET}")
+    if m.work_exceeds_wall:
+        turns.extend(_wrap(
+            "⚠ measured work exceeds the session span: durations were reported for "
+            "time the records' timestamps do not cover (clock rounding, or a "
+            "resumed clock). The turn spans above are lower bounds.",
+            w, indent="  ", colour=C_YELLOW))
     if m.turns:
         share = m.work_share
         turns.append(f"  {C_DIM}work {C_BOLD}{human_ms(m.total_work_ms)}{C_RESET}"

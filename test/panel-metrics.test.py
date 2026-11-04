@@ -449,6 +449,51 @@ check("...and its wall clock is excluded from the work total",
       m_over.total_work_ms < sum(t.work_ms for t in m_over.turns),
       f"{m_over.total_work_ms} vs {sum(t.work_ms for t in m_over.turns)}")
 
+# ---------------------------------------------------------------------------
+section("what a live pane caught that the pty harness did not")
+# ---------------------------------------------------------------------------
+
+# 1. A leading untagged record (session_start) used to render as "#1 — work 0ms"
+#    followed by the real turn: one E2E session showed two turns, one empty.
+lead = collect([{"v": 1, "ts": iso(0), "agent": "pi", "event": "note",
+                 "session_id": "s", "note": "starting"},
+                llm("t1", 1, 1200),
+                {"v": 1, "ts": iso(2), "agent": "pi", "event": "session_end",
+                 "session_id": "s", "note": "done"}])
+check("a leading untagged record joins the first tagged turn",
+      len(lead.turns) == 1, str([(t.index, t.key) for t in lead.turns]))
+
+# 2. Rows used to be clipped at the terminal edge, which is how a live pane
+#    showed "· calls 0 · t" — a label with no number.
+wide = collect([llm(f"t{i}", i * 30, 1500) for i in range(6)])
+for width in (60, 72, 88, 100):
+    rows = [strip_ansi(r) for r in render_overlay(wide, None, width, 40)]
+    turn_rows = [r for r in rows if r.strip().lstrip("▸").lstrip().startswith("#")]
+    check(f"{width} cols: turn rows end on a whole segment",
+          all(not r.rstrip().endswith(("·", "· c", "· ca", "· cal", "· call",
+                                       "· t", "· to", "· too", "· tool"))
+              for r in turn_rows),
+          str(turn_rows[:2]))
+    check(f"{width} cols: no turn row is cut by the terminal",
+          all(len(r) <= width for r in turn_rows), str([len(r) for r in turn_rows]))
+
+# 3. A per-turn span shorter than its measured work is a LOWER BOUND, said with
+#    >= rather than a warning marker on nearly every row.
+over = collect([llm("t1", 0, None, event="llm_request"), llm("t1", 1, 9000)])
+def _turn_row(metrics: Metrics) -> str:
+    # rows are " #1 ..." or " ▸#1 ..." (the open turn carries the marker)
+    for r in render_overlay(metrics, None, 100, 40):
+        plain = strip_ansi(r).strip().lstrip("▸").lstrip()
+        if plain.startswith("#"):
+            return strip_ansi(r)
+    raise AssertionError("no turn row rendered")
+
+
+row = _turn_row(over)
+check("a turn whose work exceeds its span shows 'wall >='", "wall ≥" in row, row)
+plain_row = _turn_row(collect([llm("t1", 0, 1000), llm("t1", 30, 1000)]))
+check("an ordinary turn shows a plain wall", "wall ≥" not in plain_row, plain_row)
+
 print()
 if FAILS:
     print(f"FAILED — {FAILS} check(s)")
