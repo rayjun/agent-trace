@@ -34,7 +34,7 @@ from typing import Any, Iterator, cast
 
 from core.schema.model import TERMINAL_STATUSES, now_iso, validate_event
 
-DB_SCHEMA_VERSION = 4
+DB_SCHEMA_VERSION = 5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -110,6 +110,25 @@ CREATE INDEX IF NOT EXISTS idx_spans_parent ON spans(parent_span_id);
 -- from the table instead dragged in each row's child bodies, 400ms of
 -- payload pages per refresh on a 3GB index.
 CREATE INDEX IF NOT EXISTS idx_spans_parent_trace ON spans(parent_span_id, trace_id);
+
+-- The human turn each session is currently inside, per adapter. The converter
+-- keys a task on (session, turn_id, episode) because adapters restart turn_id at
+-- every user prompt; an INCREMENTAL ingest only sees a file's tail, so without
+-- this row it would mint a different identity for the same records than a full
+-- read would, and the same turn would appear twice.
+-- Where a session was when the last pass stopped: the episode tracker's state,
+-- so an incremental tail mints the same event ids a full read would. Without it
+-- a turn that continues across two scans would appear twice.
+CREATE TABLE IF NOT EXISTS session_episodes (
+  session_id TEXT NOT NULL,
+  adapter_id TEXT NOT NULL,
+  episode_ts TEXT,
+  block_turn TEXT,
+  block_first_ts TEXT,
+  open_spans TEXT,
+  updated_at TEXT,
+  PRIMARY KEY (session_id, adapter_id)
+);
 
 CREATE TABLE IF NOT EXISTS sessions (
   session_id TEXT NOT NULL,
@@ -236,6 +255,11 @@ _MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("spans", "privacy_json TEXT"),
     ("spans", "source_json TEXT"),
     ("spans", "agent_version TEXT"),
+    # session_episodes gained the rest of the tracker's state; an index built by
+    # an earlier build of this schema has only episode_ts.
+    ("session_episodes", "block_turn TEXT"),
+    ("session_episodes", "block_first_ts TEXT"),
+    ("session_episodes", "open_spans TEXT"),
 )
 
 
@@ -292,12 +316,44 @@ class TraceStore:
     def _init_schema(self) -> None:
         with self._write_lock:
             conn = self._conn()
+            # Create first (the script is all IF NOT EXISTS), THEN read what the
+            # index says about itself: on a brand-new file the same read would
+            # fail against a table that does not exist yet.
             conn.executescript(_SCHEMA)
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key='schema_version'").fetchone()
+            stored = int(row[0]) if row and str(row[0]).isdigit() else None
             self._migrate(conn)
+            if stored is not None and stored < DB_SCHEMA_VERSION:
+                # Do NOT stamp the new version over an older index. The stored
+                # events were minted by an identity scheme this build no longer
+                # produces, so an incremental pass would add second copies under
+                # the new ids next to the old ones — the index needs a rebuild.
+                # Overwriting the marker here (which happens as soon as any
+                # reader opens the file, including the dashboard) hid that fact
+                # from `doctor` before the user ever saw the warning.
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES('needs_rebuild', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (f"indexed by schema v{stored}; this build is "
+                     f"v{DB_SCHEMA_VERSION}",))
+            else:
+                conn.execute(
+                    "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (str(DB_SCHEMA_VERSION),))
+                conn.execute("DELETE FROM meta WHERE key='needs_rebuild'")
+            conn.commit()
+
+    def mark_rebuilt(self) -> None:
+        """A full rebuild just minted fresh ids: clear the rebuild marker."""
+        with self._write_lock:
+            conn = self._conn()
             conn.execute(
                 "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (str(DB_SCHEMA_VERSION),))
+            conn.execute("DELETE FROM meta WHERE key='needs_rebuild'")
             conn.commit()
 
     @staticmethod
@@ -714,7 +770,8 @@ class TraceStore:
         """
         with self._write_lock:
             conn = self._conn()
-            for table in ("events", "spans", "sessions", "ingest_files"):
+            for table in ("events", "spans", "sessions", "ingest_files",
+                          "session_episodes"):
                 conn.execute(f"DELETE FROM {table}")
             conn.commit()
 
@@ -764,6 +821,49 @@ class TraceStore:
                 "   last_error=excluded.last_error, updated_at=excluded.updated_at",
                 (path, size, mtime, inode, indexed_bytes, corrupt_lines,
                  last_error, now_iso()))
+            conn.commit()
+
+    def session_seeds(self) -> dict[str, Any]:
+        """Episode-tracker state per (adapter, session), for EpisodeTracker."""
+        out: dict[str, Any] = {}
+        for row in self.query(
+                "SELECT adapter_id, session_id, episode_ts, block_turn,"
+                "       block_first_ts, open_spans FROM session_episodes"):
+            key = (row[0], row[1])
+            # "" means "no episode known yet". The column predates the nullable
+            # design and carries NOT NULL in tables created by an earlier build;
+            # an empty string keeps that constraint without inventing a timestamp.
+            episode = row[2] or None
+            out[key] = (episode, row[3], row[4],
+                        tuple(json.loads(row[5] or "[]")))
+        return out
+
+    def session_episodes(self) -> dict[tuple[str, str], tuple[str, str | None]]:
+        """(episode start, block turn) per (adapter, session) — for diagnostics."""
+        return {(r[0], r[1]): (r[2], r[3]) for r in self.query(
+            "SELECT adapter_id, session_id, episode_ts, block_turn"
+            " FROM session_episodes")}
+
+    def note_session_seed(self, adapter: str, session: str,
+                          episode_ts: str | None, block_turn: str | None = None,
+                          block_first_ts: str | None = None,
+                          open_keys: tuple[str, ...] = ()) -> None:
+        """Persist one session's tracker state. Called once per file, not per record."""
+        with self._write_lock:
+            conn = self._conn()
+            conn.execute(
+                "INSERT INTO session_episodes"
+                " (adapter_id, session_id, episode_ts, block_turn,"
+                "  block_first_ts, open_spans, updated_at)"
+                " VALUES (?,?,?,?,?,?,?)"
+                " ON CONFLICT(adapter_id, session_id) DO UPDATE SET"
+                "   episode_ts=excluded.episode_ts,"
+                "   block_turn=excluded.block_turn,"
+                "   block_first_ts=excluded.block_first_ts,"
+                "   open_spans=excluded.open_spans,"
+                "   updated_at=excluded.updated_at",
+                (adapter, session, episode_ts or "", block_turn, block_first_ts,
+                 json.dumps(list(open_keys)), now_iso()))
             conn.commit()
 
     def indexed_files(self) -> list[str]:

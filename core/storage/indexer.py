@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from core.convert.v1_to_v2 import convert_record
+from core.convert.v1_to_v2 import EpisodeTracker, _digest, convert_record
 from core.storage.discovery import iter_trace_files, resolved_path
 from core.storage.sqlite_store import TraceStore
 
@@ -83,6 +83,12 @@ class Indexer:
         #: cwd -> workspace snapshot (or None when it is not a repository), so a
         #: session's hundreds of events cost one `git status`.
         self._workspaces: dict[str, GitSnapshot | None] = {}
+        #: Per PASS: which human turn each session is inside, and the episode of
+        #: every record already placed. Both span files on purpose — a session is
+        #: split across daily files, and a backfill file repeats records the live
+        #: one also holds.
+        self._tracker = EpisodeTracker()
+        self._seen: dict[str, str | None] = {}
 
     def _enrich(self, event: dict[str, Any]) -> dict[str, Any]:
         """Attach the workspace when the adapter did not record one.
@@ -114,6 +120,11 @@ class Indexer:
         before = self._counters()
         files = list(iter_trace_files(self.dirs))
         present = {str(p) for p in files}
+        # A tail continues the human turn the last pass left; the episode of a
+        # record already placed in THIS pass is reused, so the same record in two
+        # files lands on the same ids.
+        self._tracker = EpisodeTracker(self.store.session_seeds())
+        self._seen = {}
         # Before the loop, not after: a key written under an older spelling has
         # to be corrected first, or this pass reads the whole file again (a
         # 1.6 GB trace) just to dedup it.
@@ -215,6 +226,10 @@ class Indexer:
         """
         report = ScanReport()
         self.store.clear_archive()
+        # A rebuild starts from nothing: the archive it just cleared described
+        # the old ids, and the files are the truth.
+        self._tracker = EpisodeTracker()
+        self._seen = {}
         before = self._counters()
         for path in iter_trace_files(self.dirs):
             report.files_seen += 1
@@ -223,6 +238,8 @@ class Indexer:
             except OSError as exc:
                 report.errors.append(f"{path}: {exc}")
         self.store.rebuild_projections()
+        # The archive now holds ids this build mints, so the rebuild marker goes.
+        self.store.mark_rebuilt()
         self._report_counters(report, before)
         return report
 
@@ -276,6 +293,14 @@ class Indexer:
         corrupt = 0
         last_error: str | None = None
         lineno = 0
+        # Which human turn each session is inside. A full read of a FILE starts
+        # from that file's own content; a tail continues what the last pass left,
+        # because it begins in the middle of an episode. Seeding a full read from
+        # the projection made the same records mint different ids depending on
+        # what had been read before.
+        tracker = self._tracker
+        seen = self._seen
+        touched: dict[tuple[str, str], tuple[Any, ...]] = {}
         with open(path, "rb") as fh:
             fh.seek(offset)
             for raw in fh:
@@ -296,13 +321,33 @@ class Indexer:
                     corrupt += 1
                     last_error = "line is not a JSON object"
                     continue
-                events = [self._enrich(e) for e in self._to_canonical(rec)]
+                episode = None
+                if rec.get("v") == 1:
+                    digest = _digest(rec)
+                    if digest in seen:
+                        # The same record, already placed in this pass: reuse its
+                        # episode so the duplicate gets the same event ids.
+                        episode = seen[digest]
+                    else:
+                        episode = tracker.step(rec)
+                        seen[digest] = episode
+                    skey = (rec.get("agent") or "unknown",
+                            rec.get("session_id") or "")
+                    st = tracker.snapshot().get(skey)
+                    if st is not None:
+                        touched[skey] = st
+                events = [self._enrich(e)
+                          for e in self._to_canonical(rec, episode)]
                 source_line: int | None = lineno if full else None
                 for event in events:
                     # Counters live on the store (it is what knows why an
                     # insert did not land); the report diffs them at the end.
                     self.store.ingest(event, source_file=key,
                                       source_line=source_line)
+        # Persist once per file, not per record: the episode only has to be
+        # correct for the NEXT scan's first record.
+        for (adapter, session), state in touched.items():
+            self.store.note_session_seed(adapter, session, *state)
         stat = path.stat()
         self.store.note_file(key, stat.st_size, stat.st_mtime, stat.st_size,
                              corrupt_lines=corrupt, last_error=last_error,
@@ -311,11 +356,12 @@ class Indexer:
         report.files_ingested += 1
 
     @staticmethod
-    def _to_canonical(rec: dict[str, Any]) -> list[dict[str, Any]]:
+    def _to_canonical(rec: dict[str, Any],
+                      episode: str | None = None) -> list[dict[str, Any]]:
         """v1 record -> converted event(s); v2 -> itself; else -> nothing."""
         v = rec.get("v")
         if v == 1:
-            converted = convert_record(rec)
+            converted = convert_record(rec, episode)
             return [converted] if converted is not None else []
         if v == 2:
             return [rec]

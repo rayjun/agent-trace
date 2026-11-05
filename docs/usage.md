@@ -92,9 +92,21 @@ breakdown:
   4.4 GiB · 0 file(s) behind · newest event 2s ago
 ```
 
-A turn here is a *contiguous block of the record stream*, not a `turn_id`:
-adapters restart their turn counter when the agent restarts, so one session
-legitimately contains several turns called `0`. `wall` is the session's own
+A turn is identified the way the index identifies a task: by the pair
+`(episode, turn_id)`, where the episode is the human turn a record belongs to.
+Adapters restart `turn_id` per human turn (pi: 68 prompt records returning to 0
+across the trace files), so `turn_id` alone would merge separate runs into one
+span — which is what made `agenttrace session` report 112 turns of which 107 were
+"interrupted".
+
+Two things to know when comparing numbers:
+
+* the panel counts **records on disk** for the session on screen, folding byte
+  identical duplicates (a live trace and a backfill can both hold the same
+  conversation). The index dedups by event id instead, so the two counts can
+  differ slightly — the overlay says which basis it used;
+* `wall` is the session's own envelope (first record to last), never the sum of
+  per-turn spans, which double-counts an overlap. `wall` is the session's own
 envelope (first record to last), never the sum of per-turn spans, which
 double-counts an overlap.
 

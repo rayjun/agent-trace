@@ -363,6 +363,9 @@ def _index_check(db_path: Path | None, files: list[Path]) -> Check:
         schema = conn.execute(
             "SELECT value FROM meta WHERE key='schema_version'").fetchone()
         schema_version = int(schema[0]) if schema else 0
+        marker = conn.execute(
+            "SELECT value FROM meta WHERE key='needs_rebuild'").fetchone()
+        needs_rebuild = str(marker[0]) if marker else None
         events = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
         spans = conn.execute("SELECT COUNT(*) FROM spans").fetchone()[0]
         indexed = {str(r[0]): (int(r[1]), int(r[2])) for r in conn.execute(
@@ -403,6 +406,10 @@ def _index_check(db_path: Path | None, files: list[Path]) -> Check:
     problems = []
     if not quick_ok:
         problems.append(f"quick_check reported: {quick[0] if quick else 'nothing'}")
+    # An OLD index is not fixed by an incremental pass: its events were minted by
+    # an identity scheme this build no longer produces, so a scan would add
+    # second copies under the new ids next to the old ones. It needs a rebuild.
+    stale_schema = bool(needs_rebuild) or 0 < schema_version < DB_SCHEMA_VERSION
     if schema_version != DB_SCHEMA_VERSION:
         problems.append(f"schema_version {schema_version} != {DB_SCHEMA_VERSION}")
     if corrupt:
@@ -416,8 +423,15 @@ def _index_check(db_path: Path | None, files: list[Path]) -> Check:
     if pending:
         summary += f", {pending} file(s) behind"
     if problems:
-        return Check("Index", "warn", summary, detail=problems[0],
-                     advice="; ".join(problems) + " — run: agenttrace index")
+        if stale_schema:
+            why = (needs_rebuild
+                   or f"the index was built by schema v{schema_version}")
+            advice = (f"{why}. This build is v{DB_SCHEMA_VERSION} and mints "
+                      f"different event ids, so an incremental pass would add "
+                      f"second copies — rebuild with: agenttrace index --full")
+        else:
+            advice = "; ".join(problems) + " — run: agenttrace index"
+        return Check("Index", "warn", summary, detail=problems[0], advice=advice)
     return Check("Index", "ok", summary)
 
 

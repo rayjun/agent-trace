@@ -68,13 +68,148 @@ _SESSION_EVENTS = {"session_start", "session_end"}
 _DISCRETE_EVENTS = {"user_prompt", "assistant_message", "note"}
 
 
-def _task_span_id(adapter: str, session: str, turn: str | None) -> str:
+#: Records that can begin a human turn.
+EPISODE_EVENTS = {"user_prompt", "session_start"}
+def _iso_ms(ts: Any) -> float | None:
+    """Epoch ms from an ISO-8601 `ts` (UTC, ends in Z). None when unparseable."""
+    if not isinstance(ts, str) or len(ts) < 19:
+        return None
+    try:
+        from datetime import datetime, timezone
+        base = ts.rstrip("Z")
+        fmt = "%Y-%m-%dT%H:%M:%S.%f" if "." in base else "%Y-%m-%dT%H:%M:%S"
+        return datetime.strptime(base, fmt).replace(
+            tzinfo=timezone.utc).timestamp() * 1000.0
+    except ValueError:
+        return None
+
+
+#: How long an unclosed span keeps blocking a turn boundary. A user-role message
+#: written mid-turn arrives seconds after its request (codex); a span still open
+#: hours later belongs to a run that died, and letting it block boundaries merged
+#: three runs of turn 0 into a 17-day task on real data. Same idea as doctor's
+#: ABANDONED_SPAN_H: an unclosed span is not evidence of an active turn forever.
+OPEN_SPAN_BLOCKS_MS = 3600 * 1000
+#: Records that open/close a span; used to tell a real turn boundary from the
+#: user-role message an agent writes mid-turn.
+_SPAN_START = {"llm_request", "tool_call"}
+_SPAN_END = {"llm_response", "llm_error", "tool_result"}
+
+
+def _span_key(rec: dict[str, Any]) -> str:
+    tool = rec.get("tool") or {}
+    if isinstance(tool, dict) and tool.get("call_id"):
+        return f"tool:{tool['call_id']}"
+    if rec.get("request_id"):
+        return f"llm:{rec['request_id']}"
+    return f"{rec.get('event')}:{rec.get('ts')}"
+
+
+class EpisodeTracker:
+    """Which HUMAN turn each record belongs to. One rule for every surface.
+
+    `turn_id` is not unique inside a session — pi restarts it per human turn
+    (68 prompt records returning to 0 across the trace files) — so keying a task
+    on it alone merged separate runs into one span whose bounds spanned days.
+
+    The rule, and why it is not "every user_prompt opens a turn":
+
+    * a boundary record opens a new human turn only when no span is OPEN for that
+      session. Codex writes `llm_request`, then a `user_prompt` carrying the SAME
+      turn_id, then `llm_response`; splitting there cuts a span in half — its
+      request and response land on different traces (measured on real rows from
+      codex-20261018.jsonl);
+    * `turn_id` is tracked only as part of the block identity, never as the
+      trigger: pi's next human turn can restart at 0 after a session_end, where
+      the id is unchanged but the turn is not.
+
+    Before any boundary is known (a file that starts mid-turn), the episode falls
+    back to the first ts seen in the current (session, turn_id) block. That keeps
+    ids content-derived, so the same archive always yields the same ids, and the
+    same records appearing in two files dedup instead of duplicating.
+    """
+
+    def __init__(self, seed: dict[str, Any] | None = None) -> None:
+        #: key -> [episode_ts, block_turn, block_first_ts, open span keys]
+        #: [episode_ts, block_turn, block_first_ts, open span keys, last turn id]
+        self._state: dict[tuple[str, str], list[Any]] = {}
+        for key, value in (seed or {}).items():
+            episode_ts, block_turn, block_first_ts, open_keys = value
+            opening = dict(open_keys or ())
+            self._state[(key[0], key[1])] = [
+                episode_ts, block_turn, block_first_ts, opening, block_turn]
+
+    def step(self, rec: dict[str, Any]) -> str | None:
+        """The episode for THIS record (call once per record, in stream order)."""
+        key = (rec.get("agent") or "unknown", rec.get("session_id") or "")
+        st = self._state.get(key)
+        if st is None:
+            st = self._state[key] = [None, None, None, {}, None]
+        ts = rec.get("ts") if isinstance(rec.get("ts"), str) else None
+        turn = rec.get("turn_id")
+        turn = str(turn) if turn is not None else None
+        if turn is not None and turn != st[1]:
+            st[1] = turn
+            st[2] = ts                    # a new block: its own start is the fallback
+        if turn is not None:
+            st[4] = turn                  # the last turn id seen, for the rule above
+        event = rec.get("event")
+        if event in EPISODE_EVENTS and ts:
+            now = _iso_ms(ts)
+            recent_open = bool(st[3]) and now is not None and any(
+                (opened_at := _iso_ms(opened)) is not None
+                and now - opened_at < OPEN_SPAN_BLOCKS_MS
+                for opened in st[3].values())
+            if turn != st[4] or not recent_open:
+                st[0] = ts
+        if event in _SPAN_START:
+            st[3][_span_key(rec)] = ts
+        elif event in _SPAN_END:
+            st[3].pop(_span_key(rec), None)
+        return st[0] or st[2]
+
+    def snapshot(self) -> dict[str, Any]:
+        """Serialisable state, for continuing a session in a later process.
+
+        The open-span set travels with it: a tail that starts mid-span must not
+        treat the next user_prompt as a boundary, or it would mint different ids
+        for records a full read already covered.
+        """
+        return {key: (st[0], st[1], st[2], tuple(sorted(st[3].items())))
+                for key, st in self._state.items()}
+
+
+def _task_span_id(adapter: str, session: str, turn: str | None,
+                  episode: str | None = None) -> str:
+    """Identity of one task (a trace root).
+
+    `turn_id` alone is NOT unique within a session: pi restarts it per human turn
+    (68 prompt records returning to 0 across the trace files on this machine, 3
+    of them inside a single file), so every run of "turn 0" collapsed into one
+    task. The projection then took min/max over all of them: one session reported
+    112 turns of which 107 were "interrupted" — 95% unusable — with per-turn p50
+    5.3s and an "agent time" of 26.8s for work that took hours.
+
+    `episode` is the start timestamp of the human turn the record belongs to —
+    the last `user_prompt`/`session_start` at or before it. Including it splits
+    the runs apart while staying deterministic: the same archive always produces
+    the same ids, because the episode is derived from record content, not from
+    how many files or how much of a file happened to be read.
+    """
+    # Only tagged records split by episode. A record with no turn_id (the
+    # user_prompt that OPENS an episode, a session-level note) keeps the
+    # session-wide identity it has always had: giving it an episode of its own
+    # would add one single-event trace per human turn, which is noise, not
+    # information — and the prompt's own ts is not the turn it introduces.
+    if episode and turn:
+        return derive_event_id("v1-task", adapter, session, turn or "-", episode)
     return derive_event_id("v1-task", adapter, session, turn or "-")
 
 
-def _trace_id(adapter: str, session: str, turn: str | None) -> str:
+def _trace_id(adapter: str, session: str, turn: str | None,
+              episode: str | None = None) -> str:
     # The trace root IS the task span; sharing the id keeps the join trivial.
-    return _task_span_id(adapter, session, turn)
+    return _task_span_id(adapter, session, turn, episode)
 
 
 def _base(rec: dict[str, Any], etype: str) -> dict[str, Any]:
@@ -107,7 +242,8 @@ def _privacy(rec: dict[str, Any]) -> dict[str, Any] | None:
     return {"capture": "full", "redacted": True}
 
 
-def _convert_span_pair(rec: dict[str, Any]) -> dict[str, Any] | None:
+def _convert_span_pair(rec: dict[str, Any],
+                       episode: str | None = None) -> dict[str, Any] | None:
     """llm_* and tool_* records -> one half of a span each."""
     adapter = rec.get("agent") or "unknown"
     event = rec.get("event")
@@ -134,11 +270,12 @@ def _convert_span_pair(rec: dict[str, Any]) -> dict[str, Any] | None:
     is_start = event in ("llm_request", "tool_call")
     out = _base(rec, "span_start" if is_start else "span_end")
     out.update({
-        "event_id": span_event_id(adapter, _trace_id(adapter, session, turn),
+        "event_id": span_event_id(adapter,
+                                  _trace_id(adapter, session, turn, episode),
                                   span_id, "span_start" if is_start else "span_end"),
-        "trace_id": _trace_id(adapter, session, turn),
+        "trace_id": _trace_id(adapter, session, turn, episode),
         "span_id": span_id,
-        "parent_span_id": _task_span_id(adapter, session, turn),
+        "parent_span_id": _task_span_id(adapter, session, turn, episode),
         "privacy": _privacy(rec),
     })
 
@@ -201,7 +338,8 @@ def _convert_span_pair(rec: dict[str, Any]) -> dict[str, Any] | None:
     return out
 
 
-def _convert_discrete(rec: dict[str, Any]) -> dict[str, Any]:
+def _convert_discrete(rec: dict[str, Any],
+                      episode: str | None = None) -> dict[str, Any]:
     adapter = rec.get("agent") or "unknown"
     session = rec.get("session_id") or "-"
     turn = rec.get("turn_id")
@@ -234,22 +372,30 @@ def _convert_discrete(rec: dict[str, Any]) -> dict[str, Any]:
     if name in _SESSION_EVENTS:
         out["trace_id"] = None  # session-level: no task to attach to
     else:
-        out["trace_id"] = _trace_id(adapter, session, turn)
-        out["span_id"] = _task_span_id(adapter, session, turn)
+        out["trace_id"] = _trace_id(adapter, session, turn, episode)
+        out["span_id"] = _task_span_id(adapter, session, turn, episode)
     out["privacy"] = _privacy(rec)
     return out
 
 
-def convert_record(rec: dict[str, Any]) -> dict[str, Any] | None:
-    """One v1 record -> one v2 event, or None if the record is not v1."""
+def convert_record(rec: dict[str, Any],
+                   episode: str | None = None) -> dict[str, Any] | None:
+    """One v1 record -> one v2 event, or None if the record is not v1.
+
+    `episode` is the human turn the record belongs to (see `_task_span_id`).
+    Callers that stream records must derive it (the indexer does, persisting the
+    current episode per session so an incremental tail lands on the same ids a
+    full read would produce); callers that convert one record in isolation leave
+    it out and get the turn-only identity.
+    """
     if rec.get("v") != 1:
         return None
     event = rec.get("event")
     if event in ("llm_request", "llm_response", "llm_error",
                  "tool_call", "tool_result"):
-        return _convert_span_pair(rec)
+        return _convert_span_pair(rec, episode)
     if event in _SESSION_EVENTS or event in _DISCRETE_EVENTS:
-        return _convert_discrete(rec)
+        return _convert_discrete(rec, episode)
     # Unknown v1 event type: keep it as a note rather than dropping data.
     out = _base(rec, "event")
     out["event_id"] = event_event_id(
@@ -257,6 +403,26 @@ def convert_record(rec: dict[str, Any]) -> dict[str, Any] | None:
         rec.get("ts"), _digest(rec))
     out["event"] = {"name": "note",
                     "attributes": {"text": f"unconverted v1 event: {event}"}}
+    return out
+
+
+def episode_for(records: Iterable[dict[str, Any]]) -> dict[int, str | None]:
+    """Episode start ts for each record position, per session, in stream order.
+
+    The one place that defines "which human turn is this record in": a
+    `user_prompt`/`session_start` record opens an episode, and every record after
+    it belongs to that episode until the next one. Returned keyed by index so a
+    streaming caller can pair it with its own records.
+    """
+    current: dict[tuple[str, str], str | None] = {}
+    out: dict[int, str | None] = {}
+    for i, rec in enumerate(records):
+        if rec.get("v") != 1:
+            continue
+        key = (rec.get("agent") or "unknown", rec.get("session_id") or "")
+        if rec.get("event") in EPISODE_EVENTS and rec.get("ts"):
+            current[key] = rec["ts"]
+        out[i] = current.get(key)
     return out
 
 
@@ -268,16 +434,25 @@ def synthesize_task_spans(records: Iterable[dict[str, Any]]
     min/max child ts. These spans are marked synthetic in attributes so a
     reader can tell 'the agent said a task ran' from 'we inferred one did'.
     """
-    groups: dict[tuple[str, str, str | None], dict[str, Any]] = {}
+    groups: dict[str, dict[str, Any]] = {}
+    tracker = EpisodeTracker()
     for rec in records:
         session = rec.get("session_id")
         if not session:
             continue
         adapter = rec.get("agent") or "unknown"
         turn = rec.get("turn_id")
-        key = (adapter, session, turn)
-        g = groups.setdefault(key, {"min": rec.get("ts"), "max": rec.get("ts"),
-                                    "error": False, "model": rec.get("model")})
+        episode = tracker.step(rec)
+        # Group by the IDENTITY the converter will mint, not by the raw inputs:
+        # `_task_span_id` ignores the episode for untagged records, so grouping
+        # on (turn, episode) put session_start and session_end in two different
+        # groups that then produced the SAME span id — a duplicate, which the
+        # conformance kit correctly rejects.
+        span_id = _task_span_id(adapter, session, turn, episode)
+        g = groups.setdefault(span_id, {"min": rec.get("ts"), "max": rec.get("ts"),
+                                        "error": False, "model": rec.get("model"),
+                                        "adapter": adapter, "session": session,
+                                        "turn": turn, "episode": episode})
         ts = rec.get("ts")
         if ts:
             g["min"] = min(g["min"] or ts, ts)
@@ -286,9 +461,10 @@ def synthesize_task_spans(records: Iterable[dict[str, Any]]
             g["error"] = True
         g["model"] = g["model"] or rec.get("model")
 
-    for (adapter, session, turn), g in groups.items():
-        span_id = _task_span_id(adapter, session, turn)
-        trace_id = _trace_id(adapter, session, turn)
+    for span_id, g in groups.items():
+        adapter, session = g["adapter"], g["session"]
+        turn, episode = g["turn"], g["episode"]
+        trace_id = _trace_id(adapter, session, turn, episode)
         attrs: dict[str, Any] = {"synthetic": True}
         if turn:
             attrs["turn_id"] = turn
@@ -336,10 +512,14 @@ def convert_stream(paths: Iterable[str | Path]) -> Iterator[dict[str, Any]]:
     synthesis belongs.
     """
     records: list[dict[str, Any]] = []
+    # One tracker, shared with synthesize_task_spans' own walk: the task roots
+    # and the children must agree on the episode, or a task points at a trace no
+    # child belongs to.
+    tracker = EpisodeTracker()
     for path in paths:
         for _, _, rec in _iter_v1(path):
             records.append(rec)
-            converted = convert_record(rec)
+            converted = convert_record(rec, tracker.step(rec))
             if converted is not None:
                 yield converted
     yield from synthesize_task_spans(records)
@@ -375,6 +555,7 @@ def convert_file(path: str | Path) -> Iterator[dict[str, Any]]:
     v1 record, so there is nothing honest to emit for it.
     """
     records: list[dict[str, Any]] = []
+    tracker = EpisodeTracker()
     with open(path, encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
@@ -387,7 +568,7 @@ def convert_file(path: str | Path) -> Iterator[dict[str, Any]]:
             if not isinstance(rec, dict):
                 continue
             records.append(rec)
-            converted = convert_record(rec)
+            converted = convert_record(rec, tracker.step(rec))
             if converted is not None:
                 yield converted
     yield from synthesize_task_spans(records)

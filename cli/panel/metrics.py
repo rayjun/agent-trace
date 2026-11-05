@@ -33,6 +33,7 @@ from panel.text import (C_AI, C_BOLD, C_DIM, C_MAGENTA, C_RED, C_RESET,
                         strip_ansi, vlen)
 
 from agenttrace_common import cache_hit_rate, total_input_tokens
+from core.convert.v1_to_v2 import EpisodeTracker, _digest
 from core.pricing import cost_usd
 
 #: Below this many samples a percentile is a lie dressed as statistics.
@@ -158,6 +159,7 @@ class Turn:
 
     index: int
     #: the `turn_id` this block was cut on (None for a block of untagged records)
+    #: (episode, turn_id): the same identity the index mints a task for
     key: object = None
     first_ts: str | None = None
     last_ts: str | None = None
@@ -204,6 +206,11 @@ class Metrics:
     unpriced_calls: int = 0
     tok_per_s: list[float] = field(default_factory=list)
     turns: list[Turn] = field(default_factory=list)
+    #: records skipped because an identical copy was already folded. The same
+    #: session is written by a live adapter AND a backfill, so one conversation
+    #: can appear several times on disk; the index dedups by event identity, and
+    #: a panel that did not would report a turn count nobody can reconcile.
+    duplicate_records: int = 0
     #: newest record timestamp, kept as a STRING (lexicographic == chronological)
     newest_ts: str | None = None
     #: first record to last: the session's window (see _finish)
@@ -305,7 +312,9 @@ class Metrics:
         return text
 
 
-def _fold(m: Metrics, turns: list[Turn], rec: dict[str, Any]) -> None:
+def _fold(m: Metrics, turns: dict[tuple[Any, Any], Turn],
+          tracker: EpisodeTracker, rec: dict[str, Any],
+          seen: set[str] | None = None) -> None:
     """Fold ONE record into the metrics. The only place a record is interpreted.
 
     Timestamps stay STRINGS here: the format is fixed and lexicographic order is
@@ -319,25 +328,33 @@ def _fold(m: Metrics, turns: list[Turn], rec: dict[str, Any]) -> None:
     turns whose windows overlapped 1,462 ways, a "wall" of 45,710s against a
     session span of 3,257s, and a work share of 7% where the truth was 99%.
     """
+    if seen is not None and rec.get("v") == 1:
+        digest = _digest(rec)
+        if digest in seen:
+            m.duplicate_records += 1
+            return
+        seen.add(digest)
     m.events += 1
     ts = rec.get("ts")
     if isinstance(ts, str) and (m.newest_ts is None or ts > m.newest_ts):
         m.newest_ts = ts
 
-    key = rec.get("turn_id")
-    turn = turns[-1] if turns else None
-    if turn is None or (key is not None and key != turn.key):
-        # A leading block of untagged records (session_start, an early note) is
-        # ADOPTED by the first tagged turn rather than shown as a zero-length
-        # turn of its own: one E2E session rendered as "#1 — work 0ms" followed
-        # by the real turn, which reads as a bug in the agent.
-        idle = (turn is not None and turn.key is None and not turn.calls
-                and not turn.tools and not turn.work_ms)
-        if idle and key is not None:
-            turn.key = key
-        else:
-            turn = Turn(index=len(turns) + 1, key=key)
-            turns.append(turn)
+    # The identity the INDEX uses: (episode, turn_id). Reading only `turn_id`
+    # made the panel report 3,417 turns for a session the index called 591 —
+    # same records, a different definition of "turn", two numbers nobody can
+    # reconcile.
+    episode = tracker.step(rec)
+    turn_id = rec.get("turn_id")
+    key = (episode, turn_id)
+    turn = turns.get(key)
+    if turn is None:
+        # Turns are keyed by the IDENTITY the index mints a task for, not by
+        # adjacency: a session split across daily files visits the same turn id
+        # in several files, and cutting on adjacency produced 639 turns where the
+        # index has 598 tasks for the same records — a number nobody could
+        # reconcile with any other surface.
+        turn = Turn(index=len(turns) + 1, key=key)
+        turns[key] = turn
     if isinstance(ts, str):
         if turn.first_ts is None or ts < turn.first_ts:
             turn.first_ts = ts
@@ -395,7 +412,7 @@ def _fold(m: Metrics, turns: list[Turn], rec: dict[str, Any]) -> None:
         turn.errors += 1
 
 
-def _finish(m: Metrics, turns: list[Turn]) -> Metrics:
+def _finish(m: Metrics, turns: dict[tuple[Any, Any], Turn]) -> Metrics:
     """Derive the per-turn wall clock and the open marker. O(turns), not O(events).
 
     Rebuilt on every call so the result is a pure function of the folded
@@ -403,7 +420,7 @@ def _finish(m: Metrics, turns: list[Turn]) -> Metrics:
     without the counters drifting.
     """
     m.turns = []
-    for turn in turns:
+    for turn in turns.values():
         turn.wall_ms = None
         if turn.first_ts and turn.last_ts:
             start, end = _ts_ms(turn.first_ts), _ts_ms(turn.last_ts)
@@ -413,11 +430,13 @@ def _finish(m: Metrics, turns: list[Turn]) -> Metrics:
         turn.interrupted = False
         m.turns.append(turn)
     if m.turns:
-        # The last turn is still running: its wall clock grows as you watch,
-        # and presenting it as a finished measurement makes "outside" meaningless.
-        m.turns[-1].open = True
-    starts = [t.first_ts for t in turns if t.first_ts]
-    for turn in turns:
+        # The turn that started most recently is still running: its wall clock
+        # grows as you watch, and presenting it as finished makes "outside"
+        # meaningless.
+        newest = max(m.turns, key=lambda t: t.first_ts or "")
+        newest.open = True
+    starts = [t.first_ts for t in turns.values() if t.first_ts]
+    for turn in turns.values():
         begin, finish = turn.first_ts, turn.last_ts
         if begin and finish:
             turn.interrupted = any(begin < other < finish for other in starts)
@@ -425,8 +444,8 @@ def _finish(m: Metrics, turns: list[Turn]) -> Metrics:
     # One envelope for the session, not the SUM of per-turn spans: spans can
     # overlap (a resumed run, a late record), and summing them double-counts the
     # overlap — it read 45,710s against a 3,257s session on real data.
-    firsts = [t.first_ts for t in turns if t.first_ts]
-    lasts = [t.last_ts for t in turns if t.last_ts]
+    firsts = [t.first_ts for t in turns.values() if t.first_ts]
+    lasts = [t.last_ts for t in turns.values() if t.last_ts]
     m.span_ms = None
     if firsts and lasts:
         a, b = _ts_ms(min(firsts)), _ts_ms(max(lasts))
@@ -438,9 +457,11 @@ def _finish(m: Metrics, turns: list[Turn]) -> Metrics:
 def collect(recs: Iterable[dict[str, Any]]) -> Metrics:
     """Metrics for a whole window, from scratch."""
     m = Metrics()
-    turns: list[Turn] = []
+    turns: dict[tuple[Any, Any], Turn] = {}
+    tracker = EpisodeTracker()
+    seen: set[str] = set()
     for rec in recs:
-        _fold(m, turns, rec)
+        _fold(m, turns, tracker, rec, seen)
     return _finish(m, turns)
 
 
@@ -463,7 +484,9 @@ class Accumulator:
 
     def __init__(self) -> None:
         self._m = Metrics()
-        self._turns: list[Turn] = []
+        self._turns: dict[tuple[Any, Any], Turn] = {}
+        self._tracker = EpisodeTracker()
+        self._seen: set[str] = set()
         self._head: dict[str, Any] | None = None
         self._key: object = None
         self._n = 0
@@ -471,7 +494,9 @@ class Accumulator:
 
     def _reset(self) -> None:
         self._m = Metrics()
-        self._turns = []
+        self._turns = {}
+        self._tracker = EpisodeTracker()
+        self._seen = set()
         self._n = 0
         self.rebuilds += 1
 
@@ -501,7 +526,7 @@ class Accumulator:
         self._head = recs[0]
         self._key = window_key
         for rec in recs[self._n:]:
-            _fold(self._m, self._turns, rec)
+            _fold(self._m, self._turns, self._tracker, rec, self._seen)
         self._n = len(recs)
         return copy.copy(_finish(self._m, self._turns))
 
@@ -774,6 +799,9 @@ def render_overlay(m: Metrics, health_: Health | None, width: int,
             "time the records' timestamps do not cover (clock rounding, or a "
             "resumed clock). The turn spans above are lower bounds.",
             w, indent="  ", colour=C_YELLOW))
+    turns.append(f"  {C_DIM}counted from {m.events:,} record(s) in the trace files"
+                 f"{' + ' + format(m.duplicate_records, ',') + ' duplicate copies folded' if m.duplicate_records else ''}"
+                 f"; the index dedups by event id and can differ{C_RESET}")
     if m.turns:
         share = m.work_share
         turns.append(f"  {C_DIM}work {C_BOLD}{human_ms(m.total_work_ms)}{C_RESET}"

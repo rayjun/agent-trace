@@ -742,17 +742,57 @@ def cmd_doctor(args) -> int:
 
 
 def cmd_index(args) -> int:
-    """One-shot indexing: scan once (or full rebuild) and print the report."""
+    """One-shot indexing: scan once (or full rebuild) and print the report.
+
+    Holds the index lock for the whole run. A rebuild CLEARS the archive, so an
+    incremental scan interleaved with it re-ingests what the rebuild just
+    dropped: measured at 52,000 events where 35,000 belong, with 1,800 id
+    conflicts and duplicate task windows. The dashboard's scan loop checks the
+    same lock and stands aside, so `index --full` is safe with it running.
+    """
     from core.storage.indexer import Indexer
     from core.storage.sqlite_store import TraceStore
     from server.main import platform_dir
+
+    platform = platform_dir()
+    lock = common.index_lock_path(platform)
+    holder = common.index_locked(platform)
+    if holder is not None:
+        print(f"another process is indexing (pid {holder}); "
+              f"wait for it, or remove {lock} if that process is gone",
+              file=sys.stderr)
+        return 2
     db = args.db or Path(os.environ.get("AGENTTRACE_DB")
-                         or platform_dir() / "agenttrace.db")
+                         or platform / "agenttrace.db")
     store = TraceStore(db)
-    report = (Indexer(store, args.dirs).full_rebuild() if args.full
-              else Indexer(store, args.dirs).scan_once())
-    print(json.dumps(report.__dict__, indent=2))
-    store.close()
+    try:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        if lock.exists():
+            # index_locked said the holder is gone, so this is a leftover from a
+            # killed writer; O_EXCL would refuse to start otherwise.
+            try:
+                lock.unlink()
+            except OSError:
+                pass
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            print(f"another process took {lock} while starting; try again",
+                  file=sys.stderr)
+            return 2
+        try:
+            os.write(fd, str(os.getpid()).encode())
+        finally:
+            os.close(fd)
+        report = (Indexer(store, args.dirs).full_rebuild() if args.full
+                  else Indexer(store, args.dirs).scan_once())
+        print(json.dumps(report.__dict__, indent=2))
+    finally:
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+        store.close()
     return 0
 
 

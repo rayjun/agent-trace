@@ -837,11 +837,15 @@ mix_store.close()
 from core.schema.model import span_event_id  # noqa: E402
 
 v1_path_id = convert_record(v1("llm_request", 0, request_id="r", model="m"))["event_id"]
-rt_store = store_with([v1("llm_request", 0, request_id="r", model="m"),
-                       v1("llm_response", 1, request_id="r", model="m",
-                          response={"usage": {"input_tokens": 5}}),
-                       v1("user_prompt", 2,
-                          request={"messages": [{"role": "user", "content": "hi"}]})])
+# The prompt comes FIRST, as every adapter writes it. Putting it last made it a
+# human-turn boundary of its own (no span was open by then), which is correct
+# behaviour for a stream that says "the turn ended, then a new prompt arrived" —
+# not what this fixture is about (OTLP round-trip fidelity).
+rt_store = store_with([v1("user_prompt", 0,
+                          request={"messages": [{"role": "user", "content": "hi"}]}),
+                       v1("llm_request", 1, request_id="r", model="m"),
+                       v1("llm_response", 2, request_id="r", model="m",
+                          response={"usage": {"input_tokens": 5}})])
 rt_trace = get_trace(rt_store, list_traces(rt_store)["traces"][0]["trace_id"])
 before = rt_store.one("SELECT COUNT(*) AS n FROM events")["n"]
 reimported = import_payload(export_trace(rt_trace))

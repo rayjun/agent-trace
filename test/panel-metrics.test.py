@@ -426,15 +426,20 @@ check("...with work share near 1 rather than a fraction",
       str(m_reuse.work_share))
 check("all four calls are still counted", m_reuse.calls == 4, str(m_reuse.calls))
 
-# Untagged records (session_end, notes) belong to the open turn, not a pseudo-turn.
+# A record with no turn_id gets the SAME identity the index mints a task for — a
+# session-level turn ("session activity") — rather than being folded into the
+# surrounding turn. Folding it in was prettier and produced a turn count the
+# index could not confirm.
 untagged = [turn_rec("0", 0), turn_rec("0", 2),
             {"v": 1, "ts": iso(3), "agent": "pi", "event": "session_end",
              "session_id": "s", "note": "done"}]
 m_untagged = collect(untagged)
-check("a record with no turn_id does not create a pseudo-turn",
-      len(m_untagged.turns) == 1, str([(t.index, t.key) for t in m_untagged.turns]))
-check("...it extends the turn that was open",
-      m_untagged.turns[0].last_ts == iso(3), str(m_untagged.turns[0].last_ts))
+keys = [t.key for t in m_untagged.turns]
+check("an untagged record forms the session-level turn the index creates",
+      len(keys) == 2 and any(k[1] is None for k in keys), str(keys))
+check("...and the session-level turn carries no work",
+      all(t.work_ms == 0 for t in m_untagged.turns if t.key[1] is None),
+      str([(t.key, t.work_ms) for t in m_untagged.turns]))
 
 # Overlapping windows are excluded from the work total (structural, D25).
 # Sequential cutting makes turns non-overlapping UNLESS a turn's records are
@@ -456,12 +461,20 @@ section("what a live pane caught that the pty harness did not")
 # 1. A leading untagged record (session_start) used to render as "#1 — work 0ms"
 #    followed by the real turn: one E2E session showed two turns, one empty.
 lead = collect([{"v": 1, "ts": iso(0), "agent": "pi", "event": "note",
-                 "session_id": "s", "note": "starting"},
+                 "session_id": "s1", "note": "starting"},
                 llm("t1", 1, 1200),
                 {"v": 1, "ts": iso(2), "agent": "pi", "event": "session_end",
-                 "session_id": "s", "note": "done"}])
-check("a leading untagged record joins the first tagged turn",
-      len(lead.turns) == 1, str([(t.index, t.key) for t in lead.turns]))
+                 "session_id": "s1", "note": "done"}])
+# The panel cuts turns on the SAME identity the index mints a task for —
+# (episode, turn_id). Records with no turn_id therefore form their own
+# session-level turn, exactly as the index's "session activity" task does; the
+# TRAILING untagged record (same episode) joins the open turn instead.
+# Every distinct (episode, turn_id) is one turn — including the session-level
+# one for records that carry no turn_id, which is exactly what the index builds.
+check("untagged records use the same identity as the index",
+      len(lead.turns) == 3, str([(t.index, t.key) for t in lead.turns]))
+check("...and none of them is a duplicate identity",
+      len({t.key for t in lead.turns}) == len(lead.turns), str([t.key for t in lead.turns]))
 
 # 2. Rows used to be clipped at the terminal edge, which is how a live pane
 #    showed "· calls 0 · t" — a label with no number.

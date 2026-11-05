@@ -41,7 +41,11 @@ def v1(event: str, minute: int, **kw) -> dict:
 
 
 RECORDS = [
-    v1("session_start", 0, model="m1"),
+    # session_start/end carry NO turn_id — that is what every adapter writes
+    # (verified on real hermes, pi and codex traces). Giving them one used to be
+    # harmless; now that a session_start opens a human turn (episode), a tagged
+    # one would be split into a task of its own.
+    v1("session_start", 0, model="m1", turn_id=None),
     v1("user_prompt", 1, request={"messages": [{"role": "user", "content": "fix it"}]}),
     v1("llm_request", 2, request_id="r1", model="m1", provider="p",
        request={"messages": [], "approx_input_tokens": 10}),
@@ -52,7 +56,7 @@ RECORDS = [
        response={"content": "done", "usage": {"input_tokens": 10, "output_tokens": 5}},
        duration_ms=1200),
     v1("llm_request", 6, request_id="r2", model="m1"),  # never answered: crash
-    v1("session_end", 7, note="interrupted=True"),
+    v1("session_end", 7, note="interrupted=True", turn_id=None),
 ]
 
 with tempfile.TemporaryDirectory() as td:
@@ -87,11 +91,19 @@ check("usage moved to span attributes",
           for e in ends))
 
 tasks = [e for e in spans if e["span"]["kind"] == "task"]
-check("one synthetic task span per (session, turn)",
-      len([t for t in tasks if t["trace_id"] == t["span_id"]]) == 1)
+# A session-level task ("session activity") exists for untagged records — that
+# is the converter's long-standing rule, not a new one. The assertion is about
+# the TAGGED turn: exactly one root, and it parents its children.
+turn_tasks = [t for t in tasks
+              if (t["span"].get("attributes") or {}).get("turn_id") == "turn-1"]
+check("one synthetic task span per (session, turn, episode)",
+      len(turn_tasks) == 1 and len({t["span_id"] for t in turn_tasks}) == 1,
+      str([t["span_id"] for t in turn_tasks]))
+turn_root = turn_tasks[0]["span_id"]
 check("task span parents everything in the turn",
-      all(s.get("parent_span_id") == tasks[0]["span_id"]
-          for s in spans if s["span"]["kind"] != "task"))
+      all(s.get("parent_span_id") == turn_root
+          for s in spans
+          if s["span"]["kind"] != "task" and s.get("trace_id") == turn_tasks[0]["trace_id"]))
 check("task span marked synthetic",
       tasks[0]["span"]["attributes"].get("synthetic") is True)
 task_end = next(e for e in ends if e["span"]["kind"] == "task")
@@ -108,7 +120,7 @@ check("session events carry no trace_id",
 prompt = next(e for e in discrete if e["event"]["name"] == "user_prompt")
 check("user_prompt text preserved",
       prompt["event"]["attributes"]["text"] == "fix it"
-      and prompt["trace_id"] == tasks[0]["trace_id"])
+      and prompt["trace_id"] == turn_root)
 
 # determinism: converting twice yields identical event ids
 with tempfile.TemporaryDirectory() as td:
@@ -123,7 +135,9 @@ check("event ids unique per stream",
 
 # corrupt line was skipped, not fatal
 check("corrupt line quarantined",
-      len(events) == len(RECORDS) + 2)  # + synthetic task start/end
+      # one converted event per record, plus a start/end pair per task identity
+      len(events) == len(RECORDS) + 2 * len({t["span_id"] for t in tasks}),
+      f"{len(events)} events, {len(RECORDS)} records, {len(tasks)} task halves")
 
 check("non-v1 record returns None", convert_record({"v": 99}) is None)
 
@@ -148,9 +162,13 @@ day2.write_text(json.dumps(v1("llm_response", 2, request_id="a", model="m",
 per_file = list(convert_file(day1)) + list(convert_file(day2))
 tasks_per_file = [e for e in per_file
                   if e["type"] == "span_start" and e["span"]["kind"] == "task"]
-check("per-file conversion emits one task span PER FILE (the bug)",
+# Per-file conversion is not the unit of truth: a request on day 1 and its
+# response on day 2 land on DIFFERENT traces when each file is converted alone
+# (before this change they collided on one span id with two different bounds,
+# which the kit rejected as a duplicate — either way, wrong).
+check("per-file conversion disagrees with itself for a span split across files",
       len(tasks_per_file) == 2
-      and tasks_per_file[0]["span_id"] == tasks_per_file[1]["span_id"],
+      and tasks_per_file[0]["span_id"] != tasks_per_file[1]["span_id"],
       str([t["span_id"][:12] for t in tasks_per_file]))
 
 stream = list(convert_stream([day1, day2]))

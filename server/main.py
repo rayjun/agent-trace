@@ -107,6 +107,8 @@ class ServerState:
         self.indexer = indexer
         self.token = token
         self.scan_interval = scan_interval
+        #: Where the index lock lives; None means the default platform dir.
+        self.platform = None
         self.started_at = time.time()
         self.version = 0            # bumped whenever ingest adds events
         self.cond = threading.Condition()
@@ -121,6 +123,12 @@ class ServerState:
 
     def indexer_loop(self) -> None:
         while not self._stop.is_set():
+            # A rebuild (`agenttrace index [--full]`) clears the archive; scanning
+            # while it does interleaves two writers and re-ingests what it just
+            # dropped. Stand aside instead of racing.
+            if common.index_locked(self.platform):
+                self._stop.wait(self.scan_interval)
+                continue
             try:
                 report = self.indexer.scan_once()
             except Exception as exc:  # never let the loop die silently

@@ -737,3 +737,32 @@ def emit_record(trace_dir: Path, file_prefix: str, record: dict,
                      path=path)
         return None
     return path
+
+
+#: Held by a process that is rewriting the projection (`agenttrace index`,
+#: `--full`). The dashboard's scan loop reads it and stands aside: a rebuild and
+#: an incremental scan running at once cleared the archive under each other and
+#: produced 52,000 events where 35,000 belong, with 1,800 id conflicts.
+INDEX_LOCK_NAME = "index.lock"
+
+
+def index_lock_path(platform: Path | None = None) -> Path:
+    return (platform or platform_dir()) / INDEX_LOCK_NAME
+
+
+def index_locked(platform: Path | None = None) -> int | None:
+    """The pid holding the index lock, or None. A dead pid's lock is stale."""
+    path = index_lock_path(platform)
+    try:
+        pid = int(path.read_text().strip() or 0)
+    except (OSError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    try:
+        os.kill(pid, 0)          # signal 0: existence check, no delivery
+    except ProcessLookupError:
+        return None              # stale: the writer died without cleaning up
+    except PermissionError:
+        return pid               # exists, just not ours to signal
+    return pid
