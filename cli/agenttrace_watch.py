@@ -33,6 +33,7 @@ import signal
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "common"))
@@ -148,6 +149,8 @@ def watch(args) -> int:
         """History preload path: only the scoped session's records are read
         off disk — there is nothing to restore when loading."""
         return admit(r) and (not scope or r.get("session_id") == scope)
+
+
 
     history = getattr(args, "history", 0)
     following = getattr(args, "follow", True)

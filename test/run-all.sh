@@ -39,6 +39,7 @@ run "dashboard routing"     node    test/dashboard-routing.test.mjs
 run "README diagrams"       node    test/readme-diagram.test.mjs
 run "hardening"             python3 test/hardening.test.py
 run "panel metrics"         python3 test/panel-metrics.test.py
+run "panel history"         python3 test/panel-history.test.py
 run "turn identity"         python3 test/turn-episodes.test.py
 run "watch TUI (pty)"       python3 test/watch-tui.test.py
 if [ "${SKIP_E2E:-0}" != "1" ]; then
