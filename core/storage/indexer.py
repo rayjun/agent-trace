@@ -43,6 +43,11 @@ class ScanReport:
     #: their rows are dropped in the same pass, because the projection follows
     #: the archive and a trace nobody can re-read must not stay queryable.
     files_dropped: int = 0
+    #: Bytes the projection gave back to the filesystem, and what it holds now.
+    #: A rebuild deletes every row before re-inserting it, so the file keeps the
+    #: old pages until something compacts it.
+    reclaimed_bytes: int = 0
+    db_bytes: int = 0
     #: files whose stored key was respelled to the canonical (resolved) path —
     #: a one-time migration for keys written before paths were canonicalised.
     files_rekeyed: int = 0
@@ -241,6 +246,12 @@ class Indexer:
         # The archive now holds ids this build mints, so the rebuild marker goes.
         self.store.mark_rebuilt()
         self._report_counters(report, before)
+        # Hand back the pages the clear/re-insert cycle left behind. This is the
+        # only place a full VACUUM is affordable: a rebuild already takes minutes
+        # and is an explicit, one-shot action.
+        prior, now = self.store.compact()
+        report.reclaimed_bytes = max(0, prior - now)
+        report.db_bytes = now
         return report
 
     def _counters(self) -> tuple[int, int, int, int]:

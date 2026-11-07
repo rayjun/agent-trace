@@ -599,6 +599,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_index.add_argument("--db", type=Path, default=None)
     p_index.add_argument("--full", action="store_true",
                          help="rebuild projections from the raw archive")
+    p_index.add_argument(
+        "--vacuum", action="store_true",
+        help="compact the database afterwards, reclaiming the pages deletions "
+             "leave behind (a --full rebuild does this automatically)")
     _dirs(p_index)
 
     p_doctor = sub.add_parser(
@@ -786,6 +790,10 @@ def cmd_index(args) -> int:
             os.close(fd)
         report = (Indexer(store, args.dirs).full_rebuild() if args.full
                   else Indexer(store, args.dirs).scan_once())
+        if getattr(args, "vacuum", False):
+            prior, now = store.compact()
+            report.reclaimed_bytes = max(0, prior - now)
+            report.db_bytes = now
         print(json.dumps(report.__dict__, indent=2))
     finally:
         try:

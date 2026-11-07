@@ -310,6 +310,15 @@ class TraceStore:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA busy_timeout=10000")
             conn.execute("PRAGMA foreign_keys=ON")
+            # Give deleted pages back automatically. This store DELETES in bulk —
+            # `clear_archive` on every rebuild, `drop_files` when a trace file is
+            # removed — and without auto-vacuum those pages stay in the file
+            # forever: 4.24 GiB of a 9.18 GiB database was freelist after three
+            # rebuilds. FULL (not INCREMENTAL) because INCREMENTAL still needs
+            # someone to call `PRAGMA incremental_vacuum`, and nobody does.
+            # The mode only takes effect on a database that has been vacuumed
+            # once; compact() does that.
+            conn.execute("PRAGMA auto_vacuum=FULL")
             self._local.conn = conn
         return conn
 
@@ -344,6 +353,66 @@ class TraceStore:
                     (str(DB_SCHEMA_VERSION),))
                 conn.execute("DELETE FROM meta WHERE key='needs_rebuild'")
             conn.commit()
+
+    def compact(self, *, full: bool = True) -> tuple[int, int]:
+        """Give freed pages back to the filesystem. Returns (before, after) bytes.
+
+        `clear_archive` deletes every row of a multi-GB database and the rebuild
+        re-inserts it, so the file keeps the old pages in its freelist. Measured
+        here: 9.18 GiB on disk holding 4.94 GiB of data. A full VACUUM rewrites
+        the file once (needs room to grow, takes a minute at this size); after
+        that, `auto_vacuum=INCREMENTAL` reclaims page by page as rows go away.
+        """
+        def on_disk() -> int:
+            # The main file is only part of it: with WAL enabled a fresh index
+            # leaves everything in `-wal`, and reporting the main file alone said
+            # "0 bytes reclaimed" for a database that was entirely in the log.
+            total = 0
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    total += Path(str(self.path) + suffix).stat().st_size
+                except OSError:
+                    continue
+            return total
+
+        # Checkpoint BEFORE measuring: with WAL, an index that just finished
+        # lives mostly in `-wal`, and a "before" taken then compared against an
+        # after-VACUUM total reported a NEGATIVE reclaim on a fresh database.
+        try:
+            with self._write_lock:
+                self._conn().execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.Error:
+            pass
+        before = on_disk()
+        with self._write_lock:
+            conn = self._conn()
+            try:
+                if full:
+                    # Turn on incremental auto-vacuum IN THE SAME SESSION as the
+                    # rewrite: the mode only changes when a VACUUM follows the
+                    # pragma, so setting it on connect (which we also do) is a
+                    # no-op until this runs. Afterwards, deletions give pages back
+                    # as they happen instead of waiting for the next rebuild.
+                    conn.execute("PRAGMA auto_vacuum=FULL")
+                    conn.execute("VACUUM")
+                else:
+                    conn.execute("PRAGMA incremental_vacuum")
+                # VACUUM writes through the WAL, so the file has not shrunk until
+                # the log is folded back in. Measuring before this reported the
+                # rewritten database PLUS its unflushed log — 17.8 MiB becoming
+                # "35.4", i.e. a negative reclaim on a database that only shrank.
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                return before, before
+        return before, on_disk()
+
+    def freelist_bytes(self) -> int:
+        """Bytes the file holds but no row uses — the size a VACUUM would reclaim."""
+        row = self.one("PRAGMA freelist_count")
+        page = self.one("PRAGMA page_size")
+        free = int(row[0]) if row else 0
+        size = int(page[0]) if page else 0
+        return free * size
 
     def mark_rebuilt(self) -> None:
         """A full rebuild just minted fresh ids: clear the rebuild marker."""
@@ -904,6 +973,11 @@ class TraceStore:
         """
         if not paths:
             return 0
+        # Resolve like every other path key: a caller that passes `/var/...`
+        # while the rows are keyed `/private/var/...` deletes nothing and says
+        # nothing, which is how a deleted trace file kept its rows forever.
+        from core.storage.discovery import resolved_path
+        paths = [resolved_path(p) for p in paths]
         dropped = 0
         with self._write_lock:
             conn = self._conn()
