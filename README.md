@@ -121,6 +121,28 @@ share of agent time, and where the gaps were) · **Datasets / Experiments** ·
 A trace is **one turn** — that is what "one task execution" means — which is why
 per-conversation time lives on the session page.
 
+## TUI inside Hermes
+
+`install.sh hermes [profile]` also drops `agenttrace.mjs` into
+`<HERMES_HOME>/tui-widgets/`, so the numbers live in the agent's own terminal
+instead of a second window. In `hermes --tui` type `/agenttrace` — a card docks
+above the status bar, the composer keeps taking input, and the same command
+closes it.
+
+```
+agent-trace             ●   933 turns
+▁▁▄▁▁▁█▁▁▃▁▂▁▃▁▁▁▁▁▃▂▁        p50   27s
+in   1.5B  out 11.1M  err 704
+last hermes 1m57s · 28 spans
+```
+
+Totals come from `/api/overview`, the sparkline is the last 24 turns from
+`/api/traces`, polled every 2.5 s. It needs the local server
+(`agenttrace serve --daemon`); with the server down the card says why instead of
+going blank, and recovers by itself on the next poll. Editing the widget file
+hot-reloads it — `/widgets-reload` forces a rescan. `scripts/widget-harness.mjs`
+renders the same card headlessly against a live server.
+
 ## Evaluation
 
 ```bash

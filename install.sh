@@ -2,6 +2,7 @@
 # Install the agent-trace adapters onto this machine.
 #
 #   ./install.sh hermes            # copy the plugin into a profile + enable it
+#                                  # (also drops the /agenttrace TUI widget)
 #   ./install.sh hermes ai         # ...into the "ai" profile
 #   ./install.sh hermes all        # ...into every profile that has one
 #   ./install.sh codex             # wire the codex hook
@@ -71,6 +72,19 @@ install_hermes() {
     fi
   done
   echo "synced hermes plugin -> $home/plugins/agent-trace"
+
+  # The TUI widget rides the same install step but lands in a different place:
+  # `hermes --tui` hot-loads `<home>/tui-widgets/*.mjs`, so /agenttrace exists
+  # in the dock without any plugin involvement. Copied (not linked) for the
+  # same reason as the plugin: a running TUI must not silently execute a
+  # half-edited checkout.
+  mkdir -p "$home/tui-widgets"
+  cp hermes/tui-widgets/agenttrace.mjs "$home/tui-widgets/"
+  if ! cmp -s hermes/tui-widgets/agenttrace.mjs "$home/tui-widgets/agenttrace.mjs"; then
+    echo "FAIL: deployed widget differs from hermes/tui-widgets/agenttrace.mjs" >&2
+    return 1
+  fi
+  echo "synced TUI widget   -> $home/tui-widgets/agenttrace.mjs"
 
   if command -v hermes >/dev/null 2>&1; then
     local flag=()
@@ -182,6 +196,19 @@ status() {
       stale=1
     else
       printf '  %-26s %-14s %s\n' "hermes $name" "ok" "$dest"
+    fi
+
+    # The TUI widget drifts independently of the plugin: it is the surface a
+    # user actually looks at, so a stale copy is visible only if reported.
+    if [ -f "$home/tui-widgets/agenttrace.mjs" ]; then
+      if cmp -s hermes/tui-widgets/agenttrace.mjs "$home/tui-widgets/agenttrace.mjs"; then
+        printf '  %-26s %-14s %s\n' "widget $name" "ok" "$home/tui-widgets/agenttrace.mjs"
+      else
+        printf '  %-26s %-14s %s\n' "widget $name" "SYNC NEEDED" "stale agenttrace.mjs"
+        stale=1
+      fi
+    else
+      printf '  %-26s %-14s\n' "widget $name" "not installed"
     fi
   done
 

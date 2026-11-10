@@ -103,6 +103,20 @@ flowchart TB
 
 一个 trace 是**一轮** —— 这就是「一次任务执行」的含义 —— 所以"每次对话耗时"在 session 页面上。
 
+## Hermes 里的 TUI
+
+`install.sh hermes [profile]` 会同时把 `agenttrace.mjs` 放进
+`<HERMES_HOME>/tui-widgets/`，指标直接长在 agent 自己的终端里，不用再开一个窗口。在 `hermes --tui` 里输入 `/agenttrace`，卡片停靠在状态栏上方，输入框照常可用，再输一次收起。
+
+```
+agent-trace             ●   933 turns
+▁▁▄▁▁▁█▁▁▃▁▂▁▃▁▁▁▁▁▃▂▁        p50   27s
+in   1.5B  out 11.1M  err 704
+last hermes 1m57s · 28 spans
+```
+
+总数来自 `/api/overview`，走势线是 `/api/traces` 里最近 24 轮，每 2.5 秒拉一次。它依赖本地服务（`agenttrace serve --daemon`）；服务没起来时卡片会说明原因而不是空着，下一次轮询自动恢复。改这个文件会热加载，`/widgets-reload` 强制重新扫描。`scripts/widget-harness.mjs` 可以在不打开 TUI 的情况下对着真实服务渲染同一张卡片。
+
 ## 评估
 
 ```bash
