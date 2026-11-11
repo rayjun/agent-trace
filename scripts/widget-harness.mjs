@@ -65,7 +65,7 @@ register(sdk)
 
 if (!app) throw new Error('register() did not define a widget app')
 
-const state = app.init(process.argv[3] ?? '')
+const state = app.init(base)
 
 if (!state) throw new Error('init() refused the launch')
 
@@ -81,7 +81,9 @@ const findBody = node => {
   return null
 }
 
-const tree = app.render({ cols: 80, state, t })
+const cols = Number(process.argv[3] ?? 80)
+const tree = app.render({ cols, state, t })
+const innerWidth = tree.props.width - 6
 const bodyEl = findBody(tree)
 
 if (!bodyEl) throw new Error('render() produced no Body component')
@@ -112,7 +114,10 @@ const rowsOf = node => {
 const print = (label, node) => {
   console.log(`\n--- ${label} ---`)
 
-  for (const row of rowsOf(node)) console.log('|' + row.padEnd(40).slice(0, 40) + '|')
+  for (const row of rowsOf(node)) {
+    if (!row.startsWith('<shimmer') && row.length > innerWidth) throw new Error(`row overflow: ${row.length} > ${innerWidth}`)
+    console.log('|' + row.padEnd(innerWidth) + '|')
+  }
 }
 
 // Phase 1: the loading card (what the dock shows on the first frame).
@@ -122,11 +127,14 @@ print('loading', bodyEl.type(bodyEl.props))
 // Phase 2: run the polling effect against the live server, then re-render.
 const effect = hooks.find(fn => typeof fn === 'function')
 const cleanup = effect()
-await new Promise(resolve => setTimeout(resolve, 1500))
-cursor = 0
-print('ready', bodyEl.type(bodyEl.props))
-
-cleanup()
+try {
+  for (let i = 0; i < 200 && hooks[0]?.kind === 'loading'; i++) {
+    await new Promise(resolve => setTimeout(resolve, 50))
+  }
+  cursor = 0
+  print(hooks[0]?.kind ?? 'unknown', bodyEl.type(bodyEl.props))
+  if (hooks[0]?.kind !== 'ready') throw new Error('live card did not reach ready')
+} finally { cleanup() }
 
 const direct = await snapshot(base)
 console.log('\nsnapshot() =', JSON.stringify({

@@ -123,25 +123,53 @@ per-conversation time lives on the session page.
 
 ## TUI inside Hermes
 
-`install.sh hermes [profile]` also drops `agenttrace.mjs` into
-`<HERMES_HOME>/tui-widgets/`, so the numbers live in the agent's own terminal
-instead of a second window. In `hermes --tui` type `/agenttrace` — a card docks
-above the status bar, the composer keeps taking input, and the same command
-closes it.
+Minimum supported terminal width: 24 columns.
 
-```
-agent-trace             ●   933 turns
-▁▁▄▁▁▁█▁▁▃▁▂▁▃▁▁▁▁▁▃▂▁        p50   27s
-in   1.5B  out 11.1M  err 704
-last hermes 1m57s · 28 spans
-```
+`./install.sh hermes` installs `/agenttrace` into the active default profile's
+`tui-widgets/` directory. In `hermes --tui`, the command toggles a four-row
+ambient card without taking the composer's keyboard. Named profiles can be
+installed explicitly with `./install.sh hermes <profile>`.
 
-Totals come from `/api/overview`, the sparkline is the last 24 turns from
-`/api/traces`, polled every 2.5 s. It needs the local server
-(`agenttrace serve --daemon`); with the server down the card says why instead of
-going blank, and recovers by itself on the next poll. Editing the widget file
-hot-reloads it — `/widgets-reload` forces a rescan. `scripts/widget-harness.mjs`
-renders the same card headlessly against a live server.
+The card is **all indexed agents**, not automatically the current conversation.
+Turn/token/error totals are lifetime index totals; `spanErr` counts error/interrupted/cancelled spans,
+not failed turns. `p50/N` and the trend use known completed durations among
+the newest 24 turns (`N` is the actual sample size). Running/missing durations
+are excluded, and `new` (latest started trace, not latest activity) shows the API's status rather than labelling every
+non-OK status as failed. Durations are recorded wall-time spans, not live elapsed time or active compute time. This is a glance panel, not a trace-tree browser.
+
+The local backend must be running: `agenttrace serve --daemon`. Polls wait
+2.5 seconds after completion, never overlap, and abort when the card closes.
+HTTP failures cannot masquerade as zero totals. Token rotation triggers one
+reauthentication attempt. Failed refreshes keep the last good values with a
+`STALE` age; all phases reserve four rows, and narrow terminals use compact
+rows. A timeout means only that the server timed out, not proof of indexing.
+
+`/widgets-reload` rescans installed widget copies. Repo edits must first be
+copied to `<HERMES_HOME>/tui-widgets/agenttrace.mjs`; the installer checks drift.
+Run `node scripts/widget-harness.mjs [server-url]` for a live headless check,
+and `node --test test/hermes-widget.test.mjs` for isolated regression tests.
+
+### Trace explorer: `/tracex`
+
+`/tracex` opens a keyboard-driven modal: select a session, press Enter to see
+its turns, Enter again for the parent/child span tree, then open an LLM/tool
+span to inspect input, output, error, model, tokens, and privacy metadata.
+`/tracex <session-id> [server-url]` binds directly to an exact session ID.
+The widget SDK does not expose the active chat ID: no-argument launch is a
+session picker, **not** a guess based on the most recently active session.
+
+- Up/Down or j/k: select or scroll; PageUp/PageDown: move ten rows.
+- Enter: drill down; Space: fold/unfold a tree node; e: toggle error spans.
+- b or Esc: back; q: close from any page; r: refresh the current snapshot.
+- In call details, i/o/x jump to input/output/error; g returns to metadata.
+
+The picker loads up to 200 recent sessions, explicitly labelled; session
+requests use the full selected ID. The explorer is a **manual-refresh snapshot**,
+not a live stream. The dock remains live independently. Chinese and emoji in
+captured payloads are preserved, terminal controls are stripped, and unknown
+values say `(not captured)`. Each detail section is bounded at 100,000
+characters and visibly marked if truncated. Closing or navigating away aborts
+pending fetches; stale replies cannot replace the new page.
 
 ## Evaluation
 

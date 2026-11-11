@@ -105,17 +105,32 @@ flowchart TB
 
 ## Hermes 里的 TUI
 
-`install.sh hermes [profile]` 会同时把 `agenttrace.mjs` 放进
-`<HERMES_HOME>/tui-widgets/`，指标直接长在 agent 自己的终端里，不用再开一个窗口。在 `hermes --tui` 里输入 `/agenttrace`，卡片停靠在状态栏上方，输入框照常可用，再输一次收起。
+支持的最小终端宽度：24 列。
 
-```
-agent-trace             ●   933 turns
-▁▁▄▁▁▁█▁▁▃▁▂▁▃▁▁▁▁▁▃▂▁        p50   27s
-in   1.5B  out 11.1M  err 704
-last hermes 1m57s · 28 spans
-```
+`./install.sh hermes` 将 `/agenttrace` 安装到 default profile 的
+`tui-widgets/`。在 `hermes --tui` 中输入命令，四行卡片停靠显示，不接管输入框；再输入一次关闭。其他 profile 需显式执行 `./install.sh hermes <profile>`。
 
-总数来自 `/api/overview`，走势线是 `/api/traces` 里最近 24 轮，每 2.5 秒拉一次。它依赖本地服务（`agenttrace serve --daemon`）；服务没起来时卡片会说明原因而不是空着，下一次轮询自动恢复。改这个文件会热加载，`/widgets-reload` 强制重新扫描。`scripts/widget-harness.mjs` 可以在不打开 TUI 的情况下对着真实服务渲染同一张卡片。
+**当前统计范围是所有已索引 agent，不是自动绑定当前对话。** 轮数、token、错误数是索引累计；`spanErr` 是 error/interrupted/cancelled span 数，不是失败轮数。`p50/N` 和走势线取最新 24 轮中已结束且耗时已知的样本，`N` 是实际样本数；运行中和耗时未知的轮次不补零。`new` 表示开始时间最新的一轮，不是最近活动，展示真实状态，不再把所有非 OK 状态都标成失败。耗时是已记录时间跨度，不是实时计时，也不是纯执行耗时。这是速览卡片，不是执行树浏览器。
+
+需启动本地服务：`agenttrace serve --daemon`。每次请求完成后等 2.5 秒再刷新，不重叠；关闭卡片会取消在途请求。HTTP 错误不会伪装成零数据，token 变化会重新认证一次。刷新失败保留上次成功数据，并标注 `STALE` 和数据年龄；加载、正常、错误都占四行，窄终端使用紧凑行。超时只说明请求超时，不能直接断言索引器正在工作。
+
+`/widgets-reload` 可重新扫描安装副本。修改仓库后需先复制到
+`<HERMES_HOME>/tui-widgets/agenttrace.mjs`，安装器可检查版本漂移。
+`node scripts/widget-harness.mjs [server-url]` 对真实服务做无界面验证，
+`node --test test/hermes-widget.test.mjs` 跑隔离回归测试。
+
+### 详情浏览器 `/tracex`
+
+`/tracex` 打开键盘操作面板：选择会话，Enter 查看该会话的轮次，再进入 span 父子执行树，选中 LLM 或工具调用后查看输入、输出、错误、模型、token 和隐私元数据。
+`/tracex <session-id> [server-url]` 可绑定指定完整会话 ID。
+Widget SDK 没有暴露当前聊天 ID，因此无参数时让你选会话，**不会把最近活动会话冒充当前会话**。
+
+- 上下键或 j/k：选择、滚动；PageUp/PageDown：移动十行。
+- Enter：进入；空格：折叠/展开节点；e：只看错误 span。
+- b 或 Esc：返回；q：关闭；r：刷新当前快照。
+- 调用详情内 i/o/x 跳到输入/输出/错误，g 回到元数据。
+
+会话选择器最多加载最近 200 个，会明确标注，不表示全部历史。详情采用**手动刷新快照**，不是实时流；速览卡片仍独立实时刷新。保留采集内容中的中文和 emoji，过滤终端控制字符；未知字段显示 `(not captured)`。单个详情区段上限为 100,000 字符，截断会提示。关闭和切页取消在途请求，旧响应不会覆盖新页面。
 
 ## 评估
 

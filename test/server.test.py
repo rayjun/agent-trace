@@ -282,6 +282,14 @@ path = write_pidfile(12345)
 check("write_pidfile records the pid",
       path.is_file() and path.read_text().strip() == "12345", str(path))
 
+from unittest.mock import patch as mock_patch
+
+encoded_trace_id = "turn/a%2Fb"
+with mock_patch("server.main.get_trace", return_value={"trace_id": encoded_trace_id}) as lookup:
+    code, body = req("/api/traces/" + urllib.parse.quote(encoded_trace_id, safe="") + "?token=test-token")
+    check("trace route decodes identifiers exactly once", code == 200 and isinstance(body, dict) and body["trace_id"] == encoded_trace_id)
+    check("trace lookup preserves literal percent escapes", lookup.call_args.args[1] == encoded_trace_id)
+
 server.state.stop()
 server.shutdown()
 server.server_close()

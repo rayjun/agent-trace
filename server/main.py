@@ -455,7 +455,7 @@ class Handler(BaseHTTPRequestHandler):
                 since=_one(qs, "since"),
                 limit=_int(qs, "limit", 50), offset=_int(qs, "offset", 0)))
         elif path.startswith("/api/traces/"):
-            trace_id = path[len("/api/traces/"):]
+            trace_id = unquote(path[len("/api/traces/"):])
             trace = get_trace(store, trace_id)
             if trace is None:
                 self._send_json({"error": "trace not found"}, 404)
