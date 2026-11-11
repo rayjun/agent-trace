@@ -162,6 +162,9 @@ session picker, **not** a guess based on the most recently active session.
 - Enter: drill down; Space: fold/unfold a tree node; e: toggle error spans.
 - b or Esc: back; q: close from any page; r: refresh the current snapshot.
 - In call details, i/o/x jump to input/output/error; g returns to metadata.
+- / opens literal, case-insensitive find; Enter applies, Esc cancels. In details, n/N moves to the next/previous matching row (wrapping around). Clear find with /, Ctrl+u, Enter.
+
+List search covers full IDs, adapter, model, status, name, and working directory in the **loaded snapshot only** (the picker still loads at most 200 sessions). Searching a tree includes folded children without destroying the fold state. Detail find also matches phrases spanning display wraps, within the displayed capture limits; at most 1,000 matching rows are tracked. Back restores parent selection and filters. Refresh follows the selected record by ID, not row number; if it disappears, the UI explicitly warns before resetting selection.
 
 The picker loads up to 200 recent sessions, explicitly labelled; session
 requests use the full selected ID. The explorer is a **manual-refresh snapshot**,

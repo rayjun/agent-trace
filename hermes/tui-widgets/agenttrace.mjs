@@ -244,7 +244,8 @@ export function explorerInit(arg = '') {
   try {
     return { base: normalizeBase(address), page: sessionId ? 'turns' : 'sessions', sessionId,
       traceId: '', selected: 0, scroll: 0, collapsed: [], errorsOnly: false,
-      loading: true, error: '', data: null, revision: 0 }
+      loading: true, error: '', data: null, revision: 0, query: '', searching: false,
+      searchDraft: '', history: [], notice: '' }
   } catch { return null }
 }
 
@@ -302,32 +303,120 @@ export function spanTree(spans, collapsed = []) {
 
 export function explorerItems(state) {
   if (!state.data) return []
-  if (state.page === 'sessions') return state.data.sessions
-  if (state.page === 'turns') return state.data.turns
-  const tree = spanTree(state.data.spans, state.collapsed)
-  return state.errorsOnly ? tree.filter(s => ['error', 'cancelled', 'interrupted'].includes(s.status)) : tree
+  let items
+  if (state.page === 'sessions') items = state.data.sessions
+  else if (state.page === 'turns') items = state.data.turns
+  else {
+    items = spanTree(state.data.spans, state.query && state.page !== 'detail' ? [] : state.collapsed)
+    if (state.errorsOnly) items = items.filter(s => ['error', 'cancelled', 'interrupted'].includes(s.status))
+  }
+  const query = state.page === 'detail' ? '' : (state.query ?? '').toLocaleLowerCase()
+  return query ? items.filter(item => [item.session_id, item.trace_id, item.span_id, item.adapter_id,
+    item.name, item.model, item.status, item.kind, item.cwd].some(value =>
+    value != null && terminalSafe(value).toLocaleLowerCase().includes(query))) : items
 }
 
+const recordKey = item => item?.span_id ?? item?.trace_id ?? item?.session_id
+const bookmark = state => ({ page: state.page, sessionId: state.sessionId, traceId: state.traceId,
+  selected: state.selected, anchor: recordKey(explorerItems(state)[state.selected]), scroll: state.scroll,
+  spanId: state.spanId, query: state.query ?? '', collapsed: state.collapsed,
+  errorsOnly: state.errorsOnly })
+
 const navigateExplorer = (state, page, fields = {}) => ({ ...state, page, selected: 0, scroll: 0,
-  collapsed: [], errorsOnly: false, data: null, error: '', loading: true, ...fields })
+  query: '', searchDraft: '', searching: false, notice: '', anchor: undefined, matchRow: null,
+  collapsed: [], errorsOnly: false, data: null, error: '', loading: true,
+  history: [...(state.history ?? []), bookmark(state)], ...fields })
+
+export function applyExplorerData(state, data) {
+  if (state.page === 'detail') return { ...state, data, loading: false, error: '', anchor: undefined,
+    notice: data.spans.some(span => span.span_id === state.spanId) ? '' : 'displayed span missing; refresh or go back' }
+  const anchor = state.anchor ?? recordKey(explorerItems(state)[state.selected])
+  const items = explorerItems({ ...state, data })
+  const found = anchor == null ? -1 : items.findIndex(item => recordKey(item) === anchor)
+  return { ...state, data, loading: false, error: '', anchor: undefined,
+    selected: found >= 0 ? found : anchor != null ? 0 : Math.max(0, Math.min(state.selected, items.length - 1)),
+    notice: anchor != null && found < 0 ? 'previous record missing; selection reset' : '' }
+}
+
+const detailLines = (state, width = state.detailWidth ?? 40) =>
+  spanDetails(state.data?.spans.find(s => s.span_id === state.spanId), width)
+
+export function detailMatches(state, width = state.detailWidth ?? 40) {
+  const query = state.query ?? ''
+  if (!query || !state.data) return []
+  const span = state.data.spans.find(s => s.span_id === state.spanId)
+  const logical = spanLogicalLines(span)
+  const escaped = Array.from(query).map(char => '\\^$.*+?()[]{}|'.includes(char) ? '\\' + char : char).join('')
+  const expression = new RegExp(escaped, 'giu')
+  const found = new Set()
+  let base = 0
+  for (const line of logical) {
+    const rows = wrapExplorer(line, width)
+    let row = 0, end = rows[0]?.length ?? 0
+    for (const match of line.matchAll(expression)) {
+      while (row < rows.length - 1 && match.index >= end) end += rows[++row].length
+      found.add(base + row)
+      if (found.size >= 1000) return [...found]
+    }
+    base += rows.length
+  }
+  return [...found]
+}
+
+function moveDetailMatch(state, backwards = false, first = false) {
+  const hits = detailMatches(state)
+  if (!hits.length) return { ...state, notice: 'no matching lines in captured detail' }
+  const position = state.matchRow ?? state.scroll
+  const target = first ? hits[0] : backwards
+    ? [...hits].reverse().find(row => row < position) ?? hits.at(-1)
+    : hits.find(row => row > position) ?? hits[0]
+  const maximum = Math.max(0, detailLines(state).length - (state.detailHeight ?? 1))
+  return { ...state, scroll: Math.min(target, maximum), matchRow: target, notice: '' }
+}
 
 export function explorerReduce(state, { ch = '', key = {} }) {
+  if (state.searching) {
+    if (key.escape) return { ...state, searching: false, searchDraft: '' }
+    if (key.return) {
+      const next = { ...state, searching: false, query: state.searchDraft, selected: 0, scroll: 0, matchRow: null, notice: '' }
+      return next.page === 'detail' && next.query ? moveDetailMatch(next, false, true) : next
+    }
+    if (key.backspace || key.delete) {
+      const parts = [...graphemes.segment(state.searchDraft)]
+      return { ...state, searchDraft: parts.slice(0, -1).map(part => part.segment).join('') }
+    }
+    if (key.ctrl && ch.toLowerCase() === 'u') return { ...state, searchDraft: '' }
+    if (key.ctrl || key.meta || key.upArrow || key.downArrow || key.leftArrow || key.rightArrow) return state
+    const text = terminalSafe(ch).replace(/[\n\t]/g, ' ')
+    return text ? { ...state, searchDraft: Array.from(state.searchDraft + text).slice(0, 256).join('') } : state
+  }
+  if (ch.startsWith('/') && !key.ctrl && !key.meta) return { ...state, searching: true,
+    searchDraft: ch.length === 1 ? state.query ?? '' : Array.from(terminalSafe(ch.slice(1)).replace(/[\n\t]/g, ' ')).slice(0, 256).join('') }
   if (ch === 'q') return null
   if (key.escape || ch === 'b' || key.backspace) {
+    const history = state.history ?? []
+    if (history.length) {
+      const previous = history.at(-1)
+      const same = explorerResource(previous) === explorerResource(state)
+      const restored = { ...state, ...previous, history: history.slice(0, -1), searching: false,
+        notice: '', error: '', anchor: previous.anchor,
+        data: same ? state.data : null, loading: same ? state.loading : true }
+      return same && state.data ? applyExplorerData(restored, state.data) : restored
+    }
     if (state.page === 'sessions') return null
-    if (state.page === 'detail') return { ...state, page: 'spans', scroll: 0 }
-    return navigateExplorer(state, state.page === 'spans' ? 'turns' : 'sessions')
+    return { ...navigateExplorer(state, state.page === 'detail' ? 'spans' : state.page === 'spans' ? 'turns' : 'sessions'), history: [] }
   }
   if (ch === 'r') return { ...state, revision: state.revision + 1, loading: true, error: '' }
   if (state.loading || state.error) return state
   const items = explorerItems(state)
   if (state.page === 'detail') {
     const delta = key.pageDown ? 10 : key.pageUp ? -10 : key.downArrow || ch === 'j' ? 1 : key.upArrow || ch === 'k' ? -1 : 0
-    const lines = spanDetails(state.data.spans.find(s => s.span_id === state.spanId), state.detailWidth ?? 40)
+    if (ch === 'n' || ch === 'N') return moveDetailMatch(state, ch === 'N')
+    const lines = detailLines(state)
     const maxScroll = Math.max(0, lines.length - (state.detailHeight ?? 1))
     const section = { i: '[input]', o: '[output]', x: '[error]', g: '[span]' }[ch]
-    if (section) return { ...state, scroll: Math.min(maxScroll, Math.max(0, lines.indexOf(section))) }
-    return delta ? { ...state, scroll: Math.max(0, Math.min(maxScroll, state.scroll + delta)) } : state
+    if (section) return { ...state, matchRow: null, scroll: Math.min(maxScroll, Math.max(0, lines.indexOf(section))) }
+    return delta ? { ...state, matchRow: null, scroll: Math.max(0, Math.min(maxScroll, state.scroll + delta)) } : state
   }
   if (ch === 'e' && state.page === 'spans') return { ...state, errorsOnly: !state.errorsOnly, collapsed: [], selected: 0 }
   const delta = key.pageDown ? 10 : key.pageUp ? -10 : key.downArrow || ch === 'j' ? 1 : key.upArrow || ch === 'k' ? -1 : 0
@@ -342,7 +431,7 @@ export function explorerReduce(state, { ch = '', key = {} }) {
   if (key.return) {
     if (state.page === 'sessions') return navigateExplorer(state, 'turns', { sessionId: item.session_id })
     if (state.page === 'turns') return navigateExplorer(state, 'spans', { traceId: item.trace_id })
-    return { ...state, page: 'detail', spanId: item.span_id, scroll: 0 }
+    return navigateExplorer(state, 'detail', { spanId: item.span_id, data: state.data, loading: false })
   }
   return state
 }
@@ -385,7 +474,7 @@ export function wrapExplorer(value, width) {
   return result
 }
 
-export function spanDetails(span, width) {
+function spanLogicalLines(span) {
   if (!span) return ['span not found in snapshot; press b then r']
   const output = []
   for (const [label, value] of [
@@ -394,12 +483,16 @@ export function spanDetails(span, width) {
     ['model', span.model], ['tokens', span.tokens], ['input', span.input], ['output', span.output],
     ['error', span.error], ['privacy', span.privacy]
   ]) {
-    output.push(...wrapExplorer(`[${label}]`, width))
+    output.push(`[${label}]`)
     const text = value == null ? '(not captured)' : typeof value === 'string' ? value : JSON.stringify(value, null, 2)
-    output.push(...wrapExplorer(text.slice(0, 100000), width))
+    output.push(...terminalSafe(text.slice(0, 100000)).replace(/\t/g, '  ').split('\n'))
     if (text.length > 100000) output.push('(section truncated at 100000 characters)')
   }
   return output
+}
+
+export function spanDetails(span, width) {
+  return spanLogicalLines(span).flatMap(line => wrapExplorer(line, width))
 }
 
 export function explorerRows(state, width, height) {
@@ -411,7 +504,7 @@ export function explorerRows(state, width, height) {
     return lines.slice(start, start + height)
   }
   const items = explorerItems(state)
-  if (!items.length) return [state.errorsOnly ? 'No error spans in this trace.' : 'No indexed records in this scope.']
+  if (!items.length) return [state.query ? 'No matches in loaded records.' : state.errorsOnly ? 'No error spans in this trace.' : 'No indexed records in this scope.']
   const start = Math.max(0, state.selected - height + 1)
   return items.slice(start, start + height).map((item, i) => {
     const marker = start + i === state.selected ? '> ' : '  '
@@ -421,6 +514,15 @@ export function explorerRows(state, width, height) {
     else line = `${'  '.repeat(Math.min(item.depth, 8))}${item.hasChildren ? state.collapsed.includes(item.span_id) ? '+ ' : '- ' : '  '}${item.kind} ${item.status} ${fmtDur(item.duration_ms)} ${item.name}`
     return wrapExplorer(marker + line, width)[0]
   })
+}
+
+export function explorerSearchStatus(state, width = 100) {
+  if (state.searching) return `find> ${wrapExplorer(state.searchDraft + '_', Math.max(2, width - 6)).at(-1)}`
+  if (state.notice) return state.notice
+  if (!state.query) return ''
+  if (state.page !== 'detail') return `/${state.query} | ${explorerItems(state).length} loaded matches | / edit`
+  const count = detailMatches(state).length
+  return `/${state.query} | ${count === 1000 ? '>=1000' : count} matching rows | n/N next/previous`
 }
 
 function registerExplorer(sdk) {
@@ -438,8 +540,7 @@ function registerExplorer(sdk) {
         if (!active) return
         updateWidget(app, current => {
           if (explorerResource(current) !== resource || current.revision !== state.revision) return current
-          return { ...current, data, loading: false, error: '',
-            selected: Math.max(0, Math.min(current.selected, explorerItems({ ...current, data }).length - 1)) }
+          return applyExplorerData(current, data)
         })
       }).catch(error => {
         if (active) updateWidget(app, current => explorerResource(current) === resource && current.revision === state.revision
@@ -468,8 +569,8 @@ function registerExplorer(sdk) {
         h(Text, { color: t.color.label }, wrapExplorer(`agent-trace / ${state.page} ${state.errorsOnly ? '[errors]' : ''}`, width - 6)[0]),
         h(Text, { color: t.color.muted }, wrapExplorer(scope, width - 6)[0]),
         h(ExplorerBody, { state, width: width - 6, height, t }),
-        h(Text, { color: t.color.muted }, wrapExplorer(width < 46 ? 'j/k Enter b q' : `${state.page === 'detail' ? 'j/k scroll' : `j/k select ${count ? state.selected + 1 : 0}/${count}`} | Enter open | b back | q close`, width - 6)[0]),
-        h(Text, { color: t.color.muted }, wrapExplorer(state.page === 'detail' ? 'i input | o output | x error | r refresh' : width < 46 ? 'r refresh e errors' : 'r refresh | Space fold | e errors | snapshot (not live)', width - 6)[0])
+        h(Text, { color: t.color.muted }, wrapExplorer(state.searching ? 'Enter apply | Esc cancel' : width < 46 ? 'j/k Enter b q /' : `${state.page === 'detail' ? 'j/k scroll' : `j/k select ${count ? state.selected + 1 : 0}/${count}`} | Enter open | b back | q close | / find`, width - 6)[0]),
+        h(Text, { color: t.color.muted }, wrapExplorer(explorerSearchStatus(state, width - 6) || (state.page === 'detail' ? 'i input | o output | x error | / find | r refresh' : width < 46 ? 'r refresh e errors' : 'r refresh | Space fold | e errors | snapshot (not live)'), width - 6)[0])
       ))
     }
   })

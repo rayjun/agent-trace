@@ -37,6 +37,7 @@ run "adapter coverage"      python3 test/coverage.test.py
 run "workspace snapshot"    python3 test/workspace.test.py
 run "Hermes dock widget"    node --test test/hermes-widget.test.mjs
 run "Hermes trace explorer" node --test test/trace-explorer.test.mjs
+run "Hermes explorer search" node --test test/trace-explorer-search.test.mjs
 run "dashboard routing"     node    test/dashboard-routing.test.mjs
 run "README diagrams"       node    test/readme-diagram.test.mjs
 run "hardening"             python3 test/hardening.test.py
