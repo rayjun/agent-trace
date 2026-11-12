@@ -38,6 +38,10 @@ run "workspace snapshot"    python3 test/workspace.test.py
 run "Hermes dock widget"    node --test test/hermes-widget.test.mjs
 run "Hermes trace explorer" node --test test/trace-explorer.test.mjs
 run "Hermes explorer search" node --test test/trace-explorer-search.test.mjs
+run "TUI live monitor"      node --test test/tui-monitor.test.mjs
+run "TUI query API"         python3 test/tui-api.test.py
+run "TUI service/export"    python3 test/service-tools.test.py
+run "TUI cold-start health" python3 test/service-startup.test.py
 run "dashboard routing"     node    test/dashboard-routing.test.mjs
 run "README diagrams"       node    test/readme-diagram.test.mjs
 run "hardening"             python3 test/hardening.test.py

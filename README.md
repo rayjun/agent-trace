@@ -130,19 +130,33 @@ Minimum supported terminal width: 24 columns.
 ambient card without taking the composer's keyboard. Named profiles can be
 installed explicitly with `./install.sh hermes <profile>`.
 
-The card is **all indexed agents**, not automatically the current conversation.
-Turn/token/error totals are lifetime index totals; `spanErr` counts error/interrupted/cancelled spans,
-not failed turns. `p50/N` and the trend use known completed durations among
-the newest 24 turns (`N` is the actual sample size). Running/missing durations
-are excluded, and `new` (latest started trace, not latest activity) shows the API's status rather than labelling every
-non-OK status as failed. Durations are recorded wall-time spans, not live elapsed time or active compute time. This is a glance panel, not a trace-tree browser.
+The card defaults to **all indexed agents**, not automatically the current conversation.
+In `/tracex`, press **p** to pin it to the selected session, or **G** to return to global scope.
+You can also use `/agenttrace session <session-id> [server-url]` and `/agenttrace global [server-url]`.
+The pin lasts for the current TUI process. Click the card to open its session (or the global picker).
+Totals use the displayed scope; `spanErr` counts error/interrupted/cancelled spans, not failed turns.
+`p50/N` and the trend use completed known durations among the newest 24 turns. Unknown durations
+are excluded; `new` means latest started, not latest activity. Recorded wall-time is not active compute time.
 
-The local backend must be running: `agenttrace serve --daemon`. Polls wait
-2.5 seconds after completion, never overlap, and abort when the card closes.
-HTTP failures cannot masquerade as zero totals. Token rotation triggers one
-reauthentication attempt. Failed refreshes keep the last good values with a
-`STALE` age; all phases reserve four rows, and narrow terminals use compact
-rows. A timeout means only that the server timed out, not proof of indexing.
+For a supervised Linux backend, run these from the repository:
+
+```bash
+python3 scripts/agenttrace-service.py install --dry-run
+python3 scripts/agenttrace-service.py install
+python3 scripts/agenttrace-service.py status
+# Remove only this managed service:
+python3 scripts/agenttrace-service.py uninstall
+```
+
+This installs a loopback-only systemd **user** service with restart-on-failure and private file permissions.
+`status` reports whether lingering is enabled; without it, boot/logout operation needs administrator setup.
+Do not run this and a manually started daemon on the same port. Other platforms can use
+`agenttrace serve --daemon`. Installing the widget does not automatically install the service.
+
+Health is served while initial indexing runs. The card shows `indexing`, ingestion problem counts,
+or empty indexed data distinctly. Polls wait 2.5 seconds after completion, never overlap, and abort
+on close. HTTP errors never become zero totals; authentication refresh is bounded. Failures preserve
+the last good values with a `STALE` age. All card phases use four rows. A timeout alone does not prove indexing.
 
 `/widgets-reload` rescans installed widget copies. Repo edits must first be
 copied to `<HERMES_HOME>/tui-widgets/agenttrace.mjs`; the installer checks drift.
@@ -164,15 +178,37 @@ session picker, **not** a guess based on the most recently active session.
 - In call details, i/o/x jump to input/output/error; g returns to metadata.
 - / opens literal, case-insensitive find; Enter applies, Esc cancels. In details, n/N moves to the next/previous matching row (wrapping around). Clear find with /, Ctrl+u, Enter.
 
-List search covers full IDs, adapter, model, status, name, and working directory in the **loaded snapshot only** (the picker still loads at most 200 sessions). Searching a tree includes folded children without destroying the fold state. Detail find also matches phrases spanning display wraps, within the displayed capture limits; at most 1,000 matching rows are tracked. Back restores parent selection and filters. Refresh follows the selected record by ID, not row number; if it disappears, the UI explicitly warns before resetting selection.
+`/` searches the **loaded snapshot only**. In the session picker, **f** searches the entire index
+by ID/model/working directory/adapter; **a**, **M**, and **t** set exact agent, exact model, and
+last-activity-since (ISO date/time) filters. Left/Right changes pages of 50 sessions; the header
+shows the indexed total. Clear each filter with its editor, Ctrl+u, Enter. Backend search is literal,
+including `%` and `_`; it is not full payload search. Tree find includes folded children without
+losing fold state. Detail find crosses display wraps, tracks at most 1,000 matching rows, and preserves whitespace.
 
-The picker loads up to 200 recent sessions, explicitly labelled; session
-requests use the full selected ID. The explorer is a **manual-refresh snapshot**,
-not a live stream. The dock remains live independently. Chinese and emoji in
-captured payloads are preserved, terminal controls are stripped, and unknown
-values say `(not captured)`. Each detail section is bounded at 100,000
-characters and visibly marked if truncated. Closing or navigating away aborts
-pending fetches; stale replies cannot replace the new page.
+Press **l** for live/pause, **m** for the selected session's diagnostics, **v** in detail for full-capture
+export instructions, and **?** for help. The default is a paused snapshot; live mode polls after completion,
+preserves selected record IDs, and does not replace data while a find editor is open. Failures keep
+last-good data visibly stale. Back preserves filters and selection, reloading lightweight tree metadata
+when returning from a call. Late replies cannot replace a new resource or refresh revision.
+
+Diagnostics separate LLM/tool measured call latency (p50, p95, max and sample counts), list the ten
+slowest calls, and show token/cache-read totals. p95 requires five samples. Synthetic/unclosed or
+unknown-duration calls do not become latency samples. These are not TTFT figures; costs and throughput
+are not guessed. Unknown token components remain unknown.
+
+The tree fetches metadata only; opening a call fetches that one payload. Wrapped rows and find results
+are bounded caches keyed by immutable record identity. Chinese/emoji are preserved, terminal controls
+are removed, and each displayed detail section is bounded at 100,000 characters with visible truncation.
+To export the full **stored** single-span capture (without disabling capture-time redaction), use the
+command shown by **v**, or run from the repository:
+
+```bash
+python3 scripts/export-span.py --trace TRACE_ID --span SPAN_ID --output span.json
+```
+
+The helper only contacts loopback HTTP, reads the existing local token, verifies both IDs, refuses
+redirects/overwrite, and creates the output with mode `0600`. Captures can contain sensitive data.
+
 
 ## Evaluation
 

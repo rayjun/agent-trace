@@ -81,7 +81,7 @@ test('back restores filter and selected identity even when parent data reorders'
   assert.equal(explorerItems(s)[s.selected].session_id, 'alpha')
 })
 
-test('returning from call detail restores exact tree selection and filter without refetch', () => {
+test('returning from lazy call detail reloads metadata and restores exact selection and filter', () => {
   let s = { ...ready(), page: 'spans', query: 'tool', data: { spans: [
     { span_id: 'a', kind: 'tool', name: 'first' }, { span_id: 'b', kind: 'tool', name: 'second' }
   ] }, selected: 1 }
@@ -91,6 +91,8 @@ test('returning from call detail restores exact tree selection and filter withou
   assert.equal(s.query, '')
   assert.equal(s.spanId, 'b')
   s = key(s, 'b')
+  assert.equal(s.loading, true)
+  s = applyExplorerData(s, data)
   assert.equal(s.selected, 1)
   assert.equal(s.query, 'tool')
   assert.equal(s.loading, false)
@@ -156,18 +158,18 @@ test('detail refresh follows displayed span identity; back resolves parent bookm
   s = applyExplorerData(s, { spans: [b, a] })
   assert.equal(s.spanId, 'b')
   assert.equal(s.notice, '')
-  s = key(s, 'b')
+  s = applyExplorerData(key(s, 'b'), { spans: [b, a] })
   assert.equal(explorerItems(s)[s.selected].span_id, 'b')
   s = key(initial, '', { return: true })
   s = applyExplorerData(s, { spans: [b] })
   assert.equal(s.notice, '')
-  s = key(s, 'b')
+  s = applyExplorerData(key(s, 'b'), { spans: [b, a] })
   assert.equal(explorerItems(s)[s.selected].span_id, 'b')
   s = key(initial, '', { return: true })
   s = applyExplorerData(s, { spans: [a] })
   assert.match(s.notice, /displayed span missing/)
   assert.equal(s.spanId, 'b')
-  s = key(s, 'b')
+  s = applyExplorerData(key(s, 'b'), { spans: [a] })
   assert.match(s.notice, /previous record missing/)
 })
 

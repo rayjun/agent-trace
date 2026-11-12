@@ -39,7 +39,8 @@ SELECT s.trace_id AS trace_id,
        root.name AS root_name,
        root.status AS root_status
 FROM spans s
-LEFT JOIN spans root ON root.span_id = s.trace_id AND root.kind = 'task'
+LEFT JOIN spans root ON root.span_id = s.trace_id
+    AND root.trace_id = s.trace_id AND root.kind = 'task'
 GROUP BY s.trace_id
 """
 
@@ -113,7 +114,24 @@ def list_traces(store: TraceStore, *, agent: str | None = None,
     return {"total": total, "traces": [_row_to_trace(r) for r in rows]}
 
 
-def get_trace(store: TraceStore, trace_id: str) -> dict[str, Any] | None:
+# Deliberately explicit: summary/metrics must never fetch payload columns.
+_SPAN_METADATA = (
+    "span_id, trace_id, session_id, parent_span_id, kind, name, status,"
+    " start_ts, end_ts, duration_ms, model, input_tokens, output_tokens,"
+    " cache_read_tokens, agent_version, synthetic, ended"
+)
+
+
+def get_trace(store: TraceStore, trace_id: str, *,
+              summary: bool = False) -> dict[str, Any] | None:
+    if summary:
+        rows = store.query(
+            f"SELECT {_SPAN_METADATA} FROM spans WHERE trace_id = ?"
+            " ORDER BY COALESCE(start_ts, end_ts), rowid", (trace_id,))
+        if not rows:
+            return None
+        return {"trace_id": trace_id, "session_id": rows[0]["session_id"],
+                "spans": [_row_to_span_metadata(r) for r in rows]}
     rows = store.query(
         "SELECT * FROM spans WHERE trace_id = ?"
         " ORDER BY COALESCE(start_ts, end_ts), rowid", (trace_id,))
@@ -225,8 +243,7 @@ def _session_workspace(store: TraceStore, session_id: str | None,
     return candidates[0]
 
 
-def _row_to_span(row: sqlite3.Row) -> dict[str, Any]:
-    attrs = _load(row["attributes_json"])
+def _row_to_span_metadata(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "span_id": row["span_id"],
         "parent_span_id": row["parent_span_id"],
@@ -246,30 +263,74 @@ def _row_to_span(row: sqlite3.Row) -> dict[str, Any]:
             "output": row["output_tokens"],
             "cache_read": row["cache_read_tokens"],
         },
-        "input": _load(row["input_json"]),
-        "output": _load(row["output_json"]),
-        "error": _load(row["error_json"]),
-        "attributes": attrs,
-        "privacy": _load(row["privacy_json"]),
-        "source": _load(row["source_json"]),
-        "resource": _load(row["resource_json"]),
         "agent_version": row["agent_version"],
         "synthetic": bool(row["synthetic"]),
         "ended": bool(row["ended"]),
     }
 
 
-def list_sessions(store: TraceStore, *, limit: int = 100) -> dict[str, Any]:
+def _row_to_span(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        **_row_to_span_metadata(row),
+        **{key: _load(row[key + "_json"]) for key in
+           ("input", "output", "error", "attributes", "privacy", "source", "resource")},
+    }
+
+
+def get_span(store: TraceStore, trace_id: str, span_id: str) -> dict[str, Any] | None:
+    row = store.one("SELECT * FROM spans WHERE trace_id = ? AND span_id = ?",
+                    (trace_id, span_id))
+    if row is None:
+        return None
+    span = _row_to_span(row)
+    begin, finish = span["start"], span["end"]
+    if begin and finish:
+        other = store.one(
+            "SELECT 1 FROM (SELECT MIN(start_ts) AS start_ts FROM spans"
+            " WHERE session_id = ? AND trace_id != ? AND start_ts IS NOT NULL"
+            " GROUP BY trace_id) WHERE start_ts > ? AND start_ts < ? LIMIT 1",
+            (row["session_id"], trace_id, begin, finish))
+        span["duration_suspect"] = other is not None
+    return {**span, "trace_id": row["trace_id"], "session_id": row["session_id"]}
+
+
+def list_sessions(store: TraceStore, *, limit: int = 100, offset: int = 0,
+                  search: str | None = None, agent: str | None = None,
+                  model: str | None = None, since: str | None = None) -> dict[str, Any]:
+    limit, offset = min(200, max(0, limit)), max(0, offset)
+    where: list[str] = []
+    params: list[Any] = []
+    if search:
+        # LIKE metacharacters are literal user text, including the escape itself.
+        literal = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        where.append("(" + " OR ".join(
+            f"s.{column} LIKE ? ESCAPE '\\'" for column in
+            ("session_id", "model", "cwd", "adapter_id")) + ")")
+        params.extend([f"%{literal}%"] * 4)
+    for column, value in (("adapter_id", agent), ("model", model)):
+        if value:
+            where.append(f"s.{column} = ?")
+            params.append(value)
+    if since:
+        where.append("s.last_ts >= ?")
+        params.append(since)
+    clause = " WHERE " + " AND ".join(where) if where else ""
+    total_row = store.one("SELECT COUNT(*) AS n FROM sessions s" + clause,
+                          tuple(params))
+    total = total_row["n"] if total_row else 0
     rows = store.query(
         "SELECT s.*, "
         " (SELECT COUNT(DISTINCT trace_id) FROM spans sp"
         "   WHERE sp.session_id = s.session_id) AS trace_count,"
-        " (SELECT COALESCE(SUM(sp.input_tokens),0) FROM spans sp"
+        " (SELECT SUM(sp.input_tokens) FROM spans sp"
         "   WHERE sp.session_id = s.session_id) AS input_tokens,"
-        " (SELECT COALESCE(SUM(sp.output_tokens),0) FROM spans sp"
+        " (SELECT SUM(sp.output_tokens) FROM spans sp"
         "   WHERE sp.session_id = s.session_id) AS output_tokens"
-        " FROM sessions s ORDER BY last_ts DESC LIMIT ?", (limit,))
-    return {"sessions": [
+        " FROM sessions s" + clause +
+        " ORDER BY last_ts DESC, s.session_id, s.adapter_id LIMIT ? OFFSET ?",
+        tuple(params) + (limit, offset))
+    return {"total": total, "limit": limit, "offset": offset,
+            "has_more": offset + len(rows) < total, "sessions": [
         {
             "session_id": r["session_id"],
             "adapter_id": r["adapter_id"],
@@ -281,6 +342,57 @@ def list_sessions(store: TraceStore, *, limit: int = 100) -> dict[str, Any]:
             "trace_count": r["trace_count"],
             "tokens": {"input": r["input_tokens"], "output": r["output_tokens"]},
         } for r in rows]}
+
+
+def session_metrics(store: TraceStore, session_id: str) -> dict[str, Any] | None:
+    """Session-scoped counters and measured work, never synthetic root latency.
+
+    Unknown token components stay null independently. Latencies use nearest-rank
+    percentiles over positive, finite, ended, non-synthetic measurements only.
+    """
+    import math
+
+    rows = store.query(f"SELECT {_SPAN_METADATA} FROM spans WHERE session_id = ?",
+                       (session_id,))
+    if not rows and store.one("SELECT 1 FROM sessions WHERE session_id = ?",
+                              (session_id,)) is None:
+        return None
+    measured = [r for r in rows if r["ended"] and not r["synthetic"]
+                and isinstance(r["duration_ms"], (int, float))
+                and math.isfinite(r["duration_ms"]) and r["duration_ms"] > 0]
+
+    def latency(kind: str) -> dict[str, Any]:
+        values = sorted(r["duration_ms"] for r in measured if r["kind"] == kind)
+        n = len(values)
+        return {"n": n, "p50_ms": values[math.ceil(n * .50) - 1] if n else None,
+                "p95_ms": values[math.ceil(n * .95) - 1] if n >= 5 else None,
+                "max_ms": values[-1] if n else None}
+
+    tokens = {}
+    for key, column in (("input", "input_tokens"), ("output", "output_tokens"),
+                        ("cache_read", "cache_read_tokens")):
+        values = [r[column] for r in rows if r[column] is not None]
+        tokens[key] = sum(values) if values else None
+    recent_sql = _TRACE_SELECT.replace(
+        "GROUP BY s.trace_id", "WHERE s.session_id = ? GROUP BY s.trace_id")
+    for column in ("input_tokens", "output_tokens", "cache_read_tokens"):
+        recent_sql = recent_sql.replace(f"SUM(COALESCE(s.{column}, 0))",
+                                        f"SUM(s.{column})")
+    recent = store.query(recent_sql +
+                         " ORDER BY first_ts DESC, s.trace_id LIMIT 24", (session_id,))
+    slowest = sorted(measured, key=lambda r: (-r["duration_ms"], r["trace_id"],
+                                             r["span_id"]))[:10]
+    return {
+        "session_id": session_id,
+        "traces": len({r["trace_id"] for r in rows}), "spans": len(rows),
+        "errors": sum(r["status"] in ("error", "interrupted", "cancelled")
+                      and not r["synthetic"] for r in rows),
+        "unclosed": sum(not r["ended"] and not r["synthetic"] for r in rows),
+        "tokens": tokens, "llm": latency("llm"), "tools": latency("tool"),
+        "slowest": [{**_row_to_span_metadata(r), "trace_id": r["trace_id"],
+                     "session_id": r["session_id"]} for r in slowest],
+        "recent_traces": [_row_to_trace(r) for r in recent],
+    }
 
 
 def session_detail(store: TraceStore, session_id: str) -> dict[str, Any] | None:

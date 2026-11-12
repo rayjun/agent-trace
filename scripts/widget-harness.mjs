@@ -125,8 +125,8 @@ cursor = 0
 print('loading', bodyEl.type(bodyEl.props))
 
 // Phase 2: run the polling effect against the live server, then re-render.
-const effect = hooks.find(fn => typeof fn === 'function')
-const cleanup = effect()
+const cleanups = hooks.filter(fn => typeof fn === 'function').map(effect => effect()).filter(fn => typeof fn === 'function')
+const cleanup = () => cleanups.forEach(fn => fn())
 try {
   for (let i = 0; i < 200 && hooks[0]?.kind === 'loading'; i++) {
     await new Promise(resolve => setTimeout(resolve, 50))

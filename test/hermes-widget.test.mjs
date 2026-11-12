@@ -29,7 +29,7 @@ async function fixture(fn) {
       res.writeHead(401); res.end('{"error":"unauthorized"}'); return
     }
     res.writeHead(status, { 'Content-Type': 'application/json' })
-    res.end(JSON.stringify(malformed ? {} : req.url.startsWith('/api/overview') ? totals : { traces: turns }))
+    res.end(JSON.stringify(malformed ? {} : req.url.startsWith('/api/overview') ? totals : req.url === '/api/health' ? { building: false, last_scan: { problems: 0 } } : { traces: turns }))
   })
   await new Promise(r => server.listen(0, '127.0.0.1', r))
   try {
@@ -67,7 +67,7 @@ test('API: HTTP failures and bad schemas are errors, never a successful zero car
     control.fail(503)
     await assert.rejects(snapshot(base), /HTTP 503/)
     control.fail(200); control.malformed()
-    await assert.rejects(snapshot(base), /invalid server response/)
+    await assert.rejects(snapshot(base), /invalid server (health )?response/)
   })
 })
 
@@ -183,6 +183,7 @@ test('real HTTP: persistent 401 retries once and cancels pending siblings', asyn
     if (req.url === '/') {
       roots++; res.end('window.__AGENTTRACE_TOKEN__ = "fixture-rejected"'); return
     }
+    if (req.url === '/api/health') { res.end(JSON.stringify({ building: false })); return }
     if (req.url.startsWith('/api/traces')) {
       pending++; res.on('close', () => { closed++ }); return
     }

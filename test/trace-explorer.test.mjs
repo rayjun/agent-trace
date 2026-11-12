@@ -38,7 +38,7 @@ test('navigation: sessions -> exact turns -> tree -> details -> back -> close', 
   state = { ...state, loading: false, data: { turns: [{ trace_id: 'trace/a' }] } }
   state = key(state, '', { return: true })
   assert.equal(state.page, 'spans'); assert.equal(state.traceId, 'trace/a')
-  assert.equal(explorerResource(state), '/api/traces/trace%2Fa')
+  assert.equal(explorerResource(state), '/api/traces/trace%2Fa?summary=1')
   state = { ...state, loading: false, data: { spans } }
   state = key(state, ' ')
   assert.deepEqual(explorerItems(state).map(s => s.span_id), ['root', 'orphan'])
@@ -88,7 +88,7 @@ test('HTTP drilldown: exact session/trace scope and schema/identity checks', asy
     res.setHeader('Content-Type', 'application/json')
     if (req.url.startsWith('/api/sessions?')) res.end(JSON.stringify({ sessions: [{ session_id: 's/a' }] }))
     else if (req.url === '/api/sessions/s%2Fa') res.end(JSON.stringify({ session_id: wrong ? 'other' : 's/a', turns: [{ trace_id: 't' }] }))
-    else if (req.url === '/api/traces/t') res.end(JSON.stringify({ trace_id: 't', spans }))
+    else if (req.url === '/api/traces/t?summary=1') res.end(JSON.stringify({ trace_id: 't', session_id: 's/a', spans }))
     else { res.writeHead(404); res.end('{}') }
   })
   await new Promise(r => server.listen(0, '127.0.0.1', r))

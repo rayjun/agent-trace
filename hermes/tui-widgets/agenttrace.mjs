@@ -49,25 +49,33 @@ async function dashboardToken(base, signal) {
   return match[1]
 }
 
-export async function requestJSON(base, path, { signal } = {}) {
+export async function requestGroup(base, paths, { signal } = {}) {
   base = normalizeBase(base)
   const deadline = AbortSignal.timeout(8000)
   const combined = signal ? AbortSignal.any([signal, deadline]) : deadline
   for (let attempt = 0; attempt < 2; attempt++) {
+    const controller = new AbortController()
+    const attemptSignal = AbortSignal.any([combined, controller.signal])
     try {
-      const token = await dashboardToken(base, combined)
-      const response = await checkedFetch(`${base}${path}`, {
-        signal: combined, headers: { Authorization: `Bearer ${token}` }
-      })
-      return await response.json()
+      const token = await dashboardToken(base, attemptSignal)
+      return await Promise.all(paths.map(async path => {
+        const response = await checkedFetch(`${base}${path}`, {
+          signal: attemptSignal, headers: { Authorization: `Bearer ${token}` }
+        })
+        return response.json()
+      }))
     } catch (error) {
       if (error.status === 401 || error.status === 403) {
         if (tokenCache.base === base) tokenCache = { base: '', token: '' }
         if (attempt === 0) continue
       }
       throw error
-    }
+    } finally { controller.abort() }
   }
+}
+
+export async function requestJSON(base, path, options) {
+  return (await requestGroup(base, [path], options))[0]
 }
 
 function describe(error) {
@@ -83,49 +91,41 @@ function describe(error) {
 
 const finite = value => typeof value === 'number' && Number.isFinite(value) && value >= 0
 
-export async function snapshot(base = DEFAULT_BASE, { signal } = {}) {
+export async function snapshot(base = DEFAULT_BASE, { signal, sessionId = '' } = {}) {
   base = normalizeBase(base)
-  const deadline = AbortSignal.timeout(8000)
-  const requestSignal = signal ? AbortSignal.any([signal, deadline]) : deadline
-  let overview, recent
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const attemptController = new AbortController()
-    const attemptSignal = AbortSignal.any([requestSignal, attemptController.signal])
-    try {
-      const token = await dashboardToken(base, attemptSignal)
-      const headers = { Authorization: `Bearer ${token}` }
-      ;[overview, recent] = await Promise.all([
-        checkedFetch(`${base}/api/overview`, { headers, signal: attemptSignal }).then(r => r.json()),
-        checkedFetch(`${base}/api/traces?limit=${SLOTS}`, { headers, signal: attemptSignal }).then(r => r.json())
-      ])
-      break
-    } catch (error) {
-      if (error.status === 401 || error.status === 403) {
-        if (tokenCache.base === base) tokenCache = { base: '', token: '' }
-        if (attempt === 0) continue
-      }
-      throw error
-    } finally {
-      attemptController.abort()
-    }
-  }
-  if (!overview || !finite(overview.traces) || !finite(overview.spans) ||
-      !finite(overview.errors) || !finite(overview.unclosed) ||
-      !finite(overview.tokens?.input) || !finite(overview.tokens?.output) ||
-      !Array.isArray(recent?.traces) || recent.traces.some(t => !t || typeof t !== 'object')) {
+  const health = await requestJSON(base, '/api/health', { signal })
+  if (typeof health?.building !== 'boolean') throw new Error('invalid server health response')
+  if (health.building) return { updatedAt: Date.now(), sessionId, health,
+    totals: { traces: null, spans: null, errors: null, unclosed: null, inTok: null, outTok: null },
+    durations: [], p50: null, last: null, sampleSize: 0 }
+  const paths = [sessionId ? `/api/sessions/${encodeURIComponent(sessionId)}/metrics` : '/api/overview']
+  if (!sessionId) paths.push(`/api/traces?limit=${SLOTS}`)
+  const [response, globalRecent] = await requestGroup(base, paths, { signal })
+  const recent = sessionId ? { traces: response.recent_traces } : globalRecent
+  if (!response || !finite(response.traces) || !finite(response.spans) ||
+      !finite(response.errors) || !finite(response.unclosed) ||
+      !(response.tokens?.input === null || finite(response.tokens?.input)) || !(response.tokens?.output === null || finite(response.tokens?.output)) ||
+      !Array.isArray(recent?.traces) || recent.traces.some(t => !t || typeof t !== 'object') ||
+      typeof health?.building !== 'boolean' || (sessionId && response.session_id !== sessionId)) {
     throw new Error('invalid server response')
   }
   const turns = recent.traces.slice(0, SLOTS).reverse()
   const durations = turns.filter(t => ['ok', 'error'].includes(t.status) && t.unclosed === 0 && finite(t.duration_ms)).map(t => t.duration_ms)
   return {
-    updatedAt: Date.now(),
-    totals: {
-      traces: overview.traces, spans: overview.spans, errors: overview.errors,
-      unclosed: overview.unclosed, inTok: overview.tokens.input, outTok: overview.tokens.output
-    },
+    updatedAt: Date.now(), sessionId, health,
+    totals: { traces: response.traces, spans: response.spans, errors: response.errors,
+      unclosed: response.unclosed, inTok: response.tokens.input, outTok: response.tokens.output },
     durations, p50: median(durations), last: turns.at(-1) ?? null, sampleSize: durations.length
   }
 }
+
+const scopeListeners = new Set()
+let pinnedScope = { base: DEFAULT_BASE, sessionId: '' }
+export function pinSession(base, sessionId = '') {
+  pinnedScope = { base: normalizeBase(base), sessionId }
+  for (const listener of scopeListeners) listener(pinnedScope)
+}
+export const currentScope = () => ({ ...pinnedScope })
 
 function median(values) {
   const clean = values.filter(v => Number.isFinite(v) && v >= 0).sort((a, b) => a - b)
@@ -140,6 +140,7 @@ function median(values) {
 const clamp = (text, width) => text.length > width ? `${text.slice(0, Math.max(0, width - 1))}~` : text
 
 function fmtTok(n) {
+  if (!finite(n)) return '-'
   if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`
   if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`
   if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`
@@ -190,42 +191,73 @@ export function cardRows(phase, width, sparkline, now = Date.now()) {
   const { snap } = phase
   const { totals, last } = snap
   const stale = phase.kind === 'error'
-  const title = stale ? `STALE ${Math.max(0, Math.floor((now - snap.updatedAt) / 1000))}s` : 'all agents'
+  const title = stale ? `STALE ${Math.max(0, Math.floor((now - snap.updatedAt) / 1000))}s`
+    : snap.health?.building ? 'indexing' : snap.sessionId ? `session ${snap.sessionId.slice(0, 12)}` : 'all agents'
   const sample = `p50/${snap.sampleSize} ${fmtDur(snap.p50)}`
   const chartWidth = Math.max(0, Math.min(22, width - sample.length - 1))
   const chart = chartWidth ? sparkline(snap.durations, chartWidth) : ''
   const tokens = width >= 32
     ? `in ${fmtTok(totals.inTok)} out ${fmtTok(totals.outTok)} spanErr ${fmtTok(totals.errors)}`
     : `i ${fmtTok(totals.inTok)} o ${fmtTok(totals.outTok)}`
+  const problems = snap.health?.last_scan?.problems
+  const problemCount = Array.isArray(problems) ? problems.length : finite(problems) ? problems : 0
   const status = !last ? 'no turns yet' : `${last.adapter_id ?? '?'} ${last.status ?? 'unknown'} ${fmtDur(last.duration_ms)}`
   return [pair(title, `${fmtTok(totals.traces)} turns`, width), pair(chart, sample, width),
-    fit(tokens, width), fit(stale ? phase.message : `new ${status}`, width)]
+    fit(tokens, width), fit(stale ? phase.message : problemCount
+      ? `ingest: ${problemCount} problems` : snap.health?.building ? 'indexing trace directories' : `new ${status}`, width)]
 }
 
 export default function register(sdk) {
-  if (sdk.Overlay && sdk.updateWidget) registerExplorer(sdk)
+  let dockApp, explorerApp
+  if (sdk.Overlay && sdk.updateWidget) explorerApp = registerExplorer(sdk, (base, sessionId) => {
+    pinSession(base, sessionId)
+    if (sdk.openWidget) sdk.openWidget(dockApp, { base })
+  })
   const { Box, Dialog, React, ShimmerRows, Text, defineWidgetApp, h, sparkline } = sdk
   function Body({ base, t, width }) {
     const [phase, setPhase] = React.useState({ kind: 'loading' })
-    React.useEffect(() => startPolling(base, setPhase), [base])
+    const [scope, setScope] = React.useState(currentScope)
+    React.useEffect(() => { scopeListeners.add(setScope); return () => scopeListeners.delete(setScope) }, [])
+    const sessionId = scope.base === base ? scope.sessionId : ''
+    React.useEffect(() => {
+      setPhase({ kind: 'loading' })
+      return startPolling(base, setPhase, { load: (address, options) => snapshot(address, { ...options, sessionId }) })
+    }, [base, sessionId])
     if (phase.kind === 'loading') {
       return h(Box, { width, height: 4, flexDirection: 'column' },
         h(ShimmerRows, { color: t.color.muted, highlight: t.color.label,
           rows: Array.from({ length: 4 }, () => [Math.max(1, width - 2)]) }))
     }
-    return h(Box, { width, height: 4, flexDirection: 'column' },
+    return h(Box, { width, height: 4, flexDirection: 'column', onClick: () => {
+      if (explorerApp && sdk.openWidget) sdk.openWidget(explorerApp, explorerInit(`${sessionId} ${base}`.trim()))
+    } },
       ...cardRows(phase, width, sparkline).map((row, i) => h(Text, {
         key: i, wrap: 'truncate', color: phase.kind === 'error' ? t.color.error :
           (i === 0 ? t.color.label : i === 1 ? t.color.primary : t.color.muted)
       }, row)))
   }
-  defineWidgetApp({
+  dockApp = defineWidgetApp({
     id: 'agenttrace', help: 'agent-trace: all-agent totals and recent-turn latency',
     mode: 'ambient', zone: 'dock-bottom', width: 46,
-    usage: `usage: /agenttrace [server-url] default ${DEFAULT_BASE}`,
+    usage: `usage: /agenttrace [global|session ID] [server-url] default ${DEFAULT_BASE}`,
     init(arg) {
-      try { return { base: normalizeBase(arg.trim() || DEFAULT_BASE) } }
-      catch { return null }
+      const args = arg.trim().split(/\s+/).filter(Boolean)
+      try {
+        if (args[0] === 'global') {
+          if (args.length > 2) return null
+          const base = normalizeBase(args[1] || pinnedScope.base)
+          pinSession(base, ''); return { base }
+        }
+        if (args[0] === 'session') {
+          if (!args[1] || args.length > 3) return null
+          const base = normalizeBase(args[2] || DEFAULT_BASE)
+          pinSession(base, args[1]); return { base }
+        }
+        if (args.length > 1) return null
+        const base = normalizeBase(args[0] || pinnedScope.base)
+        if (args.length && base !== pinnedScope.base) pinSession(base, '')
+        return { base }
+      } catch { return null }
     },
     reduce(state) { return state },
     render({ cols, state, t }) {
@@ -245,24 +277,45 @@ export function explorerInit(arg = '') {
     return { base: normalizeBase(address), page: sessionId ? 'turns' : 'sessions', sessionId,
       traceId: '', selected: 0, scroll: 0, collapsed: [], errorsOnly: false,
       loading: true, error: '', data: null, revision: 0, query: '', searching: false,
-      searchDraft: '', history: [], notice: '' }
+      searchDraft: '', history: [], notice: '', live: false, offset: 0, pageSize: 50,
+      filters: { search: '', agent: '', model: '', since: '' }, searchTarget: 'local' }
   } catch { return null }
 }
 
 export function explorerResource(state) {
-  if (state.page === 'sessions') return '/api/sessions?limit=200'
-  if (state.page === 'turns') return `/api/sessions/${encodeURIComponent(state.sessionId)}`
-  return `/api/traces/${encodeURIComponent(state.traceId)}`
+  const session = encodeURIComponent(state.sessionId)
+  if (state.page === 'sessions') {
+    const args = new URLSearchParams({ limit: String(state.pageSize ?? 50), offset: String(state.offset ?? 0) })
+    for (const [name, value] of Object.entries(state.filters ?? {})) if (value) args.set(name, value)
+    return `/api/sessions?${args}`
+  }
+  if (state.page === 'turns') return `/api/sessions/${session}`
+  if (state.page === 'metrics') return `/api/sessions/${session}/metrics`
+  const trace = encodeURIComponent(state.traceId)
+  if (state.page === 'detail') return `/api/traces/${trace}/spans/${encodeURIComponent(state.spanId)}`
+  return `/api/traces/${trace}?summary=1`
 }
 
 export async function loadExplorer(state, options) {
   const data = await requestJSON(state.base, explorerResource(state), options)
-  const key = state.page === 'sessions' ? 'sessions' : state.page === 'turns' ? 'turns' : 'spans'
-  if (!data || !Array.isArray(data[key]) || data[key].some(item => !item || typeof item !== 'object')) {
+  if (state.page === 'detail') {
+    if (!data || data.span_id !== state.spanId || data.trace_id !== state.traceId || data.session_id !== state.sessionId) {
+      throw new Error('span identity mismatch')
+    }
+    return { trace_id: data.trace_id, session_id: data.session_id, spans: [data] }
+  }
+  if (state.page === 'metrics') {
+    if (!data || data.session_id !== state.sessionId || !finite(data.traces) || !Array.isArray(data.slowest)) {
+      throw new Error('invalid metrics response')
+    }
+    return data
+  }
+  const name = state.page === 'sessions' ? 'sessions' : state.page === 'turns' ? 'turns' : 'spans'
+  if (!data || !Array.isArray(data[name]) || data[name].some(item => !item || typeof item !== 'object')) {
     throw new Error('invalid explorer response')
   }
   if (state.page === 'turns' && data.session_id !== state.sessionId) throw new Error('session identity mismatch')
-  if (key === 'spans' && data.trace_id !== state.traceId) throw new Error('trace identity mismatch')
+  if (name === 'spans' && (data.trace_id !== state.traceId || data.session_id !== state.sessionId)) throw new Error('trace identity mismatch')
   return data
 }
 
@@ -302,7 +355,7 @@ export function spanTree(spans, collapsed = []) {
 }
 
 export function explorerItems(state) {
-  if (!state.data) return []
+  if (!state.data || state.page === 'metrics') return []
   let items
   if (state.page === 'sessions') items = state.data.sessions
   else if (state.page === 'turns') items = state.data.turns
@@ -320,20 +373,21 @@ const recordKey = item => item?.span_id ?? item?.trace_id ?? item?.session_id
 const bookmark = state => ({ page: state.page, sessionId: state.sessionId, traceId: state.traceId,
   selected: state.selected, anchor: recordKey(explorerItems(state)[state.selected]), scroll: state.scroll,
   spanId: state.spanId, query: state.query ?? '', collapsed: state.collapsed,
-  errorsOnly: state.errorsOnly })
+  errorsOnly: state.errorsOnly, offset: state.offset, filters: state.filters, updatedAt: state.updatedAt })
 
 const navigateExplorer = (state, page, fields = {}) => ({ ...state, page, selected: 0, scroll: 0,
-  query: '', searchDraft: '', searching: false, notice: '', anchor: undefined, matchRow: null,
-  collapsed: [], errorsOnly: false, data: null, error: '', loading: true,
+  query: '', searchDraft: '', searching: false, notice: '', anchor: undefined, matchRow: null, showExport: false, showHelp: false,
+  collapsed: [], errorsOnly: false, data: null, error: '', loading: true, updatedAt: null,
   history: [...(state.history ?? []), bookmark(state)], ...fields })
 
 export function applyExplorerData(state, data) {
-  if (state.page === 'detail') return { ...state, data, loading: false, error: '', anchor: undefined,
+  if (state.page === 'metrics') return { ...state, data, loading: false, error: '', notice: '', updatedAt: Date.now() }
+  if (state.page === 'detail') return { ...state, data, loading: false, error: '', updatedAt: Date.now(), anchor: undefined,
     notice: data.spans.some(span => span.span_id === state.spanId) ? '' : 'displayed span missing; refresh or go back' }
   const anchor = state.anchor ?? recordKey(explorerItems(state)[state.selected])
   const items = explorerItems({ ...state, data })
   const found = anchor == null ? -1 : items.findIndex(item => recordKey(item) === anchor)
-  return { ...state, data, loading: false, error: '', anchor: undefined,
+  return { ...state, data, loading: false, error: '', updatedAt: Date.now(), anchor: undefined,
     selected: found >= 0 ? found : anchor != null ? 0 : Math.max(0, Math.min(state.selected, items.length - 1)),
     notice: anchor != null && found < 0 ? 'previous record missing; selection reset' : '' }
 }
@@ -345,6 +399,15 @@ export function detailMatches(state, width = state.detailWidth ?? 40) {
   const query = state.query ?? ''
   if (!query || !state.data) return []
   const span = state.data.spans.find(s => s.span_id === state.spanId)
+  if (!span) return []
+  if (!matchesCache.has(span)) matchesCache.set(span, new Map())
+  const cache = matchesCache.get(span)
+  const cacheKey = `${width}\u0000${query}`
+  if (cache.has(cacheKey)) return cache.get(cacheKey)
+  const remember = hits => {
+    if (cache.size >= 16) cache.delete(cache.keys().next().value)
+    cache.set(cacheKey, hits); return hits
+  }
   const logical = spanLogicalLines(span)
   const escaped = Array.from(query).map(char => '\\^$.*+?()[]{}|'.includes(char) ? '\\' + char : char).join('')
   const expression = new RegExp(escaped, 'giu')
@@ -356,11 +419,11 @@ export function detailMatches(state, width = state.detailWidth ?? 40) {
     for (const match of line.matchAll(expression)) {
       while (row < rows.length - 1 && match.index >= end) end += rows[++row].length
       found.add(base + row)
-      if (found.size >= 1000) return [...found]
+      if (found.size >= 1000) return remember([...found])
     }
     base += rows.length
   }
-  return [...found]
+  return remember([...found])
 }
 
 function moveDetailMatch(state, backwards = false, first = false) {
@@ -378,6 +441,13 @@ export function explorerReduce(state, { ch = '', key = {} }) {
   if (state.searching) {
     if (key.escape) return { ...state, searching: false, searchDraft: '' }
     if (key.return) {
+      if (state.searchTarget && state.searchTarget !== 'local') {
+        const value = state.searchDraft
+        if (state.searchTarget === 'since' && value && Number.isNaN(Date.parse(value))) return { ...state, notice: 'use an ISO date' }
+        return { ...state, searching: false, filters: { ...state.filters, [state.searchTarget]: value },
+          offset: 0, selected: 0, query: '', data: null, anchor: undefined, loading: true,
+          revision: state.revision + 1, notice: '' }
+      }
       const next = { ...state, searching: false, query: state.searchDraft, selected: 0, scroll: 0, matchRow: null, notice: '' }
       return next.page === 'detail' && next.query ? moveDetailMatch(next, false, true) : next
     }
@@ -390,9 +460,18 @@ export function explorerReduce(state, { ch = '', key = {} }) {
     const text = terminalSafe(ch).replace(/[\n\t]/g, ' ')
     return text ? { ...state, searchDraft: Array.from(state.searchDraft + text).slice(0, 256).join('') } : state
   }
-  if (ch.startsWith('/') && !key.ctrl && !key.meta) return { ...state, searching: true,
+  if (ch.startsWith('/') && !key.ctrl && !key.meta) return { ...state, searching: true, searchTarget: 'local',
     searchDraft: ch.length === 1 ? state.query ?? '' : Array.from(terminalSafe(ch.slice(1)).replace(/[\n\t]/g, ' ')).slice(0, 256).join('') }
   if (ch === 'q') return null
+  if (ch === '?') return { ...state, showHelp: !state.showHelp }
+  if (state.showHelp) return key.escape || ch === 'b' ? { ...state, showHelp: false } : state
+  if (ch === 'l') return { ...state, live: !state.live }
+  if (state.page === 'sessions' && ['f', 'a', 'M', 't'].includes(ch[0]) && !key.ctrl && !key.meta) {
+    const target = { f: 'search', a: 'agent', M: 'model', t: 'since' }[ch[0]]
+    return { ...state, searching: true, searchTarget: target,
+      searchDraft: ch.length > 1 ? Array.from(terminalSafe(ch.slice(1)).replace(/[\n\t]/g, ' ')).slice(0, 256).join('') : state.filters?.[target] ?? '', notice: '' }
+  }
+  if (state.showExport && (key.escape || ch === 'b')) return { ...state, showExport: false, scroll: 0 }
   if (key.escape || ch === 'b' || key.backspace) {
     const history = state.history ?? []
     if (history.length) {
@@ -407,7 +486,22 @@ export function explorerReduce(state, { ch = '', key = {} }) {
     return { ...navigateExplorer(state, state.page === 'detail' ? 'spans' : state.page === 'spans' ? 'turns' : 'sessions'), history: [] }
   }
   if (ch === 'r') return { ...state, revision: state.revision + 1, loading: true, error: '' }
-  if (state.loading || state.error) return state
+  if ((state.loading || state.error) && !state.data) return state
+  if (state.page === 'sessions' && (key.leftArrow || key.rightArrow)) {
+    const offset = Math.max(0, (state.offset ?? 0) + (key.leftArrow ? -1 : 1) * (state.pageSize ?? 50))
+    if (offset === (state.offset ?? 0) || (key.rightArrow && !state.data?.has_more)) return state
+    return { ...state, offset, data: null, selected: 0, anchor: undefined, loading: true, revision: state.revision + 1, notice: '' }
+  }
+  if (ch === 'v' && state.page === 'detail') return { ...state, showExport: !state.showExport, scroll: 0 }
+  if (ch === 'm' && state.page !== 'metrics') {
+    const sessionId = state.page === 'sessions' ? explorerItems(state)[state.selected]?.session_id : state.sessionId
+    return sessionId ? navigateExplorer(state, 'metrics', { sessionId }) : state
+  }
+  if (state.page === 'metrics' || state.showExport) {
+    const delta = key.pageDown ? 10 : key.pageUp ? -10 : key.downArrow || ch === 'j' ? 1 : key.upArrow || ch === 'k' ? -1 : 0
+    const lines = state.showExport ? exportRows(state, state.detailWidth ?? 40) : metricsRows(state.data, state.detailWidth ?? 40)
+    return delta ? { ...state, scroll: Math.max(0, Math.min(Math.max(0, lines.length - (state.detailHeight ?? 1)), state.scroll + delta)) } : state
+  }
   const items = explorerItems(state)
   if (state.page === 'detail') {
     const delta = key.pageDown ? 10 : key.pageUp ? -10 : key.downArrow || ch === 'j' ? 1 : key.upArrow || ch === 'k' ? -1 : 0
@@ -431,7 +525,7 @@ export function explorerReduce(state, { ch = '', key = {} }) {
   if (key.return) {
     if (state.page === 'sessions') return navigateExplorer(state, 'turns', { sessionId: item.session_id })
     if (state.page === 'turns') return navigateExplorer(state, 'spans', { traceId: item.trace_id })
-    return navigateExplorer(state, 'detail', { spanId: item.span_id, data: state.data, loading: false })
+    return navigateExplorer(state, 'detail', { spanId: item.span_id })
   }
   return state
 }
@@ -474,7 +568,12 @@ export function wrapExplorer(value, width) {
   return result
 }
 
+const logicalCache = new WeakMap()
+const rowsCache = new WeakMap()
+const matchesCache = new WeakMap()
+
 function spanLogicalLines(span) {
+  if (span && logicalCache.has(span)) return logicalCache.get(span)
   if (!span) return ['span not found in snapshot; press b then r']
   const output = []
   for (const [label, value] of [
@@ -488,16 +587,58 @@ function spanLogicalLines(span) {
     output.push(...terminalSafe(text.slice(0, 100000)).replace(/\t/g, '  ').split('\n'))
     if (text.length > 100000) output.push('(section truncated at 100000 characters)')
   }
+  logicalCache.set(span, output)
   return output
 }
 
 export function spanDetails(span, width) {
-  return spanLogicalLines(span).flatMap(line => wrapExplorer(line, width))
+  if (!span) return spanLogicalLines(span).flatMap(line => wrapExplorer(line, width))
+  if (!rowsCache.has(span)) rowsCache.set(span, new Map())
+  const cache = rowsCache.get(span)
+  if (cache.has(width)) return cache.get(width)
+  const rows = spanLogicalLines(span).flatMap(line => wrapExplorer(line, width))
+  if (cache.size >= 4) cache.delete(cache.keys().next().value)
+  cache.set(width, rows)
+  return rows
+}
+
+export function metricsRows(data, width) {
+  if (!data) return []
+  const lines = [
+    `SESSION ${data.session_id}`,
+    `turns ${data.traces} | spans ${data.spans} | error spans ${data.errors} | unclosed ${data.unclosed}`,
+    `tokens in ${data.tokens?.input ?? '?'} | out ${data.tokens?.output ?? '?'} | cache-read ${data.tokens?.cache_read ?? '?'}`,
+    'LATENCY (completed measured calls; not TTFT)'
+  ]
+  for (const [label, latency] of [['LLM', data.llm], ['Tools', data.tools]]) {
+    lines.push(`${label} n=${latency?.n ?? 0} p50 ${fmtDur(latency?.p50_ms)} p95 ${fmtDur(latency?.p95_ms)} max ${fmtDur(latency?.max_ms)}`)
+  }
+  lines.push('p95 needs at least 5 measured calls; unknown values are -', 'SLOWEST CALLS')
+  for (const item of data.slowest ?? []) lines.push(`${item.kind} ${fmtDur(item.duration_ms)} ${item.status} ${item.name}`)
+  if (!data.slowest?.length) lines.push('No completed measured calls in this session.')
+  lines.push('Cost and throughput are not inferred from token totals.')
+  return lines.flatMap(line => wrapExplorer(line, width))
+}
+
+function exportRows(state, width) {
+  const address = new URL(state.base)
+  if (address.hostname !== '127.0.0.1' || address.protocol !== 'http:') return wrapExplorer('Export helper supports local loopback HTTP only.', width)
+  const quote = value => "'" + String(value).replaceAll("'", "'\"'\"'") + "'"
+  const command = `python3 scripts/export-span.py --trace ${quote(state.traceId)} --span ${quote(state.spanId)} --output span.json --port ${address.port || 80}`
+  return ['FULL STORED CAPTURE EXPORT', 'Run from the agent-trace repo in another terminal:', command,
+    'Uses the existing local token. Writes mode 0600; refuses overwrite.',
+    'No additional payload redaction is disabled. Press v to return.'].flatMap(line => wrapExplorer(line, width))
 }
 
 export function explorerRows(state, width, height) {
-  if (state.loading) return ['loading snapshot...']
-  if (state.error) return wrapExplorer(`ERROR: ${state.error}\npress r to retry, b to go back`, width)
+  if (state.showHelp) return ['KEYS', '/ local find; f server find (sessions)', 'a agent; M model; t since date (sessions)', 'Left/Right previous/next session page', 'Enter open; b/Esc back; q close', 'l live/pause; p pin dock; G global dock', 'm metrics for selected session; r refresh', 'Space fold; e errors; i/o/x detail sections', 'n/N next/previous match; v export help', 'Ctrl+u clears find; ? closes help'].flatMap(line => wrapExplorer(line, width)).slice(0, height)
+  if (state.loading && !state.data) return ['loading snapshot...']
+  if (state.error && !state.data) return wrapExplorer(`ERROR: ${state.error}\npress r to retry, b to go back`, width)
+  if (state.page === 'metrics' || state.showExport) {
+    const lines = state.showExport ? exportRows(state, width) : metricsRows(state.data, width)
+    const start = Math.min(state.scroll, Math.max(0, lines.length - height))
+    return lines.slice(start, start + height)
+  }
   if (state.page === 'detail') {
     const lines = spanDetails(state.data.spans.find(s => s.span_id === state.spanId), width)
     const start = Math.min(state.scroll, Math.max(0, lines.length - height))
@@ -517,15 +658,20 @@ export function explorerRows(state, width, height) {
 }
 
 export function explorerSearchStatus(state, width = 100) {
-  if (state.searching) return `find> ${wrapExplorer(state.searchDraft + '_', Math.max(2, width - 6)).at(-1)}`
+  if (state.searching) return `${state.searchTarget === 'local' ? 'find' : state.searchTarget}> ${wrapExplorer(state.searchDraft + '_', Math.max(2, width - 8)).at(-1)}`
+  if (state.error) return `STALE: ${state.error} | r retry`
   if (state.notice) return state.notice
-  if (!state.query) return ''
+  if (!state.query) {
+    const filters = Object.entries(state.filters ?? {}).filter(([, value]) => value).map(([name, value]) => `${name}=${value}`).join(' ')
+    const stamp = state.updatedAt ? new Date(state.updatedAt).toISOString().slice(11, 19) + 'Z' : 'not loaded'
+    return `${state.live ? 'LIVE' : 'PAUSED'} ${stamp}${filters ? ' | ' + filters : ''}`
+  }
   if (state.page !== 'detail') return `/${state.query} | ${explorerItems(state).length} loaded matches | / edit`
   const count = detailMatches(state).length
   return `/${state.query} | ${count === 1000 ? '>=1000' : count} matching rows | n/N next/previous`
 }
 
-function registerExplorer(sdk) {
+function registerExplorer(sdk, pinDock) {
   const { Box, Dialog, Overlay, React, Text, ShimmerRows, h, defineWidgetApp, updateWidget } = sdk
   let app
   function ExplorerBody({ state, width, height, t }) {
@@ -534,21 +680,28 @@ function registerExplorer(sdk) {
       updateWidget(app, current => ({ ...current, detailWidth: width, detailHeight: height, scroll: 0 }))
     }, [width, height])
     React.useEffect(() => {
+      if (state.searching || (!state.live && state.data && !state.loading)) return
       const controller = new AbortController()
       let active = true
-      loadExplorer(state, { signal: controller.signal }).then(data => {
-        if (!active) return
-        updateWidget(app, current => {
-          if (explorerResource(current) !== resource || current.revision !== state.revision) return current
-          return applyExplorerData(current, data)
-        })
-      }).catch(error => {
-        if (active) updateWidget(app, current => explorerResource(current) === resource && current.revision === state.revision
-          ? { ...current, loading: false, error: describe(error).message } : current)
-      })
-      return () => { active = false; controller.abort() }
-    }, [state.base, resource, state.revision])
-    if (state.loading) return h(Box, { width, height }, h(ShimmerRows, {
+      let timer
+      const pull = async () => {
+        try {
+          const data = await loadExplorer(state, { signal: controller.signal })
+          if (active) updateWidget(app, current => {
+            if (explorerResource(current) !== resource || current.revision !== state.revision || current.searching) return current
+            return applyExplorerData(current, data)
+          })
+        } catch (error) {
+          if (active) updateWidget(app, current => explorerResource(current) === resource && current.revision === state.revision
+            ? { ...current, loading: false, error: describe(error).message } : current)
+        } finally {
+          if (active && state.live) timer = setTimeout(pull, POLL_MS)
+        }
+      }
+      pull()
+      return () => { active = false; clearTimeout(timer); controller.abort() }
+    }, [state.base, resource, state.revision, state.live, state.searching])
+    if (state.loading && !state.data && !state.showHelp) return h(Box, { width, height }, h(ShimmerRows, {
       color: t.color.muted, highlight: t.color.label, rows: Array.from({ length: Math.min(4, height) }, () => [Math.max(1, width - 2)])
     }))
     return h(Box, { width, height, flexDirection: 'column' },
@@ -559,19 +712,31 @@ function registerExplorer(sdk) {
   app = defineWidgetApp({
     id: 'tracex', help: 'browse sessions, turn trees, and LLM/tool inputs, outputs, errors', mode: 'modal',
     usage: 'usage: /tracex [session-id] [http://127.0.0.1:8741]',
-    init: explorerInit, reduce: explorerReduce,
+    init: explorerInit,
+    reduce(state, input) {
+      if (!state.searching && !state.showHelp && (input.ch === 'p' || input.ch === 'G')) {
+        const sessionId = input.ch === 'G' ? '' : state.page === 'sessions' ? explorerItems(state)[state.selected]?.session_id : state.sessionId
+        if (sessionId == null) return state
+        pinDock(state.base, sessionId)
+        return { ...state, notice: sessionId ? 'dock pinned to selected session' : 'dock switched to global' }
+      }
+      return explorerReduce(state, input)
+    },
     render({ cols, rows, state, t }) {
       const width = Math.max(12, Math.min(104, cols - 4))
       const height = Math.max(2, Math.min(24, rows - 12))
       const count = state.data ? explorerItems(state).length : 0
-      const scope = state.page === 'sessions' ? 'sessions (up to 200 loaded)' : `session ${state.sessionId}`
+      const scope = state.page === 'sessions'
+        ? `sessions ${state.offset ?? 0}-${(state.offset ?? 0) + (state.data?.sessions?.length ?? 0)} / ${state.data?.total ?? '?'} | Left/Right pages; f server find`
+        : `session ${state.sessionId}`
       return h(Overlay, {}, h(Dialog, { width },
-        h(Text, { color: t.color.label }, wrapExplorer(`agent-trace / ${state.page} ${state.errorsOnly ? '[errors]' : ''}`, width - 6)[0]),
+        h(Text, { color: t.color.label }, wrapExplorer(`agent-trace / ${state.page} ${state.live ? '[LIVE]' : '[PAUSED]'} ${state.errorsOnly ? '[errors]' : ''}`, width - 6)[0]),
         h(Text, { color: t.color.muted }, wrapExplorer(scope, width - 6)[0]),
         h(ExplorerBody, { state, width: width - 6, height, t }),
-        h(Text, { color: t.color.muted }, wrapExplorer(state.searching ? 'Enter apply | Esc cancel' : width < 46 ? 'j/k Enter b q /' : `${state.page === 'detail' ? 'j/k scroll' : `j/k select ${count ? state.selected + 1 : 0}/${count}`} | Enter open | b back | q close | / find`, width - 6)[0]),
+        h(Text, { color: t.color.muted }, wrapExplorer(state.searching ? 'Enter apply | Esc cancel' : width < 46 ? 'j/k Enter b q ?' : `${state.page === 'detail' ? 'j/k scroll' : `j/k select ${count ? state.selected + 1 : 0}/${count}`} | Enter | b back | q close | l live | p pin | m metrics | ? help`, width - 6)[0]),
         h(Text, { color: t.color.muted }, wrapExplorer(explorerSearchStatus(state, width - 6) || (state.page === 'detail' ? 'i input | o output | x error | / find | r refresh' : width < 46 ? 'r refresh e errors' : 'r refresh | Space fold | e errors | snapshot (not live)'), width - 6)[0])
       ))
     }
   })
+  return app
 }

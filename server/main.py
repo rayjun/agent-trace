@@ -45,7 +45,8 @@ from pathlib import Path
 from typing import Any, cast
 from urllib.parse import parse_qs, unquote, urlparse
 
-from core.query import get_trace, list_adapters, list_sessions, list_traces, overview
+from core.query import (get_span, get_trace, list_adapters, list_sessions,
+                        list_traces, overview, session_metrics)
 from core.storage.indexer import Indexer, ScanReport
 from core.storage.sqlite_store import TraceStore
 
@@ -455,28 +456,35 @@ class Handler(BaseHTTPRequestHandler):
                 since=_one(qs, "since"),
                 limit=_int(qs, "limit", 50), offset=_int(qs, "offset", 0)))
         elif path.startswith("/api/traces/"):
+            # Split the encoded path first: an ID may itself contain /spans/.
+            parts = path[len("/api/traces/"):].split("/")
+            if len(parts) == 3 and parts[1] == "spans":
+                span = get_span(store, unquote(parts[0]), unquote(parts[2]))
+                self._send_json(span if span is not None
+                                else {"error": "span not found"},
+                                200 if span is not None else 404)
+                return
             trace_id = unquote(path[len("/api/traces/"):])
-            trace = get_trace(store, trace_id)
+            trace = get_trace(store, trace_id, summary=_one(qs, "summary") == "1")
             if trace is None:
                 self._send_json({"error": "trace not found"}, 404)
             else:
                 self._send_json(trace)
         elif path == "/api/sessions":
-            self._send_json(list_sessions(store, limit=_int(qs, "limit", 100)))
+            self._send_json(list_sessions(
+                store, limit=_int(qs, "limit", 100), offset=_int(qs, "offset", 0),
+                search=_one(qs, "search"), agent=_one(qs, "agent"),
+                model=_one(qs, "model"), since=_one(qs, "since")))
+        elif path.startswith("/api/sessions/") and path.endswith("/metrics"):
+            raw = path[len("/api/sessions/"):-len("/metrics")]
+            metrics = session_metrics(store, unquote(raw))
+            self._send_json(metrics if metrics is not None
+                            else {"error": "session not found"},
+                            200 if metrics is not None else 404)
         elif path.startswith("/api/sessions/"):
-            # A session is a CONVERSATION: its turns, each with its own duration.
-            # A trace is one turn, so this is the only place the per-turn time is
-            # visible at all.
             from core.query import session_detail
             raw = path[len("/api/sessions/"):]
             detail = session_detail(store, unquote(raw))
-            if detail is None and "%25" in raw.upper():
-                # An id that is itself still escaped: older versions of the
-                # dashboard escaped the route segment twice, so URLs already in
-                # someone's history carry `%252F`. Decoding once more costs
-                # nothing (a session id never contains a literal `%`) and makes
-                # those bookmarks work instead of 404-ing.
-                detail = session_detail(store, unquote(unquote(raw)))
             self._send_json(detail if detail is not None
                             else {"error": "session not found"},
                             200 if detail is not None else 404)
@@ -608,6 +616,21 @@ def write_pidfile(pid: int) -> Path:
     return path
 
 
+def _report_startup_coverage(state: ServerState, db_path: Path) -> None:
+    try:
+        if state.wait_for_first_scan():
+            from core import coverage as _cov
+            _provider = _cov.store_session_provider(db_path)
+            for line in [c.warning() for c in _cov.check(traced_provider=_provider)
+                         if c.warning()]:
+                print(f"WARNING: {line}", flush=True)
+        else:
+            print("(coverage check deferred: the first index pass is still "
+                  "running)", flush=True)
+    except Exception as exc:                    # noqa: BLE001
+        print(f"(coverage check unavailable: {exc})", flush=True)
+
+
 def serve(*, host: str, port: int, db_path: Path, dirs: list[Path],
           scan_interval: float = 1.0, verbose: bool = False,
           pidfile: bool = True) -> None:
@@ -633,18 +656,7 @@ def serve(*, host: str, port: int, db_path: Path, dirs: list[Path],
     # computed from a half-built index reports "capturing nothing" for every
     # adapter whose sessions have not been ingested yet, which is a false alarm
     # on every fresh start.
-    try:
-        if server.state.wait_for_first_scan():
-            from core import coverage as _cov
-            _provider = _cov.store_session_provider(db_path)
-            for line in [c.warning() for c in _cov.check(traced_provider=_provider)
-                         if c.warning()]:
-                print(f"WARNING: {line}", flush=True)
-        else:
-            print("(coverage check deferred: the first index pass is still "
-                  "running)", flush=True)
-    except Exception as exc:                    # noqa: BLE001
-        print(f"(coverage check unavailable: {exc})", flush=True)
+    threading.Thread(target=_report_startup_coverage, args=(server.state, db_path), daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
