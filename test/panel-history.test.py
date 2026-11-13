@@ -239,6 +239,55 @@ took_ms = (time.perf_counter() - start_px) * 1000
 check("a no-match filter returns nothing, quickly",
       none_match == [] and took_ms < 2000, f"{took_ms:.0f} ms")
 
+section("deterministic file ranking and overlapping histories")
+
+ranked_dir = Path(tempfile.mkdtemp(prefix="history-ranked-")) / "traces"
+ranked_dir.mkdir()
+for name, times in (("a.jsonl", range(0, 40)), ("b.jsonl", range(100, 140)), ("c.jsonl", range(200, 240))):
+    path = ranked_dir / name
+    path.write_text("".join(json.dumps(rec(i)) + "\n" for i in times))
+    os.utime(path, ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000))
+for n in (10, 50):
+    check(f"equal mtimes: history={n} matches exact records",
+          load_history([ranked_dir], lambda r: True, n) == exact([ranked_dir], lambda r: True, n))
+os.utime(ranked_dir / "a.jsonl", ns=(1_900_000_000_000_000_000, 1_900_000_000_000_000_000))
+check("touching the oldest file cannot replace the newest window",
+      load_history([ranked_dir], lambda r: True, 10) == exact([ranked_dir], lambda r: True, 10))
+
+overlap = Path(tempfile.mkdtemp(prefix="history-overlap-")) / "traces"
+overlap.mkdir()
+for name, times in (("a.jsonl", [0, 100]), ("b.jsonl", [98, 99])):
+    path = overlap / name
+    path.write_text("".join(json.dumps(rec(i)) + "\n" for i in times))
+    os.utime(path, ns=(1_800_000_000_000_000_000, 1_800_000_000_000_000_000))
+os.utime(overlap / "a.jsonl", ns=(1_900_000_000_000_000_000, 1_900_000_000_000_000_000))
+check("a full newest file does not hide a newer record in an overlapping file",
+      load_history([overlap], lambda r: True, 2) == exact([overlap], lambda r: True, 2))
+
+cross_same = Path(tempfile.mkdtemp(prefix="history-cross-same-")) / "traces"
+cross_same.mkdir()
+for name in ("a", "b"):
+    path = cross_same / f"{name}.jsonl"
+    path.write_text("".join(json.dumps(rec(0, session_id=f"{name}{i}")) + "\n" for i in range(3)))
+    os.utime(path, ns=(1_700_000_000_000_000_000, 1_700_000_000_000_000_000))
+check("equal timestamps across files preserve exact reader ordering",
+      load_history([cross_same], lambda r: True, 4) == exact([cross_same], lambda r: True, 4))
+
+visited = []
+original_tail = tailer_mod._tail_records
+
+def tracking_tail(path, *args, **kwargs):
+    visited.append(path)
+    return original_tail(path, *args, **kwargs)
+
+tailer_mod._tail_records = tracking_tail
+try:
+    load_history([wide], lambda r: False, 40)
+finally:
+    tailer_mod._tail_records = original_tail
+check("an unfillable request reads at most PRELOAD_MAX_FILES payload tails",
+      len(visited) == min(PRELOAD_MAX_FILES, 30), str(len(visited)))
+
 print()
 if FAILS:
     print(f"FAILED — {FAILS} check(s)")

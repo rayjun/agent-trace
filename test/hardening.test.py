@@ -70,7 +70,7 @@ def load_installer():
 
 mod = load_installer()
 
-tmp = Path(tempfile.mkdtemp(prefix="hard-codex-"))
+tmp = Path(tempfile.mkdtemp(prefix="hard codex "))
 fake_bin = tmp / "vendor" / "aarch64-apple-darwin" / "bin" / "codex"
 fake_bin.parent.mkdir(parents=True)
 magic = b"\xcf\xfa\xed\xfe"            # Mach-O 64-bit, then ASCII event names
@@ -196,10 +196,11 @@ check("a vanished directory does NOT wipe the index",
 (traces.parent / "traces2").mkdir()
 (traces.parent / "traces2" / "c.jsonl").write_text(rec(iso(0), "s3") + "\n")
 cli("index", str(traces.parent / "traces2"))
+legacy_root = traces.parent / "traces2-alias"
+legacy_root.symlink_to(traces.parent / "traces2", target_is_directory=True)
 c = sqlite3.connect(str(db))
 c.execute("UPDATE ingest_files SET path = ? WHERE path LIKE ?",
-          ("/var" + str(traces.parent).split("/var", 1)[1] + "/traces2/c.jsonl",
-           "%traces2%"))
+          (str(legacy_root / "c.jsonl"), "%traces2%"))
 c.commit()
 c.close()
 rc, out = cli("index", str(traces.parent / "traces2"))

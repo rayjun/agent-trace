@@ -40,7 +40,7 @@ _BINARY_MAGIC = (b"\x7fELF", b"\xcf\xfa\xed\xfe", b"\xce\xfa\xed\xfe",
                  b"\xca\xfe\xba\xbe", b"\xfe\xed\xfa\xce", b"\xfe\xed\xfa\xcf",
                  b"MZ")
 
-_ASSIGN = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=[\"']?([^\"'\s]+)[\"']?\s*$", re.M)
+_ASSIGN = re.compile(r"""^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)=(?:"([^"\r\n]*)"|'([^'\r\n]*)'|([^"' \t\r\n]+))[ \t]*$""", re.M)
 _EXEC = re.compile(r"^\s*exec\s+(?:\"([^\"]+)\"|'([^']+)'|(\S+))", re.M)
 
 
@@ -66,7 +66,8 @@ def _launcher_targets(script: Path) -> list[Path]:
         text = script.read_text("utf-8", "replace")
     except OSError:
         return []
-    assignments = {m.group(1): m.group(2) for m in _ASSIGN.finditer(text)}
+    assignments = {m.group(1): next(v for v in m.groups()[1:] if v is not None)
+                   for m in _ASSIGN.finditer(text)}
 
     def expand(raw: str) -> str:
         for _ in range(3):     # $PKG inside $BIN is normal, not pathological

@@ -288,29 +288,21 @@ def load_history(dirs: list[Path], keep, history: int) -> list[dict]:
     files: list[Path] = []
     for d in dirs:
         try:
-            files.extend(p for p in d.rglob("*.jsonl") if p.is_file())
+            files.extend(sorted(p for p in d.rglob("*.jsonl") if p.is_file()))
         except OSError:
             continue
-    # Newest first: a session's newest records live in the newest files.
-    files.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0.0, reverse=True)
-    collected: list[dict] = []
-    # Read the newest files' tails and THEN pick the newest by ts. Stopping at the
-    # first file that filled `history` assumed mtime identifies the newest file,
-    # and files written in the same second share it — the preload then returned a
-    # window tens of seconds old while a newer file sat right there.
-    #
-    # The budget is what keeps this honest: it reads until `history` is satisfied
-    # or the bytes run out, so a normal request is exact (600 real records ≈ 18MB,
-    # well inside the budget) and a pathological one degrades visibly instead of
-    # silently. `agenttrace session`/`report` remain the exact tools.
+    file_order = {path: i for i, path in enumerate(files)}
+    files = _rank_by_last_ts(files)
+    chunks: list[tuple[int, list[dict]]] = []
     budget = PRELOAD_BUDGET_BYTES
-    for path in files:
-        if len(collected) >= history or budget <= 0:
+    for path in files[:PRELOAD_MAX_FILES]:
+        if budget <= 0:
             break
         recs, spent = _tail_records(path, history, keep,
                                     max_bytes=min(budget, PRELOAD_TAIL_BYTES), )
-        collected.extend(recs)
+        chunks.append((file_order[path], recs))
         budget -= spent
+    collected = [rec for _, records in sorted(chunks, key=lambda item: item[0]) for rec in records]
     collected.sort(key=lambda r: r.get("ts") or "")
     return collected[-history:]
 
