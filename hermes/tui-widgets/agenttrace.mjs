@@ -91,14 +91,17 @@ function describe(error) {
 
 const finite = value => typeof value === 'number' && Number.isFinite(value) && value >= 0
 
-export async function snapshot(base = DEFAULT_BASE, { signal, sessionId = '' } = {}) {
+const agentQuery = adapterId => adapterId ? `?${new URLSearchParams({ agent: adapterId })}` : ''
+const adapterMatches = (data, adapterId) => !adapterId || data?.adapter_id === adapterId
+
+export async function snapshot(base = DEFAULT_BASE, { signal, sessionId = '', adapterId = '' } = {}) {
   base = normalizeBase(base)
   const health = await requestJSON(base, '/api/health', { signal })
   if (typeof health?.building !== 'boolean') throw new Error('invalid server health response')
-  if (health.building) return { updatedAt: Date.now(), sessionId, health,
+  if (health.building) return { updatedAt: Date.now(), sessionId, adapterId, health,
     totals: { traces: null, spans: null, errors: null, unclosed: null, inTok: null, outTok: null },
     durations: [], p50: null, last: null, sampleSize: 0 }
-  const paths = [sessionId ? `/api/sessions/${encodeURIComponent(sessionId)}/metrics` : '/api/overview']
+  const paths = [sessionId ? `/api/sessions/${encodeURIComponent(sessionId)}/metrics${agentQuery(adapterId)}` : '/api/overview']
   if (!sessionId) paths.push(`/api/traces?limit=${SLOTS}`)
   const [response, globalRecent] = await requestGroup(base, paths, { signal })
   const recent = sessionId ? { traces: response.recent_traces } : globalRecent
@@ -106,13 +109,13 @@ export async function snapshot(base = DEFAULT_BASE, { signal, sessionId = '' } =
       !finite(response.errors) || !finite(response.unclosed) ||
       !(response.tokens?.input === null || finite(response.tokens?.input)) || !(response.tokens?.output === null || finite(response.tokens?.output)) ||
       !Array.isArray(recent?.traces) || recent.traces.some(t => !t || typeof t !== 'object') ||
-      typeof health?.building !== 'boolean' || (sessionId && response.session_id !== sessionId)) {
+      typeof health?.building !== 'boolean' || (sessionId && (response.session_id !== sessionId || !adapterMatches(response, adapterId)))) {
     throw new Error('invalid server response')
   }
   const turns = recent.traces.slice(0, SLOTS).reverse()
   const durations = turns.filter(t => ['ok', 'error'].includes(t.status) && t.unclosed === 0 && finite(t.duration_ms)).map(t => t.duration_ms)
   return {
-    updatedAt: Date.now(), sessionId, health,
+    updatedAt: Date.now(), sessionId, adapterId: adapterId || response.adapter_id || '', health,
     totals: { traces: response.traces, spans: response.spans, errors: response.errors,
       unclosed: response.unclosed, inTok: response.tokens.input, outTok: response.tokens.output },
     durations, p50: median(durations), last: turns.at(-1) ?? null, sampleSize: durations.length
@@ -120,9 +123,9 @@ export async function snapshot(base = DEFAULT_BASE, { signal, sessionId = '' } =
 }
 
 const scopeListeners = new Set()
-let pinnedScope = { base: DEFAULT_BASE, sessionId: '' }
-export function pinSession(base, sessionId = '') {
-  pinnedScope = { base: normalizeBase(base), sessionId }
+let pinnedScope = { base: DEFAULT_BASE, sessionId: '', adapterId: '' }
+export function pinSession(base, sessionId = '', adapterId = '') {
+  pinnedScope = { base: normalizeBase(base), sessionId, adapterId: sessionId ? adapterId : '' }
   for (const listener of scopeListeners) listener(pinnedScope)
 }
 export const currentScope = () => ({ ...pinnedScope })
@@ -209,8 +212,8 @@ export function cardRows(phase, width, sparkline, now = Date.now()) {
 
 export default function register(sdk) {
   let dockApp, explorerApp
-  if (sdk.Overlay && sdk.updateWidget) explorerApp = registerExplorer(sdk, (base, sessionId) => {
-    pinSession(base, sessionId)
+  if (sdk.Overlay && sdk.updateWidget) explorerApp = registerExplorer(sdk, (base, sessionId, adapterId) => {
+    pinSession(base, sessionId, adapterId)
     if (sdk.openWidget) sdk.openWidget(dockApp, { base })
   })
   const { Box, Dialog, React, ShimmerRows, Text, defineWidgetApp, h, sparkline } = sdk
@@ -219,17 +222,19 @@ export default function register(sdk) {
     const [scope, setScope] = React.useState(currentScope)
     React.useEffect(() => { scopeListeners.add(setScope); return () => scopeListeners.delete(setScope) }, [])
     const sessionId = scope.base === base ? scope.sessionId : ''
+    const adapterId = scope.base === base ? scope.adapterId : ''
     React.useEffect(() => {
       setPhase({ kind: 'loading' })
-      return startPolling(base, setPhase, { load: (address, options) => snapshot(address, { ...options, sessionId }) })
-    }, [base, sessionId])
+      return startPolling(base, setPhase, { load: (address, options) => snapshot(address, { ...options, sessionId, adapterId }) })
+    }, [base, sessionId, adapterId])
     if (phase.kind === 'loading') {
       return h(Box, { width, height: 4, flexDirection: 'column' },
         h(ShimmerRows, { color: t.color.muted, highlight: t.color.label,
           rows: Array.from({ length: 4 }, () => [Math.max(1, width - 2)]) }))
     }
     return h(Box, { width, height: 4, flexDirection: 'column', onClick: () => {
-      if (explorerApp && sdk.openWidget) sdk.openWidget(explorerApp, explorerInit(`${sessionId} ${base}`.trim()))
+      if (explorerApp && sdk.openWidget) sdk.openWidget(explorerApp, { ...explorerInit(base),
+        page: sessionId ? 'turns' : 'sessions', sessionId, adapterId })
     } },
       ...cardRows(phase, width, sparkline).map((row, i) => h(Text, {
         key: i, wrap: 'truncate', color: phase.kind === 'error' ? t.color.error :
@@ -239,7 +244,7 @@ export default function register(sdk) {
   dockApp = defineWidgetApp({
     id: 'agenttrace', help: 'agent-trace: all-agent totals and recent-turn latency',
     mode: 'ambient', zone: 'dock-bottom', width: 46,
-    usage: `usage: /agenttrace [global|session ID] [server-url] default ${DEFAULT_BASE}`,
+    usage: `usage: /agenttrace [global|session ID] [server-url] [--agent ADAPTER] default ${DEFAULT_BASE}`,
     init(arg) {
       const args = arg.trim().split(/\s+/).filter(Boolean)
       try {
@@ -249,9 +254,10 @@ export default function register(sdk) {
           pinSession(base, ''); return { base }
         }
         if (args[0] === 'session') {
-          if (!args[1] || args.length > 3) return null
-          const base = normalizeBase(args[2] || DEFAULT_BASE)
-          pinSession(base, args[1]); return { base }
+          const direct = explorerInit(args.slice(1).join(' '))
+          if (!direct?.sessionId) return null
+          const { base, sessionId, adapterId } = direct
+          pinSession(base, sessionId, adapterId); return { base }
         }
         if (args.length > 1) return null
         const base = normalizeBase(args[0] || pinnedScope.base)
@@ -270,11 +276,19 @@ export default function register(sdk) {
 
 export function explorerInit(arg = '') {
   const args = arg.trim().split(/\s+/).filter(Boolean)
+  let adapterId = ''
+  const option = args.indexOf('--agent')
+  if (option >= 0) {
+    if (option !== args.length - 2 || !args[option + 1] || args[option + 1] === '--agent') return null
+    adapterId = args[option + 1]
+    args.splice(option, 2)
+  }
   if (args.length > 2) return null
   const sessionId = args[0]?.startsWith('http') ? '' : args[0] ?? ''
+  if (adapterId && !sessionId) return null
   const address = args[0]?.startsWith('http') ? args[0] : args[1] ?? DEFAULT_BASE
   try {
-    return { base: normalizeBase(address), page: sessionId ? 'turns' : 'sessions', sessionId,
+    return { base: normalizeBase(address), page: sessionId ? 'turns' : 'sessions', sessionId, adapterId,
       traceId: '', selected: 0, scroll: 0, collapsed: [], errorsOnly: false,
       loading: true, error: '', data: null, revision: 0, query: '', searching: false,
       searchDraft: '', history: [], notice: '', live: false, offset: 0, pageSize: 50,
@@ -289,20 +303,26 @@ export function explorerResource(state) {
     for (const [name, value] of Object.entries(state.filters ?? {})) if (value) args.set(name, value)
     return `/api/sessions?${args}`
   }
-  if (state.page === 'turns') return `/api/sessions/${session}`
-  if (state.page === 'metrics') return `/api/sessions/${session}/metrics`
+  if (state.page === 'turns') return `/api/sessions/${session}${agentQuery(state.adapterId)}`
+  if (state.page === 'metrics') return `/api/sessions/${session}/metrics${agentQuery(state.adapterId)}`
   const trace = encodeURIComponent(state.traceId)
-  if (state.page === 'detail') return `/api/traces/${trace}/spans/${encodeURIComponent(state.spanId)}`
-  return `/api/traces/${trace}?summary=1`
+  const args = new URLSearchParams()
+  if (state.page !== 'detail') args.set('summary', '1')
+  if (state.adapterId) args.set('agent', state.adapterId)
+  if (state.sessionId) args.set('session', state.sessionId)
+  const query = args.size ? `?${args}` : ''
+  if (state.page === 'detail') return `/api/traces/${trace}/spans/${encodeURIComponent(state.spanId)}${query}`
+  return `/api/traces/${trace}${query}`
 }
 
 export async function loadExplorer(state, options) {
   const data = await requestJSON(state.base, explorerResource(state), options)
+  if (state.page !== 'sessions' && !adapterMatches(data, state.adapterId)) throw new Error('adapter identity mismatch')
   if (state.page === 'detail') {
     if (!data || data.span_id !== state.spanId || data.trace_id !== state.traceId || data.session_id !== state.sessionId) {
       throw new Error('span identity mismatch')
     }
-    return { trace_id: data.trace_id, session_id: data.session_id, spans: [data] }
+    return { trace_id: data.trace_id, session_id: data.session_id, adapter_id: data.adapter_id, spans: [data] }
   }
   if (state.page === 'metrics') {
     if (!data || data.session_id !== state.sessionId || !finite(data.traces) || !Array.isArray(data.slowest)) {
@@ -369,8 +389,8 @@ export function explorerItems(state) {
     value != null && terminalSafe(value).toLocaleLowerCase().includes(query))) : items
 }
 
-const recordKey = item => item?.span_id ?? item?.trace_id ?? item?.session_id
-const bookmark = state => ({ page: state.page, sessionId: state.sessionId, traceId: state.traceId,
+const recordKey = item => item?.span_id ?? item?.trace_id ?? (item?.session_id == null ? undefined : JSON.stringify([item.adapter_id ?? '', item.session_id]))
+const bookmark = state => ({ page: state.page, sessionId: state.sessionId, adapterId: state.adapterId, traceId: state.traceId,
   selected: state.selected, anchor: recordKey(explorerItems(state)[state.selected]), scroll: state.scroll,
   spanId: state.spanId, query: state.query ?? '', collapsed: state.collapsed,
   errorsOnly: state.errorsOnly, offset: state.offset, filters: state.filters, updatedAt: state.updatedAt })
@@ -437,13 +457,34 @@ function moveDetailMatch(state, backwards = false, first = false) {
   return { ...state, scroll: Math.min(target, maximum), matchRow: target, notice: '' }
 }
 
+// Date-only means UTC midnight. Datetimes must specify an offset: never let
+// Date.parse guess the host timezone or silently roll an impossible day forward.
+export function normalizeSince(value) {
+  if (!value) return ''
+  const match = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,6}))?)?(Z|[+-]\d{2}:\d{2}))?$/.exec(value)
+  if (!match) throw new Error('invalid since date/time')
+  const [, year, month, day, hour, minute, second, , zone] = match
+  const calendar = new Date(0)
+  calendar.setUTCFullYear(Number(year), Number(month) - 1, Number(day))
+  if (Number(year) < 1 || calendar.getUTCFullYear() !== Number(year) || calendar.getUTCMonth() !== Number(month) - 1 || calendar.getUTCDate() !== Number(day) ||
+      (hour != null && (Number(hour) > 23 || Number(minute) > 59 || Number(second ?? 0) > 59)) ||
+      (zone && zone !== 'Z' && (Number(zone.slice(1, 3)) > 23 || Number(zone.slice(4)) > 59))) throw new Error('invalid since date/time')
+  const instant = Date.parse(zone ? value : `${value}T00:00:00Z`)
+  if (!Number.isFinite(instant)) throw new Error('invalid since date/time')
+  const utc = new Date(instant).toISOString()
+  return match[7]?.length > 3 ? utc.replace(/\.\d{3}Z$/, `.${match[7].padEnd(6, '0')}Z`) : utc
+}
+
 export function explorerReduce(state, { ch = '', key = {} }) {
   if (state.searching) {
     if (key.escape) return { ...state, searching: false, searchDraft: '' }
     if (key.return) {
       if (state.searchTarget && state.searchTarget !== 'local') {
-        const value = state.searchDraft
-        if (state.searchTarget === 'since' && value && Number.isNaN(Date.parse(value))) return { ...state, notice: 'use an ISO date' }
+        let value = state.searchDraft
+        if (state.searchTarget === 'since' && value) {
+          try { value = normalizeSince(value) }
+          catch { return { ...state, notice: 'Invalid since date/time: use YYYY-MM-DD or a valid datetime with Z/offset' } }
+        }
         return { ...state, searching: false, filters: { ...state.filters, [state.searchTarget]: value },
           offset: 0, selected: 0, query: '', data: null, anchor: undefined, loading: true,
           revision: state.revision + 1, notice: '' }
@@ -494,8 +535,10 @@ export function explorerReduce(state, { ch = '', key = {} }) {
   }
   if (ch === 'v' && state.page === 'detail') return { ...state, showExport: !state.showExport, scroll: 0 }
   if (ch === 'm' && state.page !== 'metrics') {
-    const sessionId = state.page === 'sessions' ? explorerItems(state)[state.selected]?.session_id : state.sessionId
-    return sessionId ? navigateExplorer(state, 'metrics', { sessionId }) : state
+    const item = state.page === 'sessions' ? explorerItems(state)[state.selected] : null
+    const sessionId = item ? item.session_id : state.sessionId
+    const adapterId = state.page === 'sessions' ? item?.adapter_id ?? '' : state.adapterId
+    return sessionId ? navigateExplorer(state, 'metrics', { sessionId, adapterId }) : state
   }
   if (state.page === 'metrics' || state.showExport) {
     const delta = key.pageDown ? 10 : key.pageUp ? -10 : key.downArrow || ch === 'j' ? 1 : key.upArrow || ch === 'k' ? -1 : 0
@@ -508,8 +551,9 @@ export function explorerReduce(state, { ch = '', key = {} }) {
     if (ch === 'n' || ch === 'N') return moveDetailMatch(state, ch === 'N')
     const lines = detailLines(state)
     const maxScroll = Math.max(0, lines.length - (state.detailHeight ?? 1))
-    const section = { i: '[input]', o: '[output]', x: '[error]', g: '[span]' }[ch]
-    if (section) return { ...state, matchRow: null, scroll: Math.min(maxScroll, Math.max(0, lines.indexOf(section))) }
+    const section = { i: 'input', o: 'output', x: 'error', g: 'span' }[ch]
+    if (section) return { ...state, matchRow: null, scroll: Math.min(maxScroll,
+      detailSections.get(lines)?.[section] ?? 0) }
     return delta ? { ...state, matchRow: null, scroll: Math.max(0, Math.min(maxScroll, state.scroll + delta)) } : state
   }
   if (ch === 'e' && state.page === 'spans') return { ...state, errorsOnly: !state.errorsOnly, collapsed: [], selected: 0 }
@@ -523,7 +567,7 @@ export function explorerReduce(state, { ch = '', key = {} }) {
     return { ...state, collapsed, selected: Math.min(state.selected, explorerItems({ ...state, collapsed }).length - 1) }
   }
   if (key.return) {
-    if (state.page === 'sessions') return navigateExplorer(state, 'turns', { sessionId: item.session_id })
+    if (state.page === 'sessions') return navigateExplorer(state, 'turns', { sessionId: item.session_id, adapterId: item.adapter_id ?? '' })
     if (state.page === 'turns') return navigateExplorer(state, 'spans', { traceId: item.trace_id })
     return navigateExplorer(state, 'detail', { spanId: item.span_id })
   }
@@ -571,23 +615,28 @@ export function wrapExplorer(value, width) {
 const logicalCache = new WeakMap()
 const rowsCache = new WeakMap()
 const matchesCache = new WeakMap()
+const logicalSections = new WeakMap()
+const detailSections = new WeakMap()
 
 function spanLogicalLines(span) {
   if (span && logicalCache.has(span)) return logicalCache.get(span)
   if (!span) return ['span not found in snapshot; press b then r']
   const output = []
+  const sections = new Map()
   for (const [label, value] of [
     ['span', span.span_id], ['kind / name', `${span.kind} / ${span.name}`],
     ['status', span.status], ['duration', `${fmtDur(span.duration_ms)}${span.duration_suspect ? ' (suspect: resume gap)' : ''}`],
     ['model', span.model], ['tokens', span.tokens], ['input', span.input], ['output', span.output],
     ['error', span.error], ['privacy', span.privacy]
   ]) {
+    sections.set(output.length, label)
     output.push(`[${label}]`)
     const text = value == null ? '(not captured)' : typeof value === 'string' ? value : JSON.stringify(value, null, 2)
     output.push(...terminalSafe(text.slice(0, 100000)).replace(/\t/g, '  ').split('\n'))
     if (text.length > 100000) output.push('(section truncated at 100000 characters)')
   }
   logicalCache.set(span, output)
+  logicalSections.set(output, sections)
   return output
 }
 
@@ -596,7 +645,13 @@ export function spanDetails(span, width) {
   if (!rowsCache.has(span)) rowsCache.set(span, new Map())
   const cache = rowsCache.get(span)
   if (cache.has(width)) return cache.get(width)
-  const rows = spanLogicalLines(span).flatMap(line => wrapExplorer(line, width))
+  const logical = spanLogicalLines(span), rows = [], sections = {}
+  for (const [index, line] of logical.entries()) {
+    const section = logicalSections.get(logical)?.get(index)
+    if (section) sections[section] = rows.length
+    rows.push(...wrapExplorer(line, width))
+  }
+  detailSections.set(rows, sections)
   if (cache.size >= 4) cache.delete(cache.keys().next().value)
   cache.set(width, rows)
   return rows
@@ -624,7 +679,8 @@ function exportRows(state, width) {
   const address = new URL(state.base)
   if (address.hostname !== '127.0.0.1' || address.protocol !== 'http:') return wrapExplorer('Export helper supports local loopback HTTP only.', width)
   const quote = value => "'" + String(value).replaceAll("'", "'\"'\"'") + "'"
-  const command = `python3 scripts/export-span.py --trace ${quote(state.traceId)} --span ${quote(state.spanId)} --output span.json --port ${address.port || 80}`
+  const context = (state.adapterId ? ` --agent ${quote(state.adapterId)}` : '') + (state.sessionId ? ` --session ${quote(state.sessionId)}` : '')
+  const command = `python3 scripts/export-span.py --trace ${quote(state.traceId)} --span ${quote(state.spanId)}${context} --output span.json --port ${address.port || 80}`
   return ['FULL STORED CAPTURE EXPORT', 'Run from the agent-trace repo in another terminal:', command,
     'Uses the existing local token. Writes mode 0600; refuses overwrite.',
     'No additional payload redaction is disabled. Press v to return.'].flatMap(line => wrapExplorer(line, width))
@@ -658,7 +714,7 @@ export function explorerRows(state, width, height) {
 }
 
 export function explorerSearchStatus(state, width = 100) {
-  if (state.searching) return `${state.searchTarget === 'local' ? 'find' : state.searchTarget}> ${wrapExplorer(state.searchDraft + '_', Math.max(2, width - 8)).at(-1)}`
+  if (state.searching) return `${state.notice ? state.notice + ' | ' : ''}${state.searchTarget === 'local' ? 'find' : state.searchTarget}> ${wrapExplorer(state.searchDraft + '_', Math.max(2, width - 8)).at(-1)}`
   if (state.error) return `STALE: ${state.error} | r retry`
   if (state.notice) return state.notice
   if (!state.query) {
@@ -688,11 +744,11 @@ function registerExplorer(sdk, pinDock) {
         try {
           const data = await loadExplorer(state, { signal: controller.signal })
           if (active) updateWidget(app, current => {
-            if (explorerResource(current) !== resource || current.revision !== state.revision || current.searching) return current
+            if (current.base !== state.base || current.adapterId !== state.adapterId || current.sessionId !== state.sessionId || explorerResource(current) !== resource || current.revision !== state.revision || current.searching) return current
             return applyExplorerData(current, data)
           })
         } catch (error) {
-          if (active) updateWidget(app, current => explorerResource(current) === resource && current.revision === state.revision
+          if (active) updateWidget(app, current => current.base === state.base && current.adapterId === state.adapterId && current.sessionId === state.sessionId && explorerResource(current) === resource && current.revision === state.revision
             ? { ...current, loading: false, error: describe(error).message } : current)
         } finally {
           if (active && state.live) timer = setTimeout(pull, POLL_MS)
@@ -700,7 +756,7 @@ function registerExplorer(sdk, pinDock) {
       }
       pull()
       return () => { active = false; clearTimeout(timer); controller.abort() }
-    }, [state.base, resource, state.revision, state.live, state.searching])
+    }, [state.base, state.adapterId, state.sessionId, resource, state.revision, state.live, state.searching])
     if (state.loading && !state.data && !state.showHelp) return h(Box, { width, height }, h(ShimmerRows, {
       color: t.color.muted, highlight: t.color.label, rows: Array.from({ length: Math.min(4, height) }, () => [Math.max(1, width - 2)])
     }))
@@ -711,13 +767,14 @@ function registerExplorer(sdk, pinDock) {
   }
   app = defineWidgetApp({
     id: 'tracex', help: 'browse sessions, turn trees, and LLM/tool inputs, outputs, errors', mode: 'modal',
-    usage: 'usage: /tracex [session-id] [http://127.0.0.1:8741]',
+    usage: 'usage: /tracex [session-id] [http://127.0.0.1:8741] [--agent ADAPTER]',
     init: explorerInit,
     reduce(state, input) {
       if (!state.searching && !state.showHelp && (input.ch === 'p' || input.ch === 'G')) {
         const sessionId = input.ch === 'G' ? '' : state.page === 'sessions' ? explorerItems(state)[state.selected]?.session_id : state.sessionId
+        const adapterId = input.ch === 'G' ? '' : state.page === 'sessions' ? explorerItems(state)[state.selected]?.adapter_id ?? '' : state.adapterId
         if (sessionId == null) return state
-        pinDock(state.base, sessionId)
+        pinDock(state.base, sessionId, adapterId)
         return { ...state, notice: sessionId ? 'dock pinned to selected session' : 'dock switched to global' }
       }
       return explorerReduce(state, input)

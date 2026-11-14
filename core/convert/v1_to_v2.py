@@ -129,7 +129,7 @@ class EpisodeTracker:
     same records appearing in two files dedup instead of duplicating.
     """
 
-    def __init__(self, seed: dict[str, Any] | None = None) -> None:
+    def __init__(self, seed: dict[tuple[str, str], Any] | None = None) -> None:
         #: key -> [episode_ts, block_turn, block_first_ts, open span keys]
         #: [episode_ts, block_turn, block_first_ts, open span keys, last turn id]
         self._state: dict[tuple[str, str], list[Any]] = {}
@@ -166,9 +166,10 @@ class EpisodeTracker:
             st[3][_span_key(rec)] = ts
         elif event in _SPAN_END:
             st[3].pop(_span_key(rec), None)
-        return st[0] or st[2]
+        episode = st[0] or st[2]
+        return episode if isinstance(episode, str) else None
 
-    def snapshot(self) -> dict[str, Any]:
+    def snapshot(self) -> dict[tuple[str, str], Any]:
         """Serialisable state, for continuing a session in a later process.
 
         The open-span set travels with it: a tail that starts mid-span must not

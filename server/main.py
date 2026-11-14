@@ -45,7 +45,8 @@ from pathlib import Path
 from typing import Any, cast
 from urllib.parse import parse_qs, unquote, urlparse
 
-from core.query import (get_span, get_trace, list_adapters, list_sessions,
+from core.query import (AmbiguousSessionError, AmbiguousTraceError, InvalidSinceError,
+                        get_span, get_trace, list_adapters, list_sessions,
                         list_traces, overview, session_metrics)
 from core.storage.indexer import Indexer, ScanReport
 from core.storage.sqlite_store import TraceStore
@@ -260,6 +261,13 @@ class Handler(BaseHTTPRequestHandler):
             self._do_get()
         except (BrokenPipeError, ConnectionResetError):
             return                      # the client went away; not our problem
+        except AmbiguousTraceError as exc:
+            self._send_json({"error": str(exc), "trace_id": exc.trace_id}, 409)
+        except AmbiguousSessionError as exc:
+            self._send_json({"error": str(exc), "session_id": exc.session_id,
+                             "adapters": exc.adapters}, 409)
+        except InvalidSinceError as exc:
+            self._send_json({"error": str(exc)}, 400)
         except Exception:               # noqa: BLE001
             # One bad request must not take the dashboard down, and it must not
             # vanish either: this used to escape into socketserver's default
@@ -271,7 +279,7 @@ class Handler(BaseHTTPRequestHandler):
     def _do_get(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path
-        qs = parse_qs(parsed.query)
+        qs = parse_qs(parsed.query, keep_blank_values=True)
 
         if path == "/" or path == "/index.html":
             if not self._guard(api=False):
@@ -459,13 +467,15 @@ class Handler(BaseHTTPRequestHandler):
             # Split the encoded path first: an ID may itself contain /spans/.
             parts = path[len("/api/traces/"):].split("/")
             if len(parts) == 3 and parts[1] == "spans":
-                span = get_span(store, unquote(parts[0]), unquote(parts[2]))
+                span = get_span(store, unquote(parts[0]), unquote(parts[2]),
+                                agent=_one(qs, "agent"), session=_one(qs, "session"))
                 self._send_json(span if span is not None
                                 else {"error": "span not found"},
                                 200 if span is not None else 404)
                 return
             trace_id = unquote(path[len("/api/traces/"):])
-            trace = get_trace(store, trace_id, summary=_one(qs, "summary") == "1")
+            trace = get_trace(store, trace_id, summary=_one(qs, "summary") == "1",
+                              agent=_one(qs, "agent"), session=_one(qs, "session"))
             if trace is None:
                 self._send_json({"error": "trace not found"}, 404)
             else:
@@ -477,14 +487,14 @@ class Handler(BaseHTTPRequestHandler):
                 model=_one(qs, "model"), since=_one(qs, "since")))
         elif path.startswith("/api/sessions/") and path.endswith("/metrics"):
             raw = path[len("/api/sessions/"):-len("/metrics")]
-            metrics = session_metrics(store, unquote(raw))
+            metrics = session_metrics(store, unquote(raw), agent=_one(qs, "agent"))
             self._send_json(metrics if metrics is not None
                             else {"error": "session not found"},
                             200 if metrics is not None else 404)
         elif path.startswith("/api/sessions/"):
             from core.query import session_detail
             raw = path[len("/api/sessions/"):]
-            detail = session_detail(store, unquote(raw))
+            detail = session_detail(store, unquote(raw), agent=_one(qs, "agent"))
             self._send_json(detail if detail is not None
                             else {"error": "session not found"},
                             200 if detail is not None else 404)

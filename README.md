@@ -121,6 +121,29 @@ share of agent time, and where the gaps were) · **Datasets / Experiments** ·
 A trace is **one turn** — that is what "one task execution" means — which is why
 per-conversation time lives on the session page.
 
+## Incremental index recovery
+
+Writers must finish each JSONL record with a newline. An unfinished EOF line, including partial
+UTF-8, is deferred rather than counted as corrupt or consumed. The persisted cursor is the last
+complete line actually read, not a later observation of file size; concurrent appends remain
+eligible for the next scan.
+
+A file's events, spans, episode seeds and cursor publish together. Durable redo/dirty markers
+repair interrupted direct-ingest projections on startup or normal scanning. Destructive source
+invalidation uses an ordered, atomic replay rather than seeding a full reread from the previous
+stream's final turn. Complete scans and rebuilds serialize seed/cursor decisions using SQLite's
+writer transaction, including across separate processes; slow scans can delay other writers,
+while WAL readers remain usable. Replays do not rewrite JSONL.
+
+The source contract remains append-only. Atomic file replacement and truncation are detected;
+a same-inode, non-shrinking in-place rewrite with a newer mtime is not guaranteed to be detected.
+Use a controlled rebuild after intentionally rewriting historical contents.
+
+These guarantees prevent/recover interruptions under this version. They do **not** prove an older
+index never skipped data before the upgrade: previously missing records or incorrectly duplicated
+identities may require a controlled full rebuild from source. Back up and validate first; no
+automatic rebuild of an existing capture library is performed by this change.
+
 ## TUI inside Hermes
 
 Minimum supported terminal width: 24 columns.
@@ -172,6 +195,18 @@ span to inspect input, output, error, model, tokens, and privacy metadata.
 The widget SDK does not expose the active chat ID: no-argument launch is a
 session picker, **not** a guess based on the most recently active session.
 
+A session is identified by **adapter + session ID**. The picker retains both through refresh,
+Back, diagnostics and dock pinning. For a direct launch, use
+`/tracex <session-id> [server-url] --agent <adapter>` or
+`/agenttrace session <session-id> [server-url] --agent <adapter>`.
+An ID unique across adapters still works without `--agent`; an ambiguous ID fails explicitly
+instead of merging different agents. The CLI equivalent is `agenttrace session <id> --agent hermes`.
+Session detail/metrics HTTP requests accept the `agent` query parameter; ambiguous unqualified IDs
+return HTTP 409, and a missing selected namespace returns 404. Trace and span reads also carry
+`agent` and `session` selectors; entering details must not discard the session namespace.
+Unqualified trace IDs work only when their namespace is unique.
+
+
 - Up/Down or j/k: select or scroll; PageUp/PageDown: move ten rows.
 - Enter: drill down; Space: fold/unfold a tree node; e: toggle error spans.
 - b or Esc: back; q: close from any page; r: refresh the current snapshot.
@@ -180,7 +215,10 @@ session picker, **not** a guess based on the most recently active session.
 
 `/` searches the **loaded snapshot only**. In the session picker, **f** searches the entire index
 by ID/model/working directory/adapter; **a**, **M**, and **t** set exact agent, exact model, and
-last-activity-since (ISO date/time) filters. Left/Right changes pages of 50 sessions; the header
+last-activity-since (ISO date/time) filters. Date-only filters mean UTC midnight. Timestamps must
+include `Z` or an explicit offset, such as `2026-11-12T08:00:00+08:00`; equivalent instants
+compare equally, including the boundary. Invalid dates and timezone-less timestamps are rejected,
+not interpreted using the machine's local timezone. Left/Right changes pages of 50 sessions; the header
 shows the indexed total. Clear each filter with its editor, Ctrl+u, Enter. Backend search is literal,
 including `%` and `_`; it is not full payload search. Tree find includes folded children without
 losing fold state. Detail find crosses display wraps, tracks at most 1,000 matching rows, and preserves whitespace.
@@ -207,7 +245,8 @@ python3 scripts/export-span.py --trace TRACE_ID --span SPAN_ID --output span.jso
 ```
 
 The helper only contacts loopback HTTP, reads the existing local token, verifies both IDs, refuses
-redirects/overwrite, and creates the output with mode `0600`. Captures can contain sensitive data.
+redirects/overwrite, and creates the output with mode `0600`. For namespaced traces, include
+`--agent ADAPTER --session SESSION_ID` (the TUI export command supplies them). Captures can contain sensitive data.
 
 
 ## Evaluation

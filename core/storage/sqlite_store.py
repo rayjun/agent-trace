@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator, cast
@@ -40,6 +41,11 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
+);
+
+-- Durable redo queue: archive commits never leave an unrecorded projection gap.
+CREATE TABLE IF NOT EXISTS projection_pending (
+  event_id TEXT PRIMARY KEY
 );
 
 CREATE TABLE IF NOT EXISTS ingest_files (
@@ -290,7 +296,7 @@ class TraceStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
-        self._write_lock = threading.Lock()
+        self._write_lock = threading.RLock()
         #: Per-ingest counters. "Rejected" used to cover three very different
         #: things — an event already present (idempotent re-read, expected), an
         #: event whose id already carried a DIFFERENT payload (an adapter bug),
@@ -301,6 +307,59 @@ class TraceStore:
         self.duplicate_conflicts = 0
         self.invalid = 0
         self._init_schema()
+        self.recover_projections()
+
+    def _commit(self, conn: sqlite3.Connection) -> None:
+        if not getattr(self._local, "transaction_depth", 0):
+            conn.commit()
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Atomically publish file events, episode seed and complete-line cursor.
+
+        Nested store methods defer commits. Abrupt exit rolls back the file,
+        so replay never starts with an end seed and a stale cursor.
+        """
+        with self._write_lock:
+            conn = self._conn()
+            depth = getattr(self._local, "transaction_depth", 0)
+            if not depth:
+                conn.execute("BEGIN IMMEDIATE")
+            self._local.transaction_depth = depth + 1
+            counters = (self.added, self.duplicates, self.duplicate_conflicts, self.invalid)
+            try:
+                yield
+                if not depth:
+                    conn.commit()
+            except BaseException:
+                if not depth:
+                    conn.rollback()
+                    (self.added, self.duplicates,
+                     self.duplicate_conflicts, self.invalid) = counters
+                raise
+            finally:
+                self._local.transaction_depth = depth
+
+    def recover_projections(self) -> None:
+        """Replay interrupted span writes, then finish the durable dirty refresh.
+
+        Redo deletion and refresh-marker deletion are atomic with their effects;
+        recovery can itself be interrupted and repeated.
+        """
+        if not self.one("SELECT 1 FROM projection_pending LIMIT 1") and not self.one(
+                "SELECT 1 FROM meta WHERE key='projections_dirty'"):
+            return  # Idle scans need neither a SQLite writer nor a refresh.
+        with self.transaction():
+            conn = self._conn()
+            rows = conn.execute(
+                "SELECT e.payload FROM projection_pending p CROSS JOIN events e"
+                " ON e.event_id=p.event_id ORDER BY e.ts, e.rowid").fetchall()
+            for row in rows:
+                self._apply_to_spans(json.loads(row[0]))
+            conn.execute("DELETE FROM projection_pending")
+            if rows or conn.execute(
+                    "SELECT 1 FROM meta WHERE key='projections_dirty'").fetchone():
+                self.refresh_projections()
 
     def _conn(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
@@ -352,7 +411,7 @@ class TraceStore:
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (str(DB_SCHEMA_VERSION),))
                 conn.execute("DELETE FROM meta WHERE key='needs_rebuild'")
-            conn.commit()
+            self._commit(conn)
 
     def compact(self, *, full: bool = True) -> tuple[int, int]:
         """Give freed pages back to the filesystem. Returns (before, after) bytes.
@@ -423,7 +482,7 @@ class TraceStore:
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (str(DB_SCHEMA_VERSION),))
             conn.execute("DELETE FROM meta WHERE key='needs_rebuild'")
-            conn.commit()
+            self._commit(conn)
 
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:
@@ -509,7 +568,6 @@ class TraceStore:
                         self.duplicate_conflicts += 1
                     else:
                         self.duplicates += 1
-                    conn.rollback()
                     return False
                 cur = conn.execute(
                     "INSERT INTO events"
@@ -521,15 +579,21 @@ class TraceStore:
                      event.get("trace_id"), event.get("span_id"),
                      json.dumps(event, ensure_ascii=False),
                      source_file, source_line))
-                conn.commit()
+                conn.execute("INSERT OR IGNORE INTO projection_pending VALUES (?)",
+                             (event["event_id"],))
+                conn.execute("INSERT OR REPLACE INTO meta VALUES ('projections_dirty','1')")
+                self._commit(conn)
             except sqlite3.Error:
                 conn.rollback()
-                return False
+                raise
         if cur.rowcount == 0:
             self.duplicates += 1
             return False  # duplicate event_id: deduped, projections unchanged
         self.added += 1
-        self._apply_to_spans(event)
+        with self.transaction():
+            self._apply_to_spans(event)
+            self._conn().execute("DELETE FROM projection_pending WHERE event_id=?",
+                                 (event["event_id"],))
         return True
 
     def _apply_to_spans(self, event: dict[str, Any]) -> None:
@@ -677,7 +741,7 @@ class TraceStore:
                      json.dumps(merged_attrs, ensure_ascii=False),
                      0 if is_start else 1,
                      span_id, trace_id))
-            conn.commit()
+            self._commit(conn)
 
     # ------------------------------------------------------------------
     # projections
@@ -693,7 +757,7 @@ class TraceStore:
         are RECOMPUTED each pass — an incremental ingest that appends to a
         turn widens its task instead of freezing it at first sight.
         """
-        with self._write_lock:
+        with self.transaction():
             conn = self._conn()
             # Roots are traces that HAVE children (v1-converted turns) OR
             # traces that carry only discrete events. The second case matters:
@@ -781,7 +845,8 @@ class TraceStore:
                      _duration_ms(first_ts, last_ts),
                      json.dumps(attrs)))
             self._refresh_sessions(conn)
-            conn.commit()
+            conn.execute("DELETE FROM meta WHERE key='projections_dirty'")
+            self._commit(conn)
 
     def _refresh_sessions(self, conn: sqlite3.Connection) -> None:
         """Sessions from events; `ended` when a session_end event exists.
@@ -840,9 +905,10 @@ class TraceStore:
         with self._write_lock:
             conn = self._conn()
             for table in ("events", "spans", "sessions", "ingest_files",
-                          "session_episodes"):
+                          "session_episodes", "projection_pending"):
                 conn.execute(f"DELETE FROM {table}")
-            conn.commit()
+            conn.execute("DELETE FROM meta WHERE key IN ('projections_dirty','source_replay')")
+            self._commit(conn)
 
     def rebuild_projections(self) -> None:
         """Drop and replay every projection from the events archive.
@@ -851,18 +917,19 @@ class TraceStore:
         SQLite is derived. Replay in ts order so span upserts see starts
         before ends where the source had them so.
         """
-        with self._write_lock:
-            conn = self._conn()
-            conn.execute("DELETE FROM spans")
-            conn.execute("DELETE FROM sessions")
-            rows = conn.execute(
-                "SELECT payload FROM events ORDER BY ts, rowid").fetchall()
-            conn.commit()
-        for (payload,) in rows:
-            event = json.loads(payload)
-            if event["type"] in ("span_start", "span_end"):
-                self._upsert_span(event, is_start=event["type"] == "span_start")
-        self.refresh_projections()
+        with self.transaction():
+            with self._write_lock:
+                conn = self._conn()
+                conn.execute("DELETE FROM spans")
+                conn.execute("DELETE FROM sessions")
+                rows = conn.execute(
+                    "SELECT payload FROM events ORDER BY ts, rowid").fetchall()
+                self._commit(conn)
+            for (payload,) in rows:
+                event = json.loads(payload)
+                if event["type"] in ("span_start", "span_end"):
+                    self._upsert_span(event, is_start=event["type"] == "span_start")
+            self.refresh_projections()
 
     # ------------------------------------------------------------------
     # ingest file bookkeeping
@@ -890,11 +957,11 @@ class TraceStore:
                 "   last_error=excluded.last_error, updated_at=excluded.updated_at",
                 (path, size, mtime, inode, indexed_bytes, corrupt_lines,
                  last_error, now_iso()))
-            conn.commit()
+            self._commit(conn)
 
-    def session_seeds(self) -> dict[str, Any]:
+    def session_seeds(self) -> dict[tuple[str, str], Any]:
         """Episode-tracker state per (adapter, session), for EpisodeTracker."""
-        out: dict[str, Any] = {}
+        out: dict[tuple[str, str], Any] = {}
         for row in self.query(
                 "SELECT adapter_id, session_id, episode_ts, block_turn,"
                 "       block_first_ts, open_spans FROM session_episodes"):
@@ -933,12 +1000,29 @@ class TraceStore:
                 "   updated_at=excluded.updated_at",
                 (adapter, session, episode_ts or "", block_turn, block_first_ts,
                  json.dumps(list(open_keys)), now_iso()))
-            conn.commit()
+            self._commit(conn)
 
     def indexed_files(self) -> list[str]:
         """Every source file the projection currently claims to have read."""
         return [r[0] for r in self.query(
             "SELECT path FROM ingest_files ORDER BY path")]
+
+    def replay_required(self) -> bool:
+        return self.one("SELECT 1 FROM meta WHERE key='source_replay'") is not None
+
+    def prepare_replay(self, paths: list[str]) -> None:
+        """Forget reachable sources before ordered replay, in its transaction.
+
+        Removing an earlier boundary can change identities in surviving files.
+        Keeping old rows and merely deduping a replay preserves obsolete ids.
+        Unmounted sources are deliberately left alone.
+        """
+        conn = self._conn()
+        conn.executemany("DELETE FROM events WHERE source_file=?", ((p,) for p in paths))
+        self.rebuild_projections()
+
+    def finish_replay(self) -> None:
+        self._conn().execute("DELETE FROM meta WHERE key='source_replay'")
 
     def rekey_file(self, old: str, new: str) -> None:
         """Move a file's rows onto the canonical spelling of its path.
@@ -961,7 +1045,7 @@ class TraceStore:
                 conn.execute("DELETE FROM ingest_files WHERE path = ?", (old,))
             conn.execute("UPDATE events SET source_file = ? WHERE source_file = ?",
                          (new, old))
-            conn.commit()
+            self._commit(conn)
 
     def drop_files(self, paths: list[str]) -> int:
         """Forget source files that no longer exist, and their rows with them.
@@ -979,15 +1063,17 @@ class TraceStore:
         from core.storage.discovery import resolved_path
         paths = [resolved_path(p) for p in paths]
         dropped = 0
-        with self._write_lock:
+        with self.transaction():
             conn = self._conn()
             for path in paths:
                 cur = conn.execute("DELETE FROM events WHERE source_file = ?", (path,))
                 dropped += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
                 conn.execute("DELETE FROM ingest_files WHERE path = ?", (path,))
             conn.execute("UPDATE ingest_files SET indexed_bytes = 0")
-            conn.commit()
-        self.rebuild_projections()
+            conn.execute("DELETE FROM session_episodes")
+            conn.execute("INSERT OR REPLACE INTO meta VALUES ('source_replay','1')")
+            self._commit(conn)
+            self.rebuild_projections()
         return dropped
 
     def invalidate_file(self, path: str) -> None:
@@ -1003,13 +1089,15 @@ class TraceStore:
         idempotent, and a rotation is rare enough that the extra pass is the
         cheap way to keep "JSONL is truth" actually true.
         """
-        with self._write_lock:
+        with self.transaction():
             conn = self._conn()
             conn.execute("DELETE FROM events WHERE source_file = ?", (path,))
             conn.execute("DELETE FROM ingest_files WHERE path = ?", (path,))
             conn.execute("UPDATE ingest_files SET indexed_bytes = 0")
-            conn.commit()
-        self.rebuild_projections()
+            conn.execute("DELETE FROM session_episodes")
+            conn.execute("INSERT OR REPLACE INTO meta VALUES ('source_replay','1')")
+            self._commit(conn)
+            self.rebuild_projections()
 
     # ------------------------------------------------------------------
     # queries used by the HTTP layer (rows out; shaping lives in core/query)

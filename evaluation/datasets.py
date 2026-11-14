@@ -123,8 +123,12 @@ def import_jsonl(store: TraceStore, path_or_text: str,
                  dataset_id: str | None = None) -> dict[str, Any]:
     """Import a JSONL dataset. With dataset_id, append to it; otherwise the
     file's dataset header names a new dataset."""
-    text = (Path(path_or_text).read_text(encoding="utf-8")
-            if Path(path_or_text).is_file() else path_or_text)
+    source = Path(path_or_text)
+    try:
+        is_file = source.is_file()
+    except (OSError, ValueError):
+        is_file = False
+    text = source.read_text(encoding="utf-8") if is_file else path_or_text
     target = dataset_id
     imported = skipped = 0
     for line in text.splitlines():

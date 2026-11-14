@@ -21,6 +21,7 @@ the file, and honesty about provenance beats a guessed number.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -81,6 +82,12 @@ class ScanReport:
         return out
 
 
+class _SourceChanged(OSError):
+    def __init__(self, path: Path) -> None:
+        super().__init__(f"source changed while reading: {path}")
+        self.path = path
+
+
 class Indexer:
     def __init__(self, store: TraceStore, dirs: list[Path]) -> None:
         self.store = store
@@ -121,52 +128,83 @@ class Indexer:
         return {**event, "resource": {**base_resource, "git": git.to_dict()}}
 
     def scan_once(self) -> ScanReport:
+        # BEGIN IMMEDIATE must precede seed acquisition AND cursor decisions:
+        # the per-store RLock cannot exclude another store/process on this DB.
+        # Tradeoff: even idle scans take the SQLite writer slot, and slow file
+        # reads/workspace enrichment hold it for the whole pass (other writers
+        # wait up to busy_timeout). WAL readers retain their committed snapshot.
+        with self.store._write_lock:
+            for _ in range(3):
+                try:
+                    with self.store.transaction():
+                        report = self._scan_pass()
+                    # Publish the seed/cursor unit before derived refresh. The
+                    # durable dirty marker recovers a crash here; refresh itself
+                    # takes a writer transaction and derives from current rows.
+                    if report.changed or report.files_rekeyed:
+                        try:
+                            self.store.refresh_projections()
+                        except sqlite3.Error as exc:
+                            report.errors.append(f"refresh_projections: {exc}")
+                    return report
+                except _SourceChanged as exc:
+                    # Nested transactions have no savepoints. Unwind the OUTER
+                    # transaction before invalidating, then acquire fresh seeds.
+                    self.store.invalidate_file(resolved_path(exc.path))
+                except OSError as exc:
+                    return ScanReport(errors=[str(exc)])
+            return ScanReport(errors=["source repeatedly changed; retry next scan"])
+
+    def _scan_pass(self) -> ScanReport:
         report = ScanReport()
+        self.store.recover_projections()
         before = self._counters()
         files = list(iter_trace_files(self.dirs))
         present = {str(p) for p in files}
-        # A tail continues the human turn the last pass left; the episode of a
-        # record already placed in THIS pass is reused, so the same record in two
-        # files lands on the same ids.
+        report.files_rekeyed = self._rekey(present)
+        report.files_dropped = self._drop_vanished(present)
+        # Preflight all invalidations before choosing the replay start state.
+        # invalidate_file clears seeds as well as rewinding every file cursor.
+        for path in files:
+            try:
+                state = self.store.file_state(resolved_path(path))
+                if state is not None and self._replaced(path.stat(), state):
+                    self.store.invalidate_file(resolved_path(path))
+                    report.files_invalidated += 1
+            except OSError as exc:
+                report.errors.append(f"{path}: {exc}")
+        if self.store.replay_required():
+            # The enclosing scan transaction also makes ordered replay atomic.
+            self.store.prepare_replay([resolved_path(p) for p in files])
+            self._scan_files(files, report, before)
+            if report.errors:
+                raise OSError("source replay incomplete: " + "; ".join(report.errors))
+            self.store.finish_replay()
+        else:
+            self._scan_files(files, report, before)
+        # A caught per-file error cannot commit partial nested transactions:
+        # they defer commits but do not provide rollback savepoints.
+        if report.errors:
+            raise OSError("source scan incomplete: " + "; ".join(report.errors))
+        return report
+
+    def _scan_files(self, files: list[Path], report: ScanReport,
+                    before: tuple[int, int, int, int]) -> None:
         self._tracker = EpisodeTracker(self.store.session_seeds())
         self._seen = {}
-        # Before the loop, not after: a key written under an older spelling has
-        # to be corrected first, or this pass reads the whole file again (a
-        # 1.6 GB trace) just to dedup it.
-        report.files_rekeyed = self._rekey(present)
         for path in files:
             report.files_seen += 1
             try:
                 self._scan_file(Path(path), report)
+            except _SourceChanged:
+                raise
             except OSError as exc:
                 report.errors.append(f"{path}: {exc}")
-        # A shrink rewinds EVERY file's offset (see invalidate_file), but files
-        # already visited earlier in this pass were skipped as "unchanged"
-        # before the rewind happened — so a deduped event could stay missing
-        # until the next scan. One extra pass over the file set closes that
-        # window; event_id dedup keeps it idempotent.
-        if report.files_invalidated:
-            for path in files:
-                try:
-                    self._scan_file(Path(path), report)
-                except OSError as exc:
-                    report.errors.append(f"{path}: {exc}")
-        report.files_dropped = self._drop_vanished(present)
         # Counters BEFORE the refresh decision: `report.changed` reads
         # events_added, which is a diff of the store's counters, so asking the
         # question first and computing the diffs after silently answered "nothing
         # changed" on every pass and the projection stopped updating entirely.
         self._report_counters(report, before)
-        # Refresh only when the projection can have changed. The refresh is not
-        # free (it re-derives every synthetic task and session row), and this
-        # runs on a timer: paying it on an idle tick made a 1s scan loop spend
-        # seconds per pass doing nothing.
-        if report.changed or report.files_rekeyed:
-            try:
-                self.store.refresh_projections()
-            except sqlite3.Error as exc:   # a read-only or locked index must not
-                report.errors.append(f"refresh_projections: {exc}")  # stop ingest
-        return report
 
     def _rekey(self, present: set[str]) -> int:
         """One-time: move keys written before paths were canonicalised.
@@ -219,6 +257,28 @@ class Indexer:
         return len(gone)
 
     def full_rebuild(self) -> ScanReport:
+        with self.store._write_lock:
+            for _ in range(3):
+                try:
+                    # Clearing the archive, rebuilding seeds and reading files
+                    # must exclude independent indexers just like a normal pass.
+                    with self.store.transaction():
+                        report = self._full_rebuild()
+                    break
+                except _SourceChanged:
+                    # Nothing from this attempt survived the outer rollback.
+                    continue
+                except OSError as exc:
+                    return ScanReport(errors=[str(exc)])
+            else:
+                return ScanReport(errors=["source repeatedly changed; retry next rebuild"])
+            # VACUUM/checkpoint cannot run inside the rebuild transaction.
+            prior, now = self.store.compact()
+            report.reclaimed_bytes = max(0, prior - now)
+            report.db_bytes = now
+            return report
+
+    def _full_rebuild(self) -> ScanReport:
         """Re-ingest everything from the JSONL files.
 
         The archive is CLEARED first. Without that this was not a rebuild at
@@ -240,18 +300,16 @@ class Indexer:
             report.files_seen += 1
             try:
                 self._ingest_from(Path(path), 0, report, full=True)
+            except _SourceChanged:
+                raise
             except OSError as exc:
                 report.errors.append(f"{path}: {exc}")
+        if report.errors:
+            raise OSError("source rebuild incomplete: " + "; ".join(report.errors))
         self.store.rebuild_projections()
         # The archive now holds ids this build mints, so the rebuild marker goes.
         self.store.mark_rebuilt()
         self._report_counters(report, before)
-        # Hand back the pages the clear/re-insert cycle left behind. This is the
-        # only place a full VACUUM is affordable: a rebuild already takes minutes
-        # and is an explicit, one-shot action.
-        prior, now = self.store.compact()
-        report.reclaimed_bytes = max(0, prior - now)
-        report.db_bytes = now
         return report
 
     def _counters(self) -> tuple[int, int, int, int]:
@@ -272,99 +330,106 @@ class Indexer:
         key = resolved_path(path)   # one spelling per file, whatever dir was passed
         state = self.store.file_state(key)
 
-        # Compare against the file's last OBSERVED size, not `indexed_bytes`:
-        # invalidate_file rewinds every file's offset to 0, so a file whose
-        # own shrink happens later in the same pass would compare its new size
-        # against 0, look "unchanged", and keep its stale events forever.
-        baseline = state["size"] if state is not None else 0
-        replaced = False
-        if state is not None:
-            # A file swapped for a DIFFERENT one is not an append, even when it
-            # is bigger: the stored offset then lands in the middle of a record
-            # and the tail read ingests fragments. Size alone could not see it.
-            if "inode" in state.keys() and state["inode"] is not None \
-                    and getattr(stat, "st_ino", None) is not None \
-                    and state["inode"] != stat.st_ino:
-                replaced = True
-            elif stat.st_mtime < (state["mtime"] or 0):
-                replaced = True      # restored from a backup
-        if state is not None and (stat.st_size < baseline or replaced):
-            self.store.invalidate_file(key)
-            report.files_invalidated += 1
-            state = None
+        if state is not None and self._replaced(stat, state):
+            raise _SourceChanged(path)
         if state is not None and stat.st_size == state["indexed_bytes"]:
             return  # unchanged
 
         offset = state["indexed_bytes"] if state is not None else 0
         self._ingest_from(path, offset, report, full=state is None)
 
+    @staticmethod
+    def _replaced(stat: os.stat_result, state: sqlite3.Row) -> bool:
+        return bool(stat.st_size < state["size"]
+                or (state["inode"] is not None and state["inode"] != stat.st_ino)
+                or stat.st_mtime < (state["mtime"] or 0))
+
     def _ingest_from(self, path: Path, offset: int, report: ScanReport,
                      full: bool) -> None:
-        key = resolved_path(path)   # one spelling per file, whatever dir was passed
-        corrupt = 0
-        last_error: str | None = None
-        lineno = 0
-        # Which human turn each session is inside. A full read of a FILE starts
-        # from that file's own content; a tail continues what the last pass left,
-        # because it begins in the middle of an episode. Seeding a full read from
-        # the projection made the same records mint different ids depending on
-        # what had been read before.
-        tracker = self._tracker
-        seen = self._seen
-        touched: dict[tuple[str, str], tuple[Any, ...]] = {}
-        with open(path, "rb") as fh:
-            fh.seek(offset)
-            for raw in fh:
-                lineno += 1
-                try:
-                    line = raw.decode("utf-8", "replace").strip()
-                except UnicodeDecodeError:  # pragma: no cover - decode(replace) cannot raise
-                    continue
-                if not line:
-                    continue
-                try:
-                    rec: Any = json.loads(line)
-                except json.JSONDecodeError:
-                    corrupt += 1
-                    last_error = f"line not JSON: {line[:120]}"
-                    continue
-                if not isinstance(rec, dict):
-                    corrupt += 1
-                    last_error = "line is not a JSON object"
-                    continue
-                episode = None
-                if rec.get("v") == 1:
-                    digest = _digest(rec)
-                    if digest in seen:
-                        # The same record, already placed in this pass: reuse its
-                        # episode so the duplicate gets the same event ids.
-                        episode = seen[digest]
-                    else:
-                        episode = tracker.step(rec)
-                        seen[digest] = episode
-                    skey = (rec.get("agent") or "unknown",
-                            rec.get("session_id") or "")
-                    st = tracker.snapshot().get(skey)
-                    if st is not None:
-                        touched[skey] = st
-                events = [self._enrich(e)
-                          for e in self._to_canonical(rec, episode)]
-                source_line: int | None = lineno if full else None
-                for event in events:
-                    # Counters live on the store (it is what knows why an
-                    # insert did not land); the report diffs them at the end.
-                    self.store.ingest(event, source_file=key,
-                                      source_line=source_line)
-        # Persist once per file, not per record: the episode only has to be
-        # correct for the NEXT scan's first record.
-        for (adapter, session), state in touched.items():
-            self.store.note_session_seed(adapter, session, *state)
-        stat = path.stat()
-        self.store.note_file(key, stat.st_size, stat.st_mtime, stat.st_size,
-                             corrupt_lines=corrupt, last_error=last_error,
-                             inode=getattr(stat, "st_ino", None))
-        report.corrupt_lines += corrupt
-        report.files_ingested += 1
+        seeds, initial_seen = self._tracker.snapshot(), self._seen.copy()
+        try:
+            with self.store.transaction():
+                key = resolved_path(path)   # one spelling per file, whatever dir was passed
+                corrupt = 0
+                last_error: str | None = None
+                lineno = 0
+                # A normal tail continues the committed episode seed. A source
+                # replay starts with empty seeds and visits files in discovery
+                # order, sharing both tracker and digest map across those files.
+                tracker = self._tracker
+                seen = self._seen
+                touched: dict[tuple[str, str], tuple[Any, ...]] = {}
+                complete = offset
+                with open(path, "rb") as fh:
+                    opened = os.fstat(fh.fileno())
+                    previous = self.store.file_state(key)
+                    if (previous is not None and self._replaced(opened, previous)) or opened.st_size < offset:
+                        raise _SourceChanged(path)
+                    fh.seek(offset)
+                    # Bound this read to the opening snapshot; later appends are next scan's work.
+                    while fh.tell() < opened.st_size:
+                        raw = fh.readline(opened.st_size - fh.tell())
+                        if not raw.endswith(b"\n"):
+                            break  # Preserve partial bytes on disk, including partial UTF-8.
+                        complete = fh.tell()
+                        lineno += 1
+                        try:
+                            line = raw.decode("utf-8", "replace").strip()
+                        except UnicodeDecodeError:  # pragma: no cover - decode(replace) cannot raise
+                            continue
+                        if not line:
+                            continue
+                        try:
+                            rec: Any = json.loads(line)
+                        except json.JSONDecodeError:
+                            corrupt += 1
+                            last_error = f"line not JSON: {line[:120]}"
+                            continue
+                        if not isinstance(rec, dict):
+                            corrupt += 1
+                            last_error = "line is not a JSON object"
+                            continue
+                        episode = None
+                        if rec.get("v") == 1:
+                            digest = _digest(rec)
+                            if digest in seen:
+                                # The same record, already placed in this pass: reuse its
+                                # episode so the duplicate gets the same event ids.
+                                episode = seen[digest]
+                            else:
+                                episode = tracker.step(rec)
+                                seen[digest] = episode
+                            skey = (rec.get("agent") or "unknown",
+                                    rec.get("session_id") or "")
+                            st = tracker.snapshot().get(skey)
+                            if st is not None:
+                                touched[skey] = st
+                        events = [self._enrich(e)
+                                  for e in self._to_canonical(rec, episode)]
+                        source_line: int | None = lineno if full else None
+                        for event in events:
+                            # Counters live on the store (it is what knows why an
+                            # insert did not land); the report diffs them at the end.
+                            self.store.ingest(event, source_file=key,
+                                              source_line=source_line)
+                # Persist once per file, not per record: the episode only has to be
+                # correct for the NEXT scan's first record.
+                for (adapter, session), state in touched.items():
+                    self.store.note_session_seed(adapter, session, *state)
+                stat = path.stat()
+                if ((stat.st_dev, stat.st_ino) != (opened.st_dev, opened.st_ino)
+                        or stat.st_size < opened.st_size or stat.st_mtime_ns < opened.st_mtime_ns
+                        or (stat.st_size == opened.st_size and stat.st_mtime_ns != opened.st_mtime_ns)):
+                    raise _SourceChanged(path)
+                self.store.note_file(key, stat.st_size, stat.st_mtime, complete,
+                                     corrupt_lines=corrupt, last_error=last_error,
+                                     inode=getattr(stat, "st_ino", None))
+                report.corrupt_lines += corrupt
+                report.files_ingested += 1
+        except BaseException:
+            self._tracker = EpisodeTracker(seeds)
+            self._seen = initial_seen
+            raise
 
     @staticmethod
     def _to_canonical(rec: dict[str, Any],

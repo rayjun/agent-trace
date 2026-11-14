@@ -20,13 +20,18 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def fetch_span(trace: str, span: str, port: int, timeout: float = 10) -> dict:
+def fetch_span(trace: str, span: str, port: int, timeout: float = 10, *,
+               agent: str | None = None, session: str | None = None) -> dict:
     directory = Path(os.environ.get("AGENTTRACE_PLATFORM_DIR") or Path.home() / ".agenttrace").expanduser()
     token = (directory / "server.token").read_text(encoding="utf-8").strip()
     if not token or any(ord(c) < 33 or ord(c) > 126 for c in token):
         raise ValueError("Invalid server token file")
     url = (f"http://127.0.0.1:{port}/api/traces/" + urllib.parse.quote(trace, safe="")
            + "/spans/" + urllib.parse.quote(span, safe=""))
+    selectors = {key: value for key, value in (("agent", agent), ("session", session))
+                 if value is not None}
+    if selectors:
+        url += "?" + urllib.parse.urlencode(selectors)
     request = urllib.request.Request(url, headers={"Authorization": "Bearer " + token, "Accept": "application/json"}, method="GET")
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
     with opener.open(request, timeout=timeout) as response:
@@ -35,6 +40,9 @@ def fetch_span(trace: str, span: str, port: int, timeout: float = 10) -> dict:
         data = json.load(response)
     if not isinstance(data, dict) or data.get("trace_id") != trace or data.get("span_id") != span:
         raise ValueError("API response trace/span identity mismatch; no output written")
+    if ((agent is not None and data.get("adapter_id") != agent)
+            or (session is not None and data.get("session_id") != session)):
+        raise ValueError("API response namespace mismatch; no output written")
     return data
 
 
@@ -54,6 +62,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--trace", required=True)
     parser.add_argument("--span", required=True)
+    parser.add_argument("--agent")
+    parser.add_argument("--session")
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--port", default=8741, type=int)
     args = parser.parse_args(argv)
@@ -64,7 +74,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.output.exists() or args.output.is_symlink():
             raise FileExistsError
-        data = fetch_span(args.trace, args.span, args.port)
+        data = fetch_span(args.trace, args.span, args.port, agent=args.agent, session=args.session)
         write_export(args.output, data)
     except FileExistsError:
         print("Error: output already exists; refusing to overwrite", file=sys.stderr)

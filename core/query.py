@@ -14,10 +14,99 @@ Status rollup rule (used everywhere, defined once):
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
+from datetime import datetime, timezone
 from typing import Any
 
 from core.storage.sqlite_store import TraceStore, _duration_ms
+
+class AmbiguousSessionError(ValueError):
+    """A literal session ID exists in more than one adapter namespace."""
+
+    def __init__(self, session_id: str, adapters: list[str]) -> None:
+        self.session_id = session_id
+        self.adapters = adapters
+        super().__init__("session ID is ambiguous; choose agent with ?agent=ADAPTER or --agent ADAPTER")
+
+
+class AmbiguousTraceError(ValueError):
+    """A trace ID needs an adapter/session selector to identify its namespace."""
+
+    def __init__(self, trace_id: str) -> None:
+        self.trace_id = trace_id
+        super().__init__("trace ID is ambiguous; choose agent and session with ?agent=ADAPTER&session=SESSION")
+
+
+def _trace_context(store: TraceStore, trace_id: str, agent: str | None,
+                   session: str | None) -> tuple[str, str | None] | None:
+    where, params = ["trace_id = ?"], [trace_id]
+    for column, value in (("adapter_id", agent), ("session_id", session)):
+        if value is not None:
+            where.append(f"{column} = ?")
+            params.append(value)
+    rows = store.query("SELECT DISTINCT adapter_id, session_id FROM spans WHERE "
+                       + " AND ".join(where), tuple(params))
+    if len(rows) > 1:
+        raise AmbiguousTraceError(trace_id)
+    return (rows[0]["adapter_id"], rows[0]["session_id"]) if rows else None
+
+
+class InvalidSinceError(ValueError):
+    """The since filter is not an accepted ISO date/timestamp."""
+
+
+_ISO_SINCE = re.compile(
+    r"\d{4}-\d{2}-\d{2}(?:[Tt ]\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d{1,6})?(?:[Zz]|[+-]\d{2}:\d{2}))?", re.ASCII)
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _instant_us(value: str | None) -> int | None:
+    """Exact UTC microseconds; date-only means UTC, naive timestamps rejected.
+
+    No machine-local timezone inference, float rounding, or lexical timestamp
+    comparison. Invalid stored timestamps do not match a since filter.
+    """
+    if not isinstance(value, str) or not _ISO_SINCE.fullmatch(value):
+        return None
+    try:
+        # fromisoformat accepts out-of-range offset minutes; reject them first.
+        if value[-6:-5] in ("+", "-"):
+            if int(value[-5:-3]) > 23 or int(value[-2:]) > 59:
+                return None
+        dt = datetime.fromisoformat(value.upper().replace("Z", "+00:00"))
+        dt = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+        delta = dt.astimezone(timezone.utc) - _EPOCH
+        return (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
+    except (ValueError, OverflowError):
+        return None
+
+
+def _since_instant(store: TraceStore, since: str) -> int:
+    instant = _instant_us(since)
+    if instant is None:
+        raise InvalidSinceError(
+            "invalid since: expected ISO YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS"
+            "[.ffffff](Z|+HH:MM); dates use UTC, timestamps require a timezone")
+    # Connections are thread-local; register on the connection doing this query.
+    store._conn().create_function("trace_instant_us", 1, _instant_us, deterministic=True)
+    return instant
+
+
+def _session_agent(store: TraceStore, session_id: str, agent: str | None) -> str | None:
+    # Spans also count: older indexes can have spans before session refresh.
+    sql = ("SELECT adapter_id FROM sessions WHERE session_id = ?"
+           " UNION SELECT adapter_id FROM spans WHERE session_id = ?")
+    params: tuple[Any, ...] = (session_id, session_id)
+    if agent is not None:
+        sql = "SELECT adapter_id FROM (" + sql + ") WHERE adapter_id = ?"
+        params += (agent,)
+    adapters = sorted(r["adapter_id"] for r in store.query(sql, params))
+    if len(adapters) > 1:
+        raise AmbiguousSessionError(session_id, adapters)
+    return adapters[0] if adapters else None
+
 
 _TRACE_SELECT = """
 SELECT s.trace_id AS trace_id,
@@ -41,6 +130,7 @@ SELECT s.trace_id AS trace_id,
 FROM spans s
 LEFT JOIN spans root ON root.span_id = s.trace_id
     AND root.trace_id = s.trace_id AND root.kind = 'task'
+    AND root.adapter_id = s.adapter_id AND root.session_id IS s.session_id
 GROUP BY s.trace_id
 """
 
@@ -102,9 +192,9 @@ def list_traces(store: TraceStore, *, agent: str | None = None,
     if having:
         sql += "\nHAVING " + " AND ".join(having)
     outer_where = ""
-    if since:
-        outer_where = "WHERE first_ts >= ?"
-        params.append(since)
+    if since is not None:
+        outer_where = "WHERE trace_instant_us(first_ts) >= ?"
+        params.append(_since_instant(store, since))
     base = f"SELECT * FROM ({sql}) {outer_where}"
     total_row = store.one(f"SELECT COUNT(*) AS n FROM ({base})", tuple(params))
     total = total_row["n"] if total_row else 0
@@ -123,18 +213,26 @@ _SPAN_METADATA = (
 
 
 def get_trace(store: TraceStore, trace_id: str, *,
-              summary: bool = False) -> dict[str, Any] | None:
+              summary: bool = False, agent: str | None = None,
+              session: str | None = None) -> dict[str, Any] | None:
+    context = _trace_context(store, trace_id, agent, session)
+    if context is None:
+        return None
+    adapter, session_id = context
+    params = (trace_id, adapter, session_id)
     if summary:
         rows = store.query(
             f"SELECT {_SPAN_METADATA} FROM spans WHERE trace_id = ?"
-            " ORDER BY COALESCE(start_ts, end_ts), rowid", (trace_id,))
+            " AND adapter_id = ? AND session_id IS ?"
+            " ORDER BY COALESCE(start_ts, end_ts), rowid", params)
         if not rows:
             return None
-        return {"trace_id": trace_id, "session_id": rows[0]["session_id"],
+        return {"trace_id": trace_id, "session_id": session_id, "adapter_id": adapter,
                 "spans": [_row_to_span_metadata(r) for r in rows]}
     rows = store.query(
         "SELECT * FROM spans WHERE trace_id = ?"
-        " ORDER BY COALESCE(start_ts, end_ts), rowid", (trace_id,))
+        " AND adapter_id = ? AND session_id IS ?"
+        " ORDER BY COALESCE(start_ts, end_ts), rowid", params)
     if not rows:
         return None
     spans = [_row_to_span(r) for r in rows]
@@ -154,7 +252,9 @@ def get_trace(store: TraceStore, trace_id: str, *,
             "source": e.get("source"),
             "agent_version": e.get("agent_version"),
         }
-        for e in store.iter_events(trace_id) if e["type"] == "event"
+        for e in (json.loads(r["payload"]) for r in store.query(
+            "SELECT payload FROM events WHERE trace_id = ? AND adapter_id = ?"
+            " AND session_id IS ? AND type = 'event' ORDER BY ts, rowid", params))
     ]
     first_ts = min(s["start"] or s["end"] or "" for s in spans)
     last_ts = max(s["end"] or s["start"] or "" for s in spans)
@@ -183,8 +283,8 @@ def get_trace(store: TraceStore, trace_id: str, *,
     if session_id:
         starts = [r["start_ts"] for r in store.query(
             "SELECT DISTINCT trace_id, MIN(start_ts) AS start_ts FROM spans"
-            " WHERE session_id = ? AND trace_id != ? AND start_ts IS NOT NULL"
-            " GROUP BY trace_id", (session_id, trace_id))]
+            " WHERE session_id = ? AND adapter_id = ? AND trace_id != ? AND start_ts IS NOT NULL"
+            " GROUP BY trace_id", (session_id, adapter, trace_id))]
     for span in spans:
         begin, finish = span.get("start"), span.get("end")
         if begin and finish:
@@ -192,7 +292,7 @@ def get_trace(store: TraceStore, trace_id: str, *,
                                           for other in starts)
 
     workspace = _session_workspace(store, rows[0]["session_id"],
-                                   [s.get("resource") for s in spans])
+                                   [s.get("resource") for s in spans], adapter)
     return {
         "trace_id": trace_id,
         "adapter_id": rows[0]["adapter_id"],
@@ -216,7 +316,7 @@ def get_trace(store: TraceStore, trace_id: str, *,
 
 
 def _session_workspace(store: TraceStore, session_id: str | None,
-                       own: list[Any]) -> dict[str, Any] | None:
+                       own: list[Any], adapter: str) -> dict[str, Any] | None:
     """The workspace of the session a trace belongs to.
 
     Read from the session's events, because that is where an adapter puts it.
@@ -226,8 +326,8 @@ def _session_workspace(store: TraceStore, session_id: str | None,
     candidates = [r for r in own if isinstance(r, dict)]
     if session_id:
         for row in store.query(
-                "SELECT payload FROM events WHERE session_id = ?"
-                ' AND payload LIKE \'%"resource"%\' LIMIT 20', (session_id,)):
+                "SELECT payload FROM events WHERE session_id = ? AND adapter_id = ?"
+                ' AND payload LIKE \'%"resource"%\' LIMIT 20', (session_id, adapter)):
             try:
                 event = json.loads(row["payload"])
             except (json.JSONDecodeError, TypeError):
@@ -277,9 +377,15 @@ def _row_to_span(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def get_span(store: TraceStore, trace_id: str, span_id: str) -> dict[str, Any] | None:
-    row = store.one("SELECT * FROM spans WHERE trace_id = ? AND span_id = ?",
-                    (trace_id, span_id))
+def get_span(store: TraceStore, trace_id: str, span_id: str, *,
+             agent: str | None = None, session: str | None = None) -> dict[str, Any] | None:
+    context = _trace_context(store, trace_id, agent, session)
+    if context is None:
+        return None
+    adapter, session_id = context
+    row = store.one("SELECT * FROM spans WHERE trace_id = ? AND span_id = ?"
+                    " AND adapter_id = ? AND session_id IS ?",
+                    (trace_id, span_id, adapter, session_id))
     if row is None:
         return None
     span = _row_to_span(row)
@@ -287,11 +393,12 @@ def get_span(store: TraceStore, trace_id: str, span_id: str) -> dict[str, Any] |
     if begin and finish:
         other = store.one(
             "SELECT 1 FROM (SELECT MIN(start_ts) AS start_ts FROM spans"
-            " WHERE session_id = ? AND trace_id != ? AND start_ts IS NOT NULL"
+            " WHERE session_id IS ? AND adapter_id = ? AND trace_id != ? AND start_ts IS NOT NULL"
             " GROUP BY trace_id) WHERE start_ts > ? AND start_ts < ? LIMIT 1",
-            (row["session_id"], trace_id, begin, finish))
+            (session_id, adapter, trace_id, begin, finish))
         span["duration_suspect"] = other is not None
-    return {**span, "trace_id": row["trace_id"], "session_id": row["session_id"]}
+    return {**span, "trace_id": row["trace_id"], "session_id": session_id,
+            "adapter_id": adapter}
 
 
 def list_sessions(store: TraceStore, *, limit: int = 100, offset: int = 0,
@@ -308,12 +415,12 @@ def list_sessions(store: TraceStore, *, limit: int = 100, offset: int = 0,
             ("session_id", "model", "cwd", "adapter_id")) + ")")
         params.extend([f"%{literal}%"] * 4)
     for column, value in (("adapter_id", agent), ("model", model)):
-        if value:
+        if value is not None:
             where.append(f"s.{column} = ?")
             params.append(value)
-    if since:
-        where.append("s.last_ts >= ?")
-        params.append(since)
+    if since is not None:
+        where.append("trace_instant_us(s.last_ts) >= ?")
+        params.append(_since_instant(store, since))
     clause = " WHERE " + " AND ".join(where) if where else ""
     total_row = store.one("SELECT COUNT(*) AS n FROM sessions s" + clause,
                           tuple(params))
@@ -321,11 +428,11 @@ def list_sessions(store: TraceStore, *, limit: int = 100, offset: int = 0,
     rows = store.query(
         "SELECT s.*, "
         " (SELECT COUNT(DISTINCT trace_id) FROM spans sp"
-        "   WHERE sp.session_id = s.session_id) AS trace_count,"
+        "   WHERE sp.session_id = s.session_id AND sp.adapter_id = s.adapter_id) AS trace_count,"
         " (SELECT SUM(sp.input_tokens) FROM spans sp"
-        "   WHERE sp.session_id = s.session_id) AS input_tokens,"
+        "   WHERE sp.session_id = s.session_id AND sp.adapter_id = s.adapter_id) AS input_tokens,"
         " (SELECT SUM(sp.output_tokens) FROM spans sp"
-        "   WHERE sp.session_id = s.session_id) AS output_tokens"
+        "   WHERE sp.session_id = s.session_id AND sp.adapter_id = s.adapter_id) AS output_tokens"
         " FROM sessions s" + clause +
         " ORDER BY last_ts DESC, s.session_id, s.adapter_id LIMIT ? OFFSET ?",
         tuple(params) + (limit, offset))
@@ -344,7 +451,8 @@ def list_sessions(store: TraceStore, *, limit: int = 100, offset: int = 0,
         } for r in rows]}
 
 
-def session_metrics(store: TraceStore, session_id: str) -> dict[str, Any] | None:
+def session_metrics(store: TraceStore, session_id: str, *,
+                    agent: str | None = None) -> dict[str, Any] | None:
     """Session-scoped counters and measured work, never synthetic root latency.
 
     Unknown token components stay null independently. Latencies use nearest-rank
@@ -352,11 +460,11 @@ def session_metrics(store: TraceStore, session_id: str) -> dict[str, Any] | None
     """
     import math
 
-    rows = store.query(f"SELECT {_SPAN_METADATA} FROM spans WHERE session_id = ?",
-                       (session_id,))
-    if not rows and store.one("SELECT 1 FROM sessions WHERE session_id = ?",
-                              (session_id,)) is None:
+    adapter = _session_agent(store, session_id, agent)
+    if adapter is None:
         return None
+    rows = store.query(f"SELECT {_SPAN_METADATA} FROM spans"
+                       " WHERE session_id = ? AND adapter_id = ?", (session_id, adapter))
     measured = [r for r in rows if r["ended"] and not r["synthetic"]
                 and isinstance(r["duration_ms"], (int, float))
                 and math.isfinite(r["duration_ms"]) and r["duration_ms"] > 0]
@@ -374,16 +482,17 @@ def session_metrics(store: TraceStore, session_id: str) -> dict[str, Any] | None
         values = [r[column] for r in rows if r[column] is not None]
         tokens[key] = sum(values) if values else None
     recent_sql = _TRACE_SELECT.replace(
-        "GROUP BY s.trace_id", "WHERE s.session_id = ? GROUP BY s.trace_id")
+        "GROUP BY s.trace_id", "WHERE s.session_id = ? AND s.adapter_id = ? GROUP BY s.trace_id")
     for column in ("input_tokens", "output_tokens", "cache_read_tokens"):
         recent_sql = recent_sql.replace(f"SUM(COALESCE(s.{column}, 0))",
                                         f"SUM(s.{column})")
     recent = store.query(recent_sql +
-                         " ORDER BY first_ts DESC, s.trace_id LIMIT 24", (session_id,))
+                         " ORDER BY first_ts DESC, s.trace_id LIMIT 24", (session_id, adapter))
     slowest = sorted(measured, key=lambda r: (-r["duration_ms"], r["trace_id"],
                                              r["span_id"]))[:10]
     return {
         "session_id": session_id,
+        "adapter_id": adapter,
         "traces": len({r["trace_id"] for r in rows}), "spans": len(rows),
         "errors": sum(r["status"] in ("error", "interrupted", "cancelled")
                       and not r["synthetic"] for r in rows),
@@ -395,7 +504,8 @@ def session_metrics(store: TraceStore, session_id: str) -> dict[str, Any] | None
     }
 
 
-def session_detail(store: TraceStore, session_id: str) -> dict[str, Any] | None:
+def session_detail(store: TraceStore, session_id: str, *,
+                   agent: str | None = None) -> dict[str, Any] | None:
     """One session as a CONVERSATION: every turn, with its own duration.
 
     A trace is one turn (that is what "Trace: one task execution" means), so a
@@ -416,9 +526,12 @@ def session_detail(store: TraceStore, session_id: str) -> dict[str, Any] | None:
     a 1.1-day window — an impossible number that hid the real one. `active_ms` is
     the sum of a turn's own spans, which cannot exceed the work done.
     """
+    adapter = _session_agent(store, session_id, agent)
+    if adapter is None:
+        return None
     rows = store.query(
-        "SELECT * FROM spans WHERE session_id = ? AND kind = 'task'"
-        " ORDER BY COALESCE(start_ts, end_ts)", (session_id,))
+        "SELECT * FROM spans WHERE session_id = ? AND adapter_id = ? AND kind = 'task'"
+        " ORDER BY COALESCE(start_ts, end_ts)", (session_id, adapter))
     if not rows:
         return None
 
@@ -429,7 +542,9 @@ def session_detail(store: TraceStore, session_id: str) -> dict[str, Any] | None:
             "SELECT kind, name, status, duration_ms, model,"
             "       input_tokens, output_tokens, cache_read_tokens"
             " FROM spans WHERE trace_id = ? AND span_id != ?"
-            " ORDER BY COALESCE(start_ts, end_ts)", (trace_id, trace_id))
+            " AND session_id = ? AND adapter_id = ?"
+            " ORDER BY COALESCE(start_ts, end_ts)",
+            (trace_id, row["span_id"], session_id, adapter))
         kinds = sorted({c["kind"] for c in children})
         errors = sum(1 for c in children
                      if c["status"] in ("error", "interrupted", "cancelled"))

@@ -24,9 +24,11 @@ run "doctor + ingest faults" python3 test/doctor.test.py
 run "redaction integrity" python3 test/redaction-integrity.test.py
 run "adapter conformance kit" python3 test/conformance.test.py
 run "sqlite store + indexer"  python3 test/storage.test.py
+run "storage crash/append recovery" python3 test/storage-recovery.test.py
 run "query service layer"     python3 test/query.test.py
 run "local http server"       python3 test/server.test.py
 run "datasets + evaluators + experiments" python3 test/evaluation.test.py
+run "dataset text/path compatibility" python3 test/dataset-import-input.test.py
 run "otlp import/export"     python3 test/otlp.test.py
 run "langgraph callback adapter" python3 test/langgraph.test.py
 run "adapter discovery + matrix" python3 test/discovery.test.py
@@ -40,6 +42,11 @@ run "Hermes trace explorer" node --test test/trace-explorer.test.mjs
 run "Hermes explorer search" node --test test/trace-explorer-search.test.mjs
 run "TUI live monitor"      node --test test/tui-monitor.test.mjs
 run "TUI query API"         python3 test/tui-api.test.py
+run "session identity + ISO filters" python3 test/session-identity.test.py
+run "trace namespace isolation" python3 test/trace-namespace.test.py
+run "trace drilldown namespace" node --test test/trace-drilldown-namespace.test.mjs
+run "session CLI namespace" python3 test/session-cli-identity.test.py
+run "TUI identity + section targets" node --test test/trace-identity-sections.test.mjs
 run "TUI service/export"    python3 test/service-tools.test.py
 run "TUI cold-start health" python3 test/service-startup.test.py
 run "dashboard routing"     node    test/dashboard-routing.test.mjs

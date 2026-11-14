@@ -973,23 +973,31 @@ def cmd_session(args) -> int:
 
     # Match the whole id or its tail: these ids are long paths for pi and
     # opaque handles for hermes, and nobody wants to paste a full path.
-    exact = store.one("SELECT DISTINCT session_id FROM spans WHERE session_id = ?",
-                      (args.session_id,))
+    agent = getattr(args, "agent", None)
+    namespace = " AND adapter_id = ?" if agent else ""
+    namespace_params = (agent,) if agent else ()
+    exact = store.one("SELECT DISTINCT session_id FROM spans WHERE session_id = ?" + namespace,
+                      (args.session_id,) + namespace_params)
     sid = exact["session_id"] if exact else None
     if sid is None:
         like = store.query(
             "SELECT session_id, MAX(COALESCE(end_ts, start_ts)) AS last"
-            " FROM spans WHERE session_id LIKE ?"
+            " FROM spans WHERE session_id LIKE ?" + namespace +
             " GROUP BY session_id ORDER BY last DESC LIMIT 2",
-            (f"%{args.session_id}%",))
+            (f"%{args.session_id}%",) + namespace_params)
         if not like:
             print(f"no session matching {args.session_id!r}", file=sys.stderr)
             store.close()
             return 1
         sid = like[0]["session_id"]
 
-    detail = session_detail(store, sid)
-    store.close()
+    try:
+        detail = session_detail(store, sid, agent=agent)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    finally:
+        store.close()
     if detail is None:
         print("session has no turns", file=sys.stderr)
         return 1

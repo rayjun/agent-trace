@@ -203,7 +203,7 @@ class TuiAPI(unittest.TestCase):
             conn.set_authorizer(None)
         assert result is not None
         self.assertTrue(reads)
-        self.assertEqual(set(result), {"trace_id", "session_id", "spans"})
+        self.assertEqual(set(result), {"trace_id", "session_id", "adapter_id", "spans"})
         self.assertEqual(result["spans"][1]["parent_span_id"], "root")
         self.assertEqual(result["spans"][1]["status"], "incomplete")
         self.assertTrue(all(not (set(s) & set(PAYLOADS)) for s in result["spans"]))
@@ -214,7 +214,7 @@ class TuiAPI(unittest.TestCase):
         full = query.get_trace(self.store, "t")
         single = query.get_span(self.store, "t", "p")
         assert full is not None and single is not None
-        self.assertEqual(single, {**full["spans"][0], "trace_id": "t", "session_id": "s"})
+        self.assertEqual(single, {**full["spans"][0], "trace_id": "t", "session_id": "s", "adapter_id": "agent"})
         for p in PAYLOADS:
             self.assertEqual(single[p], {p: "value"})
         self.assertIsNone(query.get_span(self.store, "wrong", "p"))
