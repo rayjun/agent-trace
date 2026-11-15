@@ -19,6 +19,7 @@ hermes chat -q "Reply with exactly: OK"
 
 agenttrace ls                      # 最近的记录
 agenttrace watch                   # 同样的流量，实时面板
+agenttrace tui                     # Textual 监控台（需按下文安装可选依赖）
 agenttrace session <id>            # 一次对话，每一轮的耗时
 agenttrace report                  # 近期运行的效率信号
 agenttrace serve                   # Dashboard
@@ -87,6 +88,7 @@ flowchart TB
 | `agenttrace session <id>` | 一次对话：每一轮各自的耗时 |
 | `agenttrace report` | 轨迹信号 —— 重复重试、错误恢复、上下文膨胀 |
 | `agenttrace watch` | agent 运行时的实时全屏面板 |
+| `agenttrace tui` | Textual 监控台：指标、会话、执行树和调用详情 |
 | `agenttrace serve` | 索引进程 + 本地 API + Dashboard（`--daemon`、`--status`、`--stop`） |
 | `agenttrace index [--full]` | 从 JSONL 文件（重）建 SQLite 索引 |
 | `agenttrace doctor` | 为什么没有数据：安装、采集、磁盘、丢弃的事件、索引 |
@@ -94,6 +96,30 @@ flowchart TB
 | `agenttrace otlp import\|export` | OTLP 导入与导出 |
 
 筛选参数（`--agent --model --event --session --since --contains --limit`）和环境变量见 **[docs/usage.md](docs/usage.md)**。
+
+## Textual 终端监控台
+
+在仓库内安装可选的界面依赖：
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-tui.txt
+python3 cli/agenttrace.py tui
+```
+
+当前 Python 没有 Textual 时，CLI 会自动使用仓库中的 `.venv` 启动 `tui`。其他命令和采集适配器仍不需要第三方依赖。
+
+监控台在后台线程索引本地 trace，无需另起 HTTP 服务或 daemon。左侧选会话，中间展开轮次与嵌套调用，右侧通过 Input／Output／Error／JSON／Events／Info 标签页查看详情；只按需读取选中调用的正文。对话预览会展开消息和多行结果，完整结构保留在 JSON 页；只有 event 的轮次也可查看记录的事件。显示时会清除终端控制字符，每个正文预览最多 100,000 字符。
+
+`/` 搜索会话 ID、模型和目录；agent 选择器筛选会话列表，顶部指标始终统计整个本地归档。空格暂停显示刷新（采集和索引继续），`r` 手动刷新，`1`／`2`／`3` 切换会话、执行树、详情，Ctrl+Q 退出。Enter 进入，Tab 移动焦点，也可用鼠标选择、滚动和切换标签页。窄 pane 自动切为单栏，宽 pane 显示两栏或三栏；高度充足时展示 token、耗时、缓存和错误趋势线。
+
+```bash
+agenttrace tui --agent codex --session SESSION_ID
+agenttrace tui --no-index                   # 只浏览索引，不扫描来源
+agenttrace tui --db /path/to/index.db /path/to/traces
+```
+
+导航与异步刷新始终保留 adapter／session 身份。刷新失败会保留旧快照并显示 `STALE`；迟到响应不会覆盖另一个已选中的调用。旧归档首次打开时会在后台迁移投影，可能需要更长时间。
 
 ## Dashboard
 
@@ -108,6 +134,8 @@ flowchart TB
 写入方须在每条 JSONL 记录末尾添加换行。EOF 的半行及未完成的 UTF-8 字节会保留到下次扫描，不计为损坏，也不提前消费。持久化游标只指向实际读完的完整行末尾，不使用稍后观测到的文件大小；并发追加的记录仍会在后续扫描读取。
 
 同一文件的事件、span、episode 状态和游标一起提交。持久化 redo／dirty 标记让直接 ingest 的中断投影在启动或正常扫描时补齐。来源失效后的回放按顺序原子执行，不再把流末轮次状态用于从头回读；完整扫描与重建用 SQLite 写事务串行化状态读取和游标决策，跨进程也适用；慢扫描可能让其他写入等待，WAL 读取仍可继续。回放不会改写 JSONL。
+
+普通扫描用保存点隔离文件读取故障：失败文件保留原来的游标和 episode 状态，可读文件仍可更新。破坏性来源回放保持原子性，需要参与回放的来源全部可读。故障来源恢复后，会通过一次原子有序回放修正跨文件的 episode 顺序。
 
 来源仍按 append-only 处理。原子替换文件和截断可检测；同 inode、文件不缩小、mtime 变新的原地改写不保证被发现。主动修改历史内容后，应受控重建索引。
 
@@ -150,6 +178,8 @@ python3 scripts/agenttrace-service.py uninstall
 Widget SDK 没有暴露当前聊天 ID，因此无参数时让你选会话，**不会把最近活动会话冒充当前会话**。
 
 会话身份是 **adapter + session ID**。选择器会在刷新、返回、诊断和固定速览时保留二者。直接打开可用 `/tracex <session-id> [server-url] --agent <adapter>` 或 `/agenttrace session <session-id> [server-url] --agent <adapter>`。ID 在各 adapter 间唯一时，旧的不带 `--agent` 用法仍可用；同名时明确报错，不混合统计。CLI 对应用法为 `agenttrace session <id> --agent hermes`。会话详情／指标 HTTP 接口接受 `agent` 查询参数；未指定 agent 且有歧义时返回 409，指定身份不存在时返回 404。trace／span 读取也携带 `agent`、`session` 条件，进入详情不会丢失会话身份；不带条件的 trace ID 仅在身份唯一时可读取。
+
+span 存储键和合成根也按 adapter／session 隔离，包含只有 event 的 trace。旧索引首次打开时会迁移 span 键，并从已有事件归档重建相关投影；来源 JSONL、事件归档和文件游标保持不变。这种一次性的投影恢复可能让首次打开耗时增加。
 
 - 上下键或 j/k：选择、滚动；PageUp/PageDown：移动十行。
 - Enter：进入；空格：折叠/展开节点；e：只看错误 span。

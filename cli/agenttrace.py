@@ -2,7 +2,8 @@
 """agenttrace — query the trace jsonl files written by the hermes/codex/pi adapters.
 
 Reads the shared record format (schema/trace.schema.json) from one or more
-trace directories, filters, and prints. No dependencies beyond stdlib.
+trace directories, filters, and prints. Core commands need only stdlib;
+the optional `tui` console uses Textual.
 
     agenttrace ls                          # recent records, one line each
     agenttrace ls --agent codex --limit 20
@@ -575,6 +576,14 @@ def build_parser() -> argparse.ArgumentParser:
                          help="show every session instead of only the current one")
     _dirs(p_watch)
 
+    p_tui = sub.add_parser("tui", help="Textual dashboard: sessions, execution tree and call inspector")
+    p_tui.add_argument("--agent", default=None, help="initial adapter filter")
+    p_tui.add_argument("--session", default=None, help="initial session ID")
+    p_tui.add_argument("--db", type=Path, default=None)
+    p_tui.add_argument("--interval", type=float, default=2.5, help="refresh interval seconds (minimum 0.5)")
+    p_tui.add_argument("--no-index", action="store_true", help="browse the existing index without scanning source files")
+    _dirs(p_tui)
+
     # Platform commands (M2): no shared record filters — they operate on the
     # store, not on raw v1 records.
     p_serve = sub.add_parser("serve", help="local dashboard: indexer + HTTP API + web UI")
@@ -1134,6 +1143,37 @@ def cmd_watch(args) -> int:
     return watch(args)
 
 
+def cmd_tui(args) -> int:
+    import math
+    if not math.isfinite(args.interval) or args.interval < .5:
+        print("--interval must be at least 0.5 seconds", file=sys.stderr)
+        return 2
+    try:
+        from agenttrace_tui import run
+    except ModuleNotFoundError as exc:
+        if exc.name not in ("textual", "rich") and not (exc.name or "").startswith(("textual.", "rich.")):
+            raise
+        root = Path(__file__).resolve().parent.parent
+        runner = root / ".venv" / "bin" / "python"
+        if runner.is_file() and Path(sys.prefix).resolve() != runner.parent.parent.resolve():
+            command = [str(runner), str(root / "cli" / "agenttrace.py"), "tui",
+                       "--interval", str(args.interval)]
+            for name in ("db", "agent", "session"):
+                value = getattr(args, name, None)
+                if value is not None:
+                    command += ["--" + name, str(value)]
+            if args.no_index:
+                command.append("--no-index")
+            command += [str(d) for d in args.dirs]
+            return subprocess.call(command)
+        print("The Textual dashboard needs optional dependencies. Install with:\n"
+              "  python3 -m venv .venv\n"
+              "  .venv/bin/python -m pip install -r requirements-tui.txt\n"
+              "Then run: .venv/bin/python cli/agenttrace.py tui", file=sys.stderr)
+        return 1
+    return run(args)
+
+
 def main(argv=None) -> int:
     # Python sets SIGPIPE to SIG_IGN at interpreter start, so any agenttrace
     # command piped into a short-circuiting reader (`agenttrace ls | head -5`,
@@ -1162,6 +1202,7 @@ def main(argv=None) -> int:
         "serve": cmd_serve, "index": cmd_index, "doctor": cmd_doctor,
         "adapter": cmd_adapter, "otlp": cmd_otlp, "report": cmd_report,
         "session": cmd_session,
+        "tui": cmd_tui,
     }[args.cmd](args)
 
 

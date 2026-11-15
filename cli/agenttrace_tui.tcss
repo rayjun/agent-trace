@@ -1,0 +1,84 @@
+Screen {
+    background: #10141f;
+    color: #e2e8f0;
+}
+#masthead { height: 3; padding: 0 2; align-vertical: middle; }
+#brand { width: 25; color: #7dd3fc; text-style: bold; content-align: left middle; height: 3; }
+#tagline { width: 1fr; color: #8492ad; content-align: left middle; height: 3; }
+#live { width: 15; content-align: right middle; height: 3; color: #7dd3fc; text-style: bold; }
+#opening { width: 5; height: 3; }
+#controls { height: 3; margin: 0 1; }
+Input { border: tall #303d56; background: #191f2e; padding: 0 1; }
+Input:focus { border: tall #7dd3fc; }
+#search { width: 1fr; margin-right: 1; }
+#agent { width: 22; margin-right: 1; }
+SelectCurrent { background: #191f2e; border: tall #303d56; }
+SelectOverlay { background: #191f2e; border: round #7dd3fc; }
+Button { background: #20283a; color: #cbd5e1; border: none; min-width: 5; height: 3; }
+Button:hover { background: #33435e; color: #7dd3fc; }
+Button:focus { background: #33435e; text-style: bold; }
+#pause { width: 13; margin-right: 1; }
+#refresh { width: 5; }
+#metrics { height: 5; margin: 1 1; }
+.metric { width: 1fr; height: 5; margin-right: 1; padding: 0 2; border-left: solid #3b4e70; background: #181e2d; }
+.metric-label { height: 1; color: #8492ad; text-style: bold; }
+.metric-value { height: 1; color: #7dd3fc; text-style: bold; }
+.metric-caption { height: 1; color: #94a3bd; }
+.metric-chart { height: 1; margin-top: 1; }
+#latency .metric-value { color: #b6a0fa; }
+#cache .metric-value { color: #86efac; }
+#errors .metric-value { color: #fda4af; }
+#body { height: 1fr; margin: 0 1; }
+.panel { height: 1fr; border: round #303d56; background: #151b28; }
+.panel:focus-within { border: round #56799d; }
+.panel-title { height: 1; color: #91a6c4; text-style: bold; margin: 0 1 1 1; }
+#sessions-panel { width: 27%; min-width: 30; margin-right: 1; }
+#traces-panel { width: 33%; min-width: 30; margin-right: 1; }
+#detail-panel { width: 1fr; }
+#sessions { height: 1fr; background: #151b28; scrollbar-size: 1 1; }
+DataTable > .datatable--header { background: #1e283a; color: #94a3bd; text-style: bold; }
+DataTable > .datatable--cursor { background: #263c55; color: #e2e8f0; }
+DataTable > .datatable--hover { background: #202d41; }
+DataTable > .datatable--odd-row { background: #151b28; }
+DataTable > .datatable--even-row { background: #181f2e; }
+#scope { height: 1; margin: 0 1 1 1; color: #94a3bd; }
+#traces { height: 1fr; background: #151b28; padding: 0 1; scrollbar-size: 1 1; }
+Tree > .tree--cursor { background: #263c55; text-style: bold; }
+Tree > .tree--guides { color: #3a4963; }
+Tree > .tree--highlight-line { background: #202d41; }
+#span-summary { height: 2; margin: 0 1; color: #7dd3fc; }
+#details { height: 1fr; }
+ContentSwitcher { height: 1fr; }
+TabPane { height: 1fr; padding: 0; }
+Tabs { background: #151b28; }
+Tab { color: #94a3bd; background: #151b28; padding: 0 1; }
+Tab.-active { color: #7dd3fc; text-style: bold; }
+Underline > .underline--bar { color: #7dd3fc; }
+TextArea { height: 1fr; border: none; background: #151b28; padding: 0 1; scrollbar-size: 1 1; }
+TextArea:focus { border: none; }
+.pager { height: 1; margin: 0 1; }
+.pager Button { height: 1; min-width: 3; width: 3; background: #20283a; }
+.pager Static { width: 1fr; height: 1; text-align: center; color: #8492ad; }
+#status { height: 1; margin: 0 2; color: #94a3bd; }
+Footer { background: #1c2638; color: #94a3bd; }
+Footer > .footer--key { background: #263b53; color: #7dd3fc; }
+Screen.short #masthead, Screen.short #brand, Screen.short #tagline, Screen.short #live { height: 2; }
+Screen.short #metrics { height: 3; margin: 0 1 1 1; }
+Screen.short .metric { height: 3; padding: 0 1; }
+Screen.short .metric-chart { display: none; }
+Screen.short .panel-title { margin-bottom: 0; }
+Screen.short #scope { margin-bottom: 0; }
+Screen.medium #sessions-panel { display: none; width: 40%; }
+Screen.medium #traces-panel { width: 42%; }
+Screen.medium.view-sessions #sessions-panel { display: block; }
+Screen.medium.view-sessions #traces-panel { display: none; }
+Screen.narrow #sessions-panel, Screen.narrow #traces-panel, Screen.narrow #detail-panel { display: none; width: 1fr; margin-right: 0; }
+Screen.narrow.view-sessions #sessions-panel { display: block; }
+Screen.narrow.view-traces #traces-panel { display: block; }
+Screen.narrow.view-detail #detail-panel { display: block; }
+Screen.narrow #tagline { display: none; }
+Screen.narrow #brand { width: 1fr; }
+Screen.narrow #agent { width: 20; }
+Screen.narrow #pause { width: 11; }
+Screen.narrow .metric-caption { display: none; }
+Screen.narrow #metrics, Screen.narrow .metric { height: 2; }

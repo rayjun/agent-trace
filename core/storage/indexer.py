@@ -88,6 +88,10 @@ class _SourceChanged(OSError):
         self.path = path
 
 
+class _ReplayReady(Exception):
+    """All sources are readable again; replace provisional episode identities."""
+
+
 class Indexer:
     def __init__(self, store: TraceStore, dirs: list[Path]) -> None:
         self.store = store
@@ -148,8 +152,8 @@ class Indexer:
                             report.errors.append(f"refresh_projections: {exc}")
                     return report
                 except _SourceChanged as exc:
-                    # Nested transactions have no savepoints. Unwind the OUTER
-                    # transaction before invalidating, then acquire fresh seeds.
+                    # Unwind the complete pass before invalidating, then acquire
+                    # fresh seeds for the ordered source replay.
                     self.store.invalidate_file(resolved_path(exc.path))
                 except OSError as exc:
                     return ScanReport(errors=[str(exc)])
@@ -174,19 +178,36 @@ class Indexer:
             except OSError as exc:
                 report.errors.append(f"{path}: {exc}")
         if self.store.replay_required():
-            # The enclosing scan transaction also makes ordered replay atomic.
-            self.store.prepare_replay([resolved_path(p) for p in files])
-            self._scan_files(files, report, before)
-            if report.errors:
-                raise OSError("source replay incomplete: " + "; ".join(report.errors))
-            self.store.finish_replay()
+            self._replay_files(files, report, before)
         else:
-            self._scan_files(files, report, before)
-        # A caught per-file error cannot commit partial nested transactions:
-        # they defer commits but do not provide rollback savepoints.
-        if report.errors:
-            raise OSError("source scan incomplete: " + "; ".join(report.errors))
+            try:
+                with self.store.transaction():
+                    self._scan_files(files, report, before)
+                    if not report.errors and self.store.scan_was_incomplete():
+                        # A skipped file can hold an earlier prompt boundary.
+                        # Discard this probe's tail identities, then replay from
+                        # empty seeds before publishing the recovered snapshot.
+                        raise _ReplayReady()
+            except _ReplayReady:
+                report = ScanReport(files_rekeyed=report.files_rekeyed,
+                                    files_dropped=report.files_dropped,
+                                    files_invalidated=report.files_invalidated)
+                self._replay_files(files, report, before)
+            if report.errors:
+                self.store.mark_scan_incomplete()
+        # Ordinary file failures roll back to the file savepoint, including its
+        # cursor and episode state. Healthy files can still publish. Destructive
+        # ordered replay above must remain all-or-nothing.
         return report
+
+    def _replay_files(self, files: list[Path], report: ScanReport,
+                      before: tuple[int, int, int, int]) -> None:
+        # The enclosing scan transaction makes the complete replay atomic.
+        self.store.prepare_replay([resolved_path(p) for p in files])
+        self._scan_files(files, report, before)
+        if report.errors:
+            raise OSError("source replay incomplete: " + "; ".join(report.errors))
+        self.store.finish_replay()
 
     def _scan_files(self, files: list[Path], report: ScanReport,
                     before: tuple[int, int, int, int]) -> None:

@@ -60,7 +60,7 @@ class Recovery(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.base = Path(self.tmp.name)
+        self.base = Path(self.tmp.name).resolve()
         self.traces = self.base / "traces"
         self.traces.mkdir()
         self.path = self.traces / "a.jsonl"

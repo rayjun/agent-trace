@@ -1,0 +1,730 @@
+"""Textual observability console. Launched by ``agenttrace tui``."""
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+import json
+import time
+from typing import Any
+
+from rich.text import Text
+from textual import on
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical
+from textual.events import Resize
+from textual.widgets import (Button, DataTable, Footer, Input, LoadingIndicator,
+                             Select, Sparkline, Static, TabbedContent, TabPane,
+                             TextArea, Tree)
+from textual.widgets.tree import TreeNode
+
+from panel.text import sane
+from agenttrace_common import flatten_content
+from tui_data import PAGE_SIZE, LocalBackend, SessionKey
+
+CYAN = "#7dd3fc"
+VIOLET = "#b6a0fa"
+MUTED = "#94a3bd"
+GREEN = "#86efac"
+RED = "#fda4af"
+BODY_LIMIT = 100_000
+
+
+def compact(value: int | float | None) -> str:
+    if value is None:
+        return "—"
+    for scale, suffix in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "k")):
+        if abs(value) >= scale:
+            return f"{value / scale:.1f}{suffix}"
+    return f"{value:g}"
+
+
+def duration(ms: int | float | None) -> str:
+    if ms is None:
+        return "—"
+    if ms < 1000:
+        return f"{ms:g}ms"
+    if ms < 60_000:
+        return f"{ms / 1000:.1f}s"
+    return f"{ms / 60_000:.1f}m"
+
+
+def body_text(value: Any) -> tuple[str, str | None]:
+    if value is None:
+        return "Not captured in this span.", None
+    structured = not isinstance(value, str)
+    text = json.dumps(value, ensure_ascii=False, indent=2) if structured else value
+    text = sane(text)
+    if len(text) > BODY_LIMIT:
+        text = text[:BODY_LIMIT] + "\n\n… Preview limited to 100,000 characters."
+    return text, "json" if structured else None
+
+
+def readable_body(value: Any, section: str) -> Any:
+    """Show recorded conversation text naturally; the JSON tab retains structure."""
+    if section == "events" and isinstance(value, list):
+        return "\n\n".join(
+            f"{e.get('ts', '')} · {e.get('name', 'event')}\n"
+            + body_text(readable_body(e.get("attributes"), "output"))[0] for e in value)
+    if section == "input":
+        messages = value.get("messages") if isinstance(value, dict) else value
+        if isinstance(messages, list) and messages and all(isinstance(m, dict) and "role" in m for m in messages):
+            blocks = []
+            if isinstance(value, dict):
+                system = value.get("system_prompt") or value.get("instructions")
+                if system:
+                    blocks.append("SYSTEM\n" + flatten_content(system))
+            for message in messages:
+                content = flatten_content(message.get("content"))
+                if not content and message.get("content") is not None:
+                    content = body_text(message["content"])[0]
+                blocks.append(str(message["role"]).upper() + "\n" + content)
+                if message.get("tool_calls"):
+                    blocks.append("TOOL CALLS\n" + body_text(message["tool_calls"])[0])
+            if isinstance(value, dict) and value.get("tools"):
+                blocks.append("TOOLS\n" + body_text(value["tools"])[0])
+            return "\n\n".join(blocks)
+    if section == "output" and isinstance(value, dict):
+        parts = []
+        if value.get("reasoning"):
+            parts.append("REASONING\n" + flatten_content(value["reasoning"]))
+        for field in ("content", "result", "text"):
+            if value.get(field) is not None:
+                content = flatten_content(value[field])
+                parts.append(content if content else body_text(value[field])[0])
+                break
+        if value.get("tool_calls"):
+            parts.append("TOOL CALLS\n" + body_text(value["tool_calls"])[0])
+        if parts:
+            return "\n\n".join(parts)
+    return value
+
+
+@dataclass(frozen=True)
+class NodeRef:
+    trace_id: str
+    span_id: str | None = None
+
+
+def span_forest(spans: list[dict]) -> list[tuple[dict, list]]:
+    """Keep orphan/cyclic spans inspectable without recursive parent loops."""
+    by_id = {s["span_id"]: s for s in spans}
+    children: dict[str, list[dict]] = {}
+    roots = []
+    for span in spans:
+        parent = span.get("parent_span_id")
+        if isinstance(parent, str) and parent in by_id and parent != span["span_id"]:
+            children.setdefault(parent, []).append(span)
+        else:
+            roots.append(span)
+    visited: set[str] = set()
+
+    def branch(span: dict, depth: int = 0) -> tuple[dict, list]:
+        visited.add(span["span_id"])
+        # Extremely deep adapter trees are flattened rather than exhausting the
+        # Python stack (or generating unusable indentation in the terminal).
+        nested = [] if depth >= 40 else [branch(s, depth + 1)
+                 for s in children.get(span["span_id"], []) if s["span_id"] not in visited]
+        return span, nested
+
+    forest = [branch(s) for s in roots if s["span_id"] not in visited]
+    for span in spans:
+        if span["span_id"] not in visited:
+            forest.append(branch(span))
+    return forest
+
+
+class Metric(Vertical):
+    def __init__(self, label: str, name: str) -> None:
+        super().__init__(id=name, classes="metric")
+        self.label = label
+
+    def compose(self) -> ComposeResult:
+        yield Static(self.label, classes="metric-label")
+        yield Static("—", classes="metric-value")
+        yield Static("Waiting for local data", classes="metric-caption")
+        yield Sparkline([], classes="metric-chart", min_color="#334155", max_color=CYAN)
+
+    def set_value(self, value: str, caption: str, data: list[float]) -> None:
+        self.query_one(".metric-value", Static).update(Text(value))
+        self.query_one(".metric-caption", Static).update(Text(caption))
+        self.query_one(Sparkline).data = data
+
+
+class TraceApp(App):
+    TITLE = "agent-trace"
+    SUB_TITLE = "Local observability"
+    AUTO_FOCUS = "#sessions"
+    CSS_PATH = "agenttrace_tui.tcss"
+    BINDINGS = [
+        Binding("ctrl+q", "quit", "Quit", priority=True),
+        Binding("q", "quit", "Quit", show=False),
+        Binding("space", "pause", "Pause"),
+        Binding("r", "refresh", "Refresh"),
+        Binding("/", "search", "Search"),
+        Binding("1", "panel('sessions')", "Sessions"),
+        Binding("2", "panel('traces')", "Trace"),
+        Binding("3", "panel('detail')", "Details"),
+        Binding("escape", "navigate_back", "Back", show=False),
+    ]
+
+    def __init__(self, backend: Any, *, agent: str | None = None,
+                 session: str | None = None, interval: float = 2.5) -> None:
+        super().__init__()
+        self.backend = backend
+        self.interval = interval
+        self.agent_filter = agent
+        self.initial_session = session
+        self.live = True
+        self.ready = False
+        self._starting = False
+        self.closed = False
+        self._refreshing = False
+        self._filter_revision = 0
+        self._display_epoch = 0
+        self._session_epoch = 0
+        self._span_epoch = 0
+        self.session_key: SessionKey | None = None
+        self.span_ref: NodeRef | None = None
+        self.session_offset = 0
+        self.turn_offset = 0
+        self._session_keys: list[str] = []
+        self._session_rows: dict[str, dict] = {}
+        self._agent_options: tuple[str, ...] = ()
+        self._turn_nodes: dict[str, TreeNode] = {}
+        self._trace_cache: dict[str, list[dict]] = {}
+        self._search_timer: Any = None
+        self._active_panel = "sessions"
+        self._last_dashboard: dict = {}
+        self._last_success: float | None = None
+        self._request_started = 0.0
+
+    def compose(self) -> ComposeResult:
+        with Horizontal(id="masthead"):
+            yield Static("◈ AGENT / TRACE", id="brand")
+            yield Static("LOCAL OBSERVABILITY", id="tagline")
+            yield LoadingIndicator(id="opening")
+            yield Static("◌ OPENING", id="live")
+        with Horizontal(id="controls"):
+            yield Input(value=self.initial_session or "", placeholder="Search sessions, models, folders…  /", id="search")
+            options = [("All agents", "*")]
+            if self.agent_filter:
+                options.append((self.agent_filter, self.agent_filter))
+            yield Select(options, allow_blank=False, value=self.agent_filter or "*", id="agent")
+            yield Button("Ⅱ Pause", id="pause", variant="default")
+            yield Button("↻", id="refresh")
+        with Horizontal(id="metrics"):
+            yield Metric("TOKENS", "tokens")
+            yield Metric("TURN P50", "latency")
+            yield Metric("CACHE HIT", "cache")
+            yield Metric("SPAN ERRORS", "errors")
+        with Horizontal(id="body"):
+            with Vertical(id="sessions-panel", classes="panel"):
+                yield Static("01  SESSIONS", classes="panel-title")
+                yield DataTable(id="sessions", cursor_type="row", zebra_stripes=True)
+                with Horizontal(classes="pager"):
+                    yield Button("‹", id="sessions-prev")
+                    yield Static("—", id="sessions-page")
+                    yield Button("›", id="sessions-next")
+            with Vertical(id="traces-panel", classes="panel"):
+                yield Static("02  EXECUTION TREE", classes="panel-title")
+                yield Static("Select a session", id="scope", classes="muted")
+                yield Tree("Turns", id="traces")
+                with Horizontal(classes="pager"):
+                    yield Button("‹", id="turns-prev")
+                    yield Static("—", id="turns-page")
+                    yield Button("›", id="turns-next")
+            with Vertical(id="detail-panel", classes="panel"):
+                yield Static("03  CALL INSPECTOR", classes="panel-title")
+                yield Static("Select a call to inspect", id="span-summary")
+                with TabbedContent(initial="tab-info", id="details"):
+                    for label, name in (("Input", "input"), ("Output", "output"),
+                                        ("Error", "error"), ("JSON", "json"),
+                                        ("Events", "events"), ("Info", "info")):
+                        with TabPane(label, id="tab-" + name):
+                            yield TextArea("Select a session, expand a turn, then choose a call.",
+                                           id="field-" + name, read_only=True, soft_wrap=True,
+                                           show_line_numbers=False, show_cursor=False,
+                                           theme="css")
+        yield Static("Opening your local archive…", id="status")
+        yield Footer()
+
+    async def on_mount(self) -> None:
+        table = self.query_one("#sessions", DataTable)
+        table.add_column("AGENT / SESSION", key="identity", width=25)
+        table.add_column("TURNS", key="turns", width=5)
+        self.query_one("#traces", Tree).show_root = False
+        self._layout()
+        self.set_interval(self.interval, self._tick)
+        self.run_worker(self._initialize(), group="startup", exit_on_error=False)
+
+    async def _initialize(self) -> None:
+        if self._starting:
+            return
+        self._starting = True
+        try:
+            await asyncio.to_thread(self.backend.start)
+            if self.closed:
+                self.backend.close()
+                return
+            self.ready = True
+            self.query_one("#opening").display = False
+            await self._refresh()
+        except Exception as exc:
+            self.query_one("#opening").display = False
+            self._error(exc)
+        finally:
+            self._starting = False
+
+    def on_unmount(self) -> None:
+        self.closed = True
+        self.backend.close()
+
+    def on_resize(self, event: Resize) -> None:
+        if self.screen_stack:
+            self._layout(event.size.width, event.size.height)
+
+    def _layout(self, width: int | None = None, height: int | None = None) -> None:
+        width = self.size.width if width is None else width
+        height = self.size.height if height is None else height
+        self.screen.set_class(width < 125, "medium")
+        self.screen.set_class(width < 85, "narrow")
+        self.screen.set_class(height < 35, "short")
+        for panel in ("sessions", "traces", "detail"):
+            self.screen.set_class(self._active_panel == panel, "view-" + panel)
+
+    def _tick(self) -> None:
+        if self.ready and self.live and not self._refreshing:
+            self.run_worker(self._refresh(), group="refresh", exit_on_error=False)
+        elif self.ready and self.live and self._last_success and (
+                time.monotonic() - self._request_started > max(10, self.interval * 3)):
+            self._error(TimeoutError("Refresh delayed; showing the previous snapshot"))
+
+    def _error(self, exc: Exception) -> None:
+        if self.closed:
+            return
+        age = f" · last good snapshot {int(time.time() - self._last_success)}s ago" if self._last_success else ""
+        self.query_one("#status", Static).update(Text("STALE · " + sane(exc) + age, style=RED))
+        self.query_one("#live", Static).update(Text("● STALE", style=RED))
+
+    async def _refresh(self) -> None:
+        if self._refreshing or not self.ready:
+            return
+        self._refreshing = True
+        self._request_started = time.monotonic()
+        revision = self._filter_revision
+        display_epoch = self._display_epoch
+        try:
+            search = self.query_one("#search", Input).value
+            data = await asyncio.to_thread(self.backend.dashboard, search,
+                                           self.agent_filter, self.session_offset)
+            if self.closed or revision != self._filter_revision or display_epoch != self._display_epoch:
+                return
+            self._last_dashboard = data
+            self._render_dashboard(data)
+            self._render_sessions(data["sessions"])
+            if self.session_key is not None:
+                await self._load_session(self.session_key, self._session_epoch)
+            self._last_success = time.time()
+        except Exception as exc:
+            self._error(exc)
+        finally:
+            self._refreshing = False
+            if not self.closed and revision != self._filter_revision:
+                self.call_later(self.action_refresh)
+
+    def _render_dashboard(self, data: dict) -> None:
+        overview, health = data["overview"], data["health"]
+        recent = list(reversed(data.get("recent", [])))
+        tokens = overview["tokens"]
+        known = data.get("usage_known", True)
+        total_tokens = (tokens.get("input") or 0) + (tokens.get("output") or 0)
+        self.query_one("#tokens", Metric).set_value(
+            compact(total_tokens) if known else "—",
+            f"{compact(tokens.get('input'))} in · {compact(tokens.get('output'))} out · all agents" if known else "Token usage not captured",
+            [(r["tokens"].get("input") or 0) + (r["tokens"].get("output") or 0) for r in recent])
+        durations = [r["duration_ms"] for r in recent
+                     if r.get("duration_ms") is not None and r.get("unclosed") == 0]
+        self.query_one("#latency", Metric).set_value(
+            duration(overview["task_duration_ms"]["p50"]), "Stored turn duration · all agents", durations)
+        cache = tokens.get("cache_read")
+        input_tokens = tokens.get("input")
+        ratio = min(100, 100 * cache / input_tokens) if known and data.get("cache_known", True) and input_tokens and cache is not None else None
+        self.query_one("#cache", Metric).set_value(
+            f"{ratio:.1f}%" if ratio is not None else "—", "Cache read / input · all agents",
+            [min(100, 100 * (r["tokens"].get("cache_read") or 0) / r["tokens"]["input"])
+             for r in recent if r["tokens"].get("input") and r["tokens"].get("cache_read") is not None])
+        self.query_one("#errors", Metric).set_value(
+            compact(overview["errors"]), f"{compact(overview['unclosed'])} open spans · all agents",
+            [r.get("status") == "error" for r in recent])
+        agents = tuple(sorted(set(data.get("agents", [])) | ({self.agent_filter} if self.agent_filter else set())))
+        if agents != self._agent_options:
+            self._agent_options = agents
+            with self.prevent(Select.Changed):
+                select = self.query_one("#agent", Select)
+                select.set_options([("All agents", "*")] + [(a, a) for a in agents])
+                select.value = self.agent_filter or "*"
+        indexing = health.get("index") and not health.get("scans")
+        label = "Ⅱ PAUSED" if not self.live else "◌ INDEXING" if indexing else "● LIVE"
+        self.query_one("#live", Static).update(Text(label, style=VIOLET if not self.live else CYAN))
+        notes = f"{compact(overview['sessions'])} sessions · {compact(overview['traces'])} turns · {compact(overview['spans'])} spans"
+        if not health.get("index", True):
+            notes += " · index refresh disabled"
+        elif health.get("scanning"):
+            notes += " · indexing new activity"
+        if health.get("errors"):
+            notes += f" · {len(health['errors'])} source issues (last snapshot retained)"
+        self.query_one("#status", Static).update(Text(notes, style=MUTED))
+
+    def _render_sessions(self, data: dict) -> None:
+        table = self.query_one("#sessions", DataTable)
+        rows = data["sessions"]
+        row_map = {json.dumps([r["adapter_id"], r["session_id"]]): r for r in rows}
+        keys = list(row_map)
+        selected = json.dumps(list(self.session_key)) if self.session_key else None
+        with self.prevent(DataTable.RowHighlighted, DataTable.RowSelected):
+            if keys != self._session_keys:
+                table.clear()
+                for key, row in row_map.items():
+                    cwd = (row.get("cwd") or "").rstrip("/").rsplit("/", 1)[-1]
+                    sid = sane(row["session_id"]).rsplit("/", 1)[-1]
+                    label = Text(sane(row["adapter_id"]), style=CYAN)
+                    label.append(" · " + (sane(cwd) or sid[-18:]), style="#e2e8f0")
+                    label.append("\n" + sid[-25:], style=MUTED)
+                    table.add_row(label, compact(row["trace_count"]), height=2, key=key)
+                self._session_keys = keys
+                if selected in keys:
+                    table.move_cursor(row=keys.index(selected), scroll=False)
+            else:
+                for key, row in row_map.items():
+                    table.update_cell(key, "turns", compact(row["trace_count"]))
+        self._session_rows = row_map
+        total = data["total"]
+        start = self.session_offset + 1 if rows else 0
+        self.query_one("#sessions-page", Static).update(f"{start}–{self.session_offset + len(rows)} / {total}")
+        self.query_one("#sessions-prev", Button).disabled = self.session_offset == 0
+        self.query_one("#sessions-next", Button).disabled = not data["has_more"]
+        if selected not in keys:
+            if rows:
+                matches = [r for r in rows if r["session_id"] == self.initial_session]
+                if len(matches) > 1 and self.agent_filter is None:
+                    self._clear_session()
+                    self._show_info("This session ID belongs to multiple agents. Select an agent or choose a row.")
+                    return
+                chosen = next((r for r in rows if r["session_id"] == self.initial_session), rows[0])
+                self.initial_session = None
+                self._select_session((chosen["adapter_id"], chosen["session_id"]))
+                with self.prevent(DataTable.RowHighlighted, DataTable.RowSelected):
+                    table.move_cursor(row=rows.index(chosen))
+            else:
+                self._clear_session()
+                message = "No sessions match your search." if total == 0 and self.query_one("#search", Input).value else "No sessions yet. New agent activity will appear here."
+                self._show_info(message)
+
+    def _clear_session(self) -> None:
+        self.session_key = None
+        self.span_ref = None
+        self._session_epoch += 1
+        self._span_epoch += 1
+        self._turn_nodes.clear()
+        self._trace_cache.clear()
+        self.query_one("#traces", Tree).clear()
+        self.query_one("#scope", Static).update("Select a session")
+        self.query_one("#span-summary", Static).update("Select a call to inspect")
+        for name in ("input", "output", "error", "json", "events", "info"):
+            self._set_body(name, None)
+
+    def _select_session(self, key: SessionKey) -> None:
+        if key == self.session_key:
+            return
+        self._clear_session()
+        self.session_key = key
+        self.turn_offset = 0
+        self.query_one("#scope", Static).update(Text(sane(key[0]) + " / " + sane(key[1])[-28:], style=MUTED))
+        self._show_info("Loading this session…")
+
+    @on(DataTable.RowHighlighted, "#sessions")
+    @on(DataTable.RowSelected, "#sessions")
+    def session_selected(self, event: Any) -> None:
+        row = self._session_rows.get(event.row_key.value)
+        if row:
+            self.initial_session = None
+            key = (row["adapter_id"], row["session_id"])
+            self._select_session(key)
+            if isinstance(event, DataTable.RowSelected):
+                self._active_panel = "traces"
+                self._layout()
+                self.query_one("#traces", Tree).focus()
+            self.run_worker(self._load_session(key, self._session_epoch),
+                            group="session", exclusive=True, exit_on_error=False)
+
+    async def _load_session(self, key: SessionKey, epoch: int) -> None:
+        offset = self.turn_offset
+        try:
+            data = await asyncio.to_thread(self.backend.session, key, offset)
+            if self.closed or key != self.session_key or epoch != self._session_epoch or offset != self.turn_offset:
+                return
+            turns = data["turns"]
+            tree = self.query_one("#traces", Tree)
+            ids = {r["trace_id"] for r in turns["traces"]}
+            with self.prevent(Tree.NodeSelected, Tree.NodeExpanded):
+                for trace_id in list(self._turn_nodes):
+                    if trace_id not in ids:
+                        self._turn_nodes.pop(trace_id).remove()
+                        self._trace_cache.pop(trace_id, None)
+                for row in reversed(turns["traces"]):
+                    label = self._turn_label(row)
+                    trace_id = row["trace_id"]
+                    if trace_id in self._turn_nodes:
+                        self._turn_nodes[trace_id].set_label(label)
+                    else:
+                        self._turn_nodes[trace_id] = tree.root.add(
+                            label, NodeRef(trace_id), before=0, allow_expand=True)
+            n = len(turns["traces"])
+            start = offset + 1 if n else 0
+            self.query_one("#turns-page", Static).update(f"{start}–{offset + n} / {turns['total']}")
+            self.query_one("#turns-prev", Button).disabled = offset == 0
+            self.query_one("#turns-next", Button).disabled = offset + n >= turns["total"]
+            if self.span_ref is not None and self.span_ref.trace_id not in ids:
+                self.span_ref = None
+                self._span_epoch += 1
+                self._show_info("The selected turn left this page. Select another turn.")
+            if n and self.span_ref is None:
+                trace_id = turns["traces"][0]["trace_id"]
+                await self._load_trace(key, epoch, trace_id, choose=True, selection=self._span_epoch)
+            elif self.span_ref is not None:
+                await self._load_trace(key, epoch, self.span_ref.trace_id)
+                if self.span_ref and self.span_ref.span_id:
+                    await self._load_span(key, self.span_ref, self._span_epoch)
+            elif not n:
+                self._show_info("This session has no indexed turns yet.")
+        except Exception as exc:
+            if epoch == self._session_epoch and key == self.session_key:
+                self._error(exc)
+
+    @staticmethod
+    def _turn_label(row: dict) -> Text:
+        status = row.get("status")
+        icon, color = ("!", RED) if status == "error" else ("◌", CYAN) if status == "incomplete" else ("✓", GREEN)
+        label = Text(icon + " ", style=color)
+        label.append((row.get("start") or "")[11:19] + "  ", style=MUTED)
+        label.append(sane(row.get("name") or "Turn")[:28])
+        label.append("  " + duration(row.get("duration_ms")), style=VIOLET)
+        return label
+
+    async def _load_trace(self, key: SessionKey, epoch: int, trace_id: str,
+                          *, choose: bool = False, selection: int | None = None) -> None:
+        data = await asyncio.to_thread(self.backend.trace, key, trace_id)
+        if self.closed or epoch != self._session_epoch or key != self.session_key or trace_id not in self._turn_nodes:
+            return
+        if choose and selection is not None and selection != self._span_epoch:
+            return
+        if data is None:
+            self._show_info("This turn is no longer in the index. Refresh to update.")
+            return
+        spans = data["spans"]
+        visible = [s for s in spans if not (s.get("synthetic") and s["span_id"] == trace_id)] or spans
+        node = self._turn_nodes[trace_id]
+        if self._trace_cache.get(trace_id) != visible:
+            tree = self.query_one("#traces", Tree)
+            cursor_ref = tree.cursor_node.data if tree.cursor_node else None
+            descendants = []
+            pending = list(node.children)
+            while pending:
+                child = pending.pop()
+                descendants.append(child)
+                pending.extend(child.children)
+            expanded = {n.data.span_id for n in descendants if n.is_expanded and n.data}
+            with self.prevent(Tree.NodeSelected, Tree.NodeExpanded):
+                node.remove_children()
+
+                def add(parent: TreeNode, forest: list) -> None:
+                    for span, children in forest:
+                        status = span.get("status")
+                        color = RED if status == "error" else CYAN if status == "incomplete" else GREEN
+                        label = Text("◌ " if status == "incomplete" else "! " if status == "error" else "✓ ", style=color)
+                        label.append(sane(span.get("kind", "span")), style=VIOLET)
+                        label.append(" · " + sane(span.get("name", ""))[:32])
+                        label.append("  " + duration(span.get("duration_ms")), style=MUTED)
+                        child = parent.add(label, NodeRef(trace_id, span["span_id"]),
+                                           expand=span["span_id"] in expanded,
+                                           allow_expand=bool(children))
+                        if child.data == cursor_ref:
+                            tree.select_node(child)
+                        add(child, children)
+
+                add(node, span_forest(visible))
+                self._trace_cache[trace_id] = visible
+                if choose:
+                    node.expand()
+            if self.span_ref and self.span_ref.trace_id == trace_id and self.span_ref.span_id:
+                if not any(s["span_id"] == self.span_ref.span_id for s in visible):
+                    self.span_ref = None
+                    self._span_epoch += 1
+                    self._show_info("This call is no longer in the index. Select another call.")
+        if choose and visible:
+            first = next((s for s in visible if s.get("kind") in ("llm", "tool")), visible[0])
+            self.span_ref = NodeRef(trace_id, first["span_id"])
+            self._span_epoch += 1
+            await self._load_span(key, self.span_ref, self._span_epoch, new=True)
+
+    @on(Tree.NodeExpanded, "#traces")
+    def trace_expanded(self, event: Tree.NodeExpanded) -> None:
+        if event.node.data and event.node.data.span_id is None and self.session_key:
+            self.run_worker(self._expand(self.session_key, self._session_epoch, event.node.data), group="expand", exclusive=True,
+                            exit_on_error=False)
+
+    async def _expand(self, key: SessionKey, epoch: int, ref: NodeRef) -> None:
+        try:
+            await self._load_trace(key, epoch, ref.trace_id)
+        except Exception as exc:
+            self._error(exc)
+
+    @on(Tree.NodeSelected, "#traces")
+    def call_selected(self, event: Tree.NodeSelected) -> None:
+        ref = event.node.data
+        if not ref or not self.session_key:
+            return
+        self._active_panel = "detail"
+        self._layout()
+        self.span_ref = ref
+        self._span_epoch += 1
+        self._show_info("Loading this call…")
+        if ref.span_id is None:
+            self.run_worker(self._choose_trace(self.session_key, self._session_epoch, ref.trace_id, self._span_epoch),
+                            group="detail", exclusive=True, exit_on_error=False)
+        else:
+            self.run_worker(self._load_span(self.session_key, ref, self._span_epoch, new=True),
+                            group="detail", exclusive=True, exit_on_error=False)
+
+    async def _choose_trace(self, key: SessionKey, epoch: int, trace_id: str,
+                            selection: int) -> None:
+        try:
+            await self._load_trace(key, epoch, trace_id, choose=True, selection=selection)
+        except Exception as exc:
+            self._error(exc)
+
+    async def _load_span(self, key: SessionKey, ref: NodeRef, epoch: int,
+                         *, new: bool = False) -> None:
+        try:
+            span = await asyncio.to_thread(self.backend.span, key, ref.trace_id, ref.span_id)
+            if self.closed or key != self.session_key or ref != self.span_ref or epoch != self._span_epoch:
+                return
+            if span is None:
+                self._show_info("This call is no longer in the index. Select another call.")
+                return
+            summary = Text(sane(span.get("kind", "span")) + " · " + sane(span.get("name", "")), style=CYAN)
+            summary.append("\n" + sane(span.get("status", "")) + " · " + duration(span.get("duration_ms"))
+                           + " · " + sane(span.get("model") or "model not recorded"), style=MUTED)
+            self.query_one("#span-summary", Static).update(summary)
+            for name in ("input", "output", "error", "events"):
+                self._set_body(name, span.get(name), reset=new)
+            self._set_body("json", span, reset=new)
+            info = {k: v for k, v in span.items() if k not in ("input", "output", "error")}
+            self._set_body("info", info, reset=new)
+            if new:
+                self.query_one("#details", TabbedContent).active = (
+                    "tab-error" if span.get("error") else "tab-output" if span.get("output") is not None
+                    else "tab-input" if span.get("input") is not None
+                    else "tab-events" if span.get("events") else "tab-info")
+        except Exception as exc:
+            if epoch == self._span_epoch and key == self.session_key:
+                self._error(exc)
+
+    def _set_body(self, name: str, value: Any, *, reset: bool = False) -> None:
+        field = self.query_one("#field-" + name, TextArea)
+        text, language = body_text(readable_body(value, name))
+        if field.text != text:
+            offset = field.scroll_offset
+            field.language = language
+            field.load_text(text)
+            if not reset:
+                field.scroll_to(offset.x, offset.y, animate=False, immediate=True)
+        if reset:
+            field.scroll_home(animate=False)
+
+    def _show_info(self, message: str) -> None:
+        self._set_body("info", message, reset=True)
+        self.query_one("#details", TabbedContent).active = "tab-info"
+
+    @on(Input.Changed, "#search")
+    def search_changed(self) -> None:
+        self._filter_revision += 1
+        self.session_offset = 0
+        if self._search_timer:
+            self._search_timer.stop()
+        self._search_timer = self.set_timer(.3, self.action_refresh)
+
+    @on(Select.Changed, "#agent")
+    def agent_changed(self, event: Select.Changed) -> None:
+        self.agent_filter = None if event.value == "*" else str(event.value)
+        self.session_offset = 0
+        self._filter_revision += 1
+        self.action_refresh()
+
+    @on(Button.Pressed)
+    def button_pressed(self, event: Button.Pressed) -> None:
+        name = event.button.id
+        if name == "pause":
+            self.action_pause()
+        elif name == "refresh":
+            self.action_refresh()
+        elif name in ("sessions-prev", "sessions-next"):
+            self.session_offset = max(0, self.session_offset + (PAGE_SIZE if name.endswith("next") else -PAGE_SIZE))
+            self._filter_revision += 1
+            self.action_refresh()
+        elif name in ("turns-prev", "turns-next") and self.session_key:
+            self.turn_offset = max(0, self.turn_offset + (PAGE_SIZE if name.endswith("next") else -PAGE_SIZE))
+            self._session_epoch += 1
+            self.span_ref = None
+            self._span_epoch += 1
+            self._turn_nodes.clear()
+            self._trace_cache.clear()
+            self.query_one("#traces", Tree).clear()
+            self.run_worker(self._load_session(self.session_key, self._session_epoch),
+                            group="session", exclusive=True, exit_on_error=False)
+
+    def action_pause(self) -> None:
+        self.live = not self.live
+        self._display_epoch += 1
+        self._session_epoch += 1
+        self._span_epoch += 1
+        self.query_one("#pause", Button).label = "Ⅱ Pause" if self.live else "▶ Resume"
+        self.query_one("#live", Static).update(Text("● LIVE" if self.live else "Ⅱ PAUSED", style=CYAN if self.live else VIOLET))
+        if self.live:
+            self.action_refresh()
+
+    def action_refresh(self) -> None:
+        if self.ready:
+            self.run_worker(self._refresh(), group="refresh", exit_on_error=False)
+        elif self._starting:
+            self.notify("The local archive is still opening", severity="information")
+        else:
+            self.query_one("#opening").display = True
+            self.run_worker(self._initialize(), group="startup", exit_on_error=False)
+
+    def action_search(self) -> None:
+        self.query_one("#search", Input).focus()
+
+    def action_panel(self, panel: str) -> None:
+        self._active_panel = panel
+        self._layout()
+        active = self.query_one("#details", TabbedContent).active.removeprefix("tab-")
+        self.query_one({"sessions": "#sessions", "traces": "#traces", "detail": "#field-" + active}[panel]).focus()
+
+    def action_navigate_back(self) -> None:
+        if isinstance(self.focused, Input):
+            self.query_one("#sessions", DataTable).focus()
+        else:
+            self.action_panel("traces" if self._active_panel == "detail" else "sessions")
+
+
+def run(args: Any) -> int:
+    from agenttrace_common import platform_dir
+    import os
+    from pathlib import Path
+
+    db = args.db or Path(os.environ.get("AGENTTRACE_DB") or platform_dir() / "agenttrace.db")
+    backend = LocalBackend(db.expanduser(), args.dirs, index=not args.no_index, interval=args.interval)
+    TraceApp(backend, agent=args.agent, session=args.session, interval=args.interval).run()
+    return 0

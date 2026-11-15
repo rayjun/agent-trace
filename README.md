@@ -25,6 +25,7 @@ hermes chat -q "Reply with exactly: OK"
 
 agenttrace ls                      # recent records
 agenttrace watch                   # the same traffic, live
+agenttrace tui                     # Textual console (optional setup below)
 agenttrace session <id>            # one conversation, every turn timed
 agenttrace report                  # efficiency signals across recent runs
 agenttrace serve                   # the dashboard
@@ -97,6 +98,7 @@ is in [docs/decisions.md](docs/decisions.md).
 | `agenttrace session <id>` | a conversation: every turn with its own duration |
 | `agenttrace report` | trajectory signals — retry loops, error recovery, context growth |
 | `agenttrace watch` | live full-screen panel while the agent runs |
+| `agenttrace tui` | Textual console: metrics, sessions, execution trees, call inspector |
 | `agenttrace serve` | indexer + local API + dashboard (`--daemon`, `--status`, `--stop`) |
 | `agenttrace index [--full]` | (re)build the SQLite index from the JSONL files |
 | `agenttrace doctor` | why is nothing showing up: install, capture, disk, dropped events, index |
@@ -105,6 +107,46 @@ is in [docs/decisions.md](docs/decisions.md).
 
 Filters (`--agent --model --event --session --since --contains --limit`) and the
 environment variables are in **[docs/usage.md](docs/usage.md)**.
+
+## Textual terminal console
+
+Install the optional UI dependency into the repository's virtual environment:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-tui.txt
+python3 cli/agenttrace.py tui
+```
+
+The CLI automatically uses this `.venv` for `tui` when the current Python lacks
+Textual. Other commands and capture adapters remain dependency-free.
+
+The console indexes local trace directories in a background thread, with no HTTP
+server or extra daemon. Browse sessions on the left, expand turns and nested
+calls in the middle, and inspect Input / Output / Error / JSON / Events / Info on the right.
+Conversation previews unwrap captured messages and multiline results; the JSON
+tab retains their complete structure. Event-only turns expose their recorded events.
+Source payloads are fetched only for the selected call. Terminal control codes
+are removed from displayed text, and each preview is limited to 100,000 characters.
+
+Use `/` to search session IDs, models and folders; the agent selector filters
+the session list. Metric cards always show the whole local archive. Space pauses
+display refresh (capture/indexing continues), `r` refreshes, `1`/`2`/`3` focus the
+sessions/tree/details, and Ctrl+Q quits. Enter drills down, Tab moves between
+controls, and the mouse can select, scroll and switch detail tabs. Narrow panes
+switch to a single panel; larger panes show two or three columns. Taller panes
+also show recent token, latency, cache and error sparklines.
+
+```bash
+agenttrace tui --agent codex --session SESSION_ID
+agenttrace tui --no-index                   # browse without scanning sources
+agenttrace tui --db /path/to/index.db /path/to/traces
+```
+
+Session identity includes the adapter throughout navigation and asynchronous
+refresh. A slow or failed refresh retains the previous snapshot and reports
+`STALE`; a late response cannot replace a different selected call. The first
+open of an old archive may take longer while projections migrate in the background.
 
 ## Dashboard
 
@@ -134,6 +176,11 @@ invalidation uses an ordered, atomic replay rather than seeding a full reread fr
 stream's final turn. Complete scans and rebuilds serialize seed/cursor decisions using SQLite's
 writer transaction, including across separate processes; slow scans can delay other writers,
 while WAL readers remain usable. Replays do not rewrite JSONL.
+
+Ordinary scans isolate file read failures with savepoints: a failed file keeps its prior
+cursor and episode state, while readable files can still update. Destructive source replays
+remain atomic and require all participating sources to be readable.
+Once failed sources recover, an atomic ordered replay restores episode ordering across split files.
 
 The source contract remains append-only. Atomic file replacement and truncation are detected;
 a same-inode, non-shrinking in-place rewrite with a newer mtime is not guaranteed to be detected.
@@ -205,6 +252,11 @@ Session detail/metrics HTTP requests accept the `agent` query parameter; ambiguo
 return HTTP 409, and a missing selected namespace returns 404. Trace and span reads also carry
 `agent` and `session` selectors; entering details must not discard the session namespace.
 Unqualified trace IDs work only when their namespace is unique.
+
+Span storage and synthetic roots use the same adapter/session namespace, including traces
+containing only events. Existing indexes migrate their span keys on first open and rebuild
+affected projections from the archived events; source JSONL, archive rows and file cursors
+are preserved. This one-time projection recovery can make the first open take longer.
 
 
 - Up/Down or j/k: select or scroll; PageUp/PageDown: move ten rows.

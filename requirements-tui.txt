@@ -1,0 +1,2 @@
+# Optional terminal dashboard. The capture adapters and other CLI commands stay stdlib-only.
+textual>=8.2.8,<9

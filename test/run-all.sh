@@ -25,6 +25,15 @@ run "redaction integrity" python3 test/redaction-integrity.test.py
 run "adapter conformance kit" python3 test/conformance.test.py
 run "sqlite store + indexer"  python3 test/storage.test.py
 run "storage crash/append recovery" python3 test/storage-recovery.test.py
+run "storage file + namespace isolation" python3 test/storage-isolation.test.py
+run "Textual local backend" python3 test/textual-data.test.py
+if python3 -c 'import textual' >/dev/null 2>&1; then
+  run "Textual keyboard + resize + races" python3 test/textual-ui.test.py
+elif [ -x .venv/bin/python ] && .venv/bin/python -c 'import textual' >/dev/null 2>&1; then
+  run "Textual keyboard + resize + races" .venv/bin/python test/textual-ui.test.py
+else
+  echo "=== Textual UI skipped (optional: install requirements-tui.txt) ==="
+fi
 run "query service layer"     python3 test/query.test.py
 run "local http server"       python3 test/server.test.py
 run "datasets + evaluators + experiments" python3 test/evaluation.test.py

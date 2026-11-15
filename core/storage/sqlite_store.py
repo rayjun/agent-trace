@@ -104,8 +104,12 @@ CREATE TABLE IF NOT EXISTS spans (
   agent_version TEXT,
   synthetic INTEGER NOT NULL DEFAULT 0,
   ended INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (trace_id, span_id)
+  PRIMARY KEY (adapter_id, session_id, trace_id, span_id)
 );
+-- SQLite composite primary keys permit NULL duplicates. Keep a missing session
+-- distinct from an empty session while enforcing uniqueness for both.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_spans_namespace ON spans(
+  adapter_id, (session_id IS NULL), COALESCE(session_id, ''), trace_id, span_id);
 CREATE INDEX IF NOT EXISTS idx_spans_span ON spans(span_id);
 CREATE INDEX IF NOT EXISTS idx_spans_trace ON spans(trace_id, start_ts);
 CREATE INDEX IF NOT EXISTS idx_spans_session ON spans(session_id);
@@ -228,8 +232,12 @@ CREATE TABLE IF NOT EXISTS spans (
   agent_version TEXT,
   synthetic INTEGER NOT NULL DEFAULT 0,
   ended INTEGER NOT NULL DEFAULT 0,
-  PRIMARY KEY (trace_id, span_id)
+  PRIMARY KEY (adapter_id, session_id, trace_id, span_id)
 );
+-- SQLite composite primary keys permit NULL duplicates. Keep a missing session
+-- distinct from an empty session while enforcing uniqueness for both.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_spans_namespace ON spans(
+  adapter_id, (session_id IS NULL), COALESCE(session_id, ''), trace_id, span_id);
 CREATE INDEX IF NOT EXISTS idx_spans_span ON spans(span_id);
 CREATE INDEX IF NOT EXISTS idx_spans_trace_id ON spans(trace_id, start_ts);
 CREATE INDEX IF NOT EXISTS idx_spans_session ON spans(session_id);
@@ -244,12 +252,12 @@ CREATE INDEX IF NOT EXISTS idx_spans_parent_trace ON spans(parent_span_id, trace
 
 
 def _spans_key_is_wrong(conn: sqlite3.Connection) -> bool:
-    """True when `spans` still has the old single-column primary key."""
+    """Whether spans still use an identity without the adapter/session scope."""
     rows = conn.execute("PRAGMA table_info(spans)").fetchall()
     if not rows:
         return False
     pk_columns = [r[1] for r in sorted(rows, key=lambda r: r[5]) if r[5]]
-    return pk_columns != ["trace_id", "span_id"]
+    return pk_columns != ["adapter_id", "session_id", "trace_id", "span_id"]
 
 #: Columns added after the first release. `CREATE TABLE IF NOT EXISTS` cannot
 #: add them to an existing database, and a projection that silently lacks a
@@ -317,25 +325,32 @@ class TraceStore:
     def transaction(self) -> Iterator[None]:
         """Atomically publish file events, episode seed and complete-line cursor.
 
-        Nested store methods defer commits. Abrupt exit rolls back the file,
-        so replay never starts with an end seed and a stale cursor.
+        Nested operations use savepoints so a failed file can roll back without
+        discarding other files. Abrupt exit rolls back the outer transaction.
         """
         with self._write_lock:
             conn = self._conn()
             depth = getattr(self._local, "transaction_depth", 0)
             if not depth:
                 conn.execute("BEGIN IMMEDIATE")
+            else:
+                conn.execute(f"SAVEPOINT trace_tx_{depth}")
             self._local.transaction_depth = depth + 1
             counters = (self.added, self.duplicates, self.duplicate_conflicts, self.invalid)
             try:
                 yield
                 if not depth:
                     conn.commit()
+                else:
+                    conn.execute(f"RELEASE SAVEPOINT trace_tx_{depth}")
             except BaseException:
                 if not depth:
                     conn.rollback()
-                    (self.added, self.duplicates,
-                     self.duplicate_conflicts, self.invalid) = counters
+                else:
+                    conn.execute(f"ROLLBACK TO SAVEPOINT trace_tx_{depth}")
+                    conn.execute(f"RELEASE SAVEPOINT trace_tx_{depth}")
+                (self.added, self.duplicates,
+                 self.duplicate_conflicts, self.invalid) = counters
                 raise
             finally:
                 self._local.transaction_depth = depth
@@ -347,10 +362,14 @@ class TraceStore:
         recovery can itself be interrupted and repeated.
         """
         if not self.one("SELECT 1 FROM projection_pending LIMIT 1") and not self.one(
-                "SELECT 1 FROM meta WHERE key='projections_dirty'"):
+                "SELECT 1 FROM meta WHERE key IN ('projections_dirty', 'namespace_rebuild')"):
             return  # Idle scans need neither a SQLite writer nor a refresh.
         with self.transaction():
             conn = self._conn()
+            if conn.execute("SELECT 1 FROM meta WHERE key='namespace_rebuild'").fetchone():
+                self.rebuild_projections()
+                conn.execute("DELETE FROM meta WHERE key='namespace_rebuild'")
+                return
             rows = conn.execute(
                 "SELECT e.payload FROM projection_pending p CROSS JOIN events e"
                 " ON e.event_id=p.event_id ORDER BY e.ts, e.rowid").fetchall()
@@ -388,30 +407,35 @@ class TraceStore:
             # index says about itself: on a brand-new file the same read would
             # fail against a table that does not exist yet.
             conn.executescript(_SCHEMA)
-            row = conn.execute(
-                "SELECT value FROM meta WHERE key='schema_version'").fetchone()
-            stored = int(row[0]) if row and str(row[0]).isdigit() else None
-            self._migrate(conn)
-            if stored is not None and stored < DB_SCHEMA_VERSION:
-                # Do NOT stamp the new version over an older index. The stored
-                # events were minted by an identity scheme this build no longer
-                # produces, so an incremental pass would add second copies under
-                # the new ids next to the old ones — the index needs a rebuild.
-                # Overwriting the marker here (which happens as soon as any
-                # reader opens the file, including the dashboard) hid that fact
-                # from `doctor` before the user ever saw the warning.
-                conn.execute(
-                    "INSERT INTO meta(key, value) VALUES('needs_rebuild', ?) "
-                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (f"indexed by schema v{stored}; this build is "
-                     f"v{DB_SCHEMA_VERSION}",))
-            else:
-                conn.execute(
-                    "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
-                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (str(DB_SCHEMA_VERSION),))
-                conn.execute("DELETE FROM meta WHERE key='needs_rebuild'")
-            self._commit(conn)
+            with self.transaction():
+                row = conn.execute(
+                    "SELECT value FROM meta WHERE key='schema_version'").fetchone()
+                stored = int(row[0]) if row and str(row[0]).isdigit() else None
+                migrated = self._migrate(conn)
+                if migrated and conn.execute("SELECT 1 FROM events LIMIT 1").fetchone():
+                    # Only projections change identity; archive/cursors stay intact.
+                    # Recovery replays archived events atomically before serving reads.
+                    conn.execute("INSERT OR REPLACE INTO meta VALUES ('namespace_rebuild','1')")
+                if stored is not None and stored < DB_SCHEMA_VERSION:
+                    # Do NOT stamp the new version over an older index. The stored
+                    # events were minted by an identity scheme this build no longer
+                    # produces, so an incremental pass would add second copies under
+                    # the new ids next to the old ones — the index needs a rebuild.
+                    # Overwriting the marker here (which happens as soon as any
+                    # reader opens the file, including the dashboard) hid that fact
+                    # from `doctor` before the user ever saw the warning.
+                    conn.execute(
+                        "INSERT INTO meta(key, value) VALUES('needs_rebuild', ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (f"indexed by schema v{stored}; this build is "
+                         f"v{DB_SCHEMA_VERSION}",))
+                else:
+                    conn.execute(
+                        "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        (str(DB_SCHEMA_VERSION),))
+                    conn.execute("DELETE FROM meta WHERE key='needs_rebuild'")
+                self._commit(conn)
 
     def compact(self, *, full: bool = True) -> tuple[int, int]:
         """Give freed pages back to the filesystem. Returns (before, after) bytes.
@@ -485,17 +509,12 @@ class TraceStore:
             self._commit(conn)
 
     @staticmethod
-    def _migrate(conn: sqlite3.Connection) -> None:
-        """Bring a database from an older version up to the current shape.
+    def _migrate(conn: sqlite3.Connection) -> bool:
+        """Add missing columns and migrate span identities without losing rows.
 
-        Two kinds of change, both explicit:
-        * additive columns (CREATE TABLE IF NOT EXISTS cannot add them);
-        * the `spans` key, which was `span_id` alone. Span ids are only unique
-          WITHIN a trace — the v1 converter mints `llm:<request_id>`, and two
-          sessions can both have `r1` — so a single-column key silently merged
-          two sessions' spans into one row and let the second trace's error
-          overwrite the first. SQLite cannot alter a PRIMARY KEY, so the table
-          is rebuilt and its rows carried over.
+        The caller holds a writer transaction. Nullable session IDs require an
+        expression index as well as the composite primary key: NULL and empty
+        session IDs are different namespaces, and neither may duplicate a span.
         """
         for table, column_def in _MIGRATIONS:
             column = column_def.split()[0]
@@ -511,9 +530,12 @@ class TraceStore:
             # would take them with it — leaving span/session/parent lookups as
             # full scans. Drop them first.
             for index in ("idx_spans_trace", "idx_spans_span", "idx_spans_trace_id",
-                          "idx_spans_session", "idx_spans_parent"):
+                          "idx_spans_session", "idx_spans_parent", "idx_spans_parent_trace",
+                          "idx_spans_namespace"):
                 conn.execute(f"DROP INDEX IF EXISTS {index}")
-            conn.executescript(_SPANS_TABLE)
+            for statement in _SPANS_TABLE.split(";"):
+                if statement.strip():
+                    conn.execute(statement)
             names = [
                 "span_id", "trace_id", "session_id", "parent_span_id",
                 "adapter_id", "kind", "name", "status", "start_ts", "end_ts",
@@ -537,6 +559,8 @@ class TraceStore:
                 f"INSERT OR REPLACE INTO spans ({columns})"
                 f" SELECT {columns} FROM (SELECT {inner} FROM spans_old_key)")
             conn.execute("DROP TABLE spans_old_key")
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # ingest
@@ -584,7 +608,8 @@ class TraceStore:
                 conn.execute("INSERT OR REPLACE INTO meta VALUES ('projections_dirty','1')")
                 self._commit(conn)
             except sqlite3.Error:
-                conn.rollback()
+                if not getattr(self._local, "transaction_depth", 0):
+                    conn.rollback()
                 raise
         if cur.rowcount == 0:
             self.duplicates += 1
@@ -661,8 +686,9 @@ class TraceStore:
                      0 if is_start else 1))
             if cur.rowcount == 0:
                 row = conn.execute(
-                    "SELECT * FROM spans WHERE span_id = ? AND trace_id = ?",
-                    (span_id, trace_id)).fetchone()
+                    "SELECT * FROM spans WHERE span_id = ? AND trace_id = ?"
+                    " AND adapter_id = ? AND session_id IS ?",
+                    (span_id, trace_id, event["adapter_id"], event.get("session_id"))).fetchone()
             else:
                 row = None
             if row is not None:
@@ -720,7 +746,7 @@ class TraceStore:
                     " output_json=COALESCE(output_json, ?),"
                     " error_json=COALESCE(error_json, ?),"
                     " attributes_json=?, ended=MAX(ended, ?)"
-                    " WHERE span_id=? AND trace_id=?",
+                    " WHERE span_id=? AND trace_id=? AND adapter_id=? AND session_id IS ?",
                     (start_ts, end_ts, status, duration,
                      merged_attrs.get("model") or row["model"],
                      usage.get("input_tokens") if usage else row["input_tokens"],
@@ -740,7 +766,7 @@ class TraceStore:
                      _dump_or_none(span.get("error")),
                      json.dumps(merged_attrs, ensure_ascii=False),
                      0 if is_start else 1,
-                     span_id, trace_id))
+                     span_id, trace_id, event["adapter_id"], event.get("session_id")))
             self._commit(conn)
 
     # ------------------------------------------------------------------
@@ -765,21 +791,22 @@ class TraceStore:
             # events but no span, and without a task row those events are
             # unreachable from list_traces/get_trace — the data exists in the
             # archive and no surface can show it.
-            roots = {r[0] for r in conn.execute(
-                "SELECT DISTINCT trace_id FROM spans"
-                " WHERE parent_span_id = trace_id AND trace_id IS NOT NULL")}
-            # An event-only trace is one with no span of its own. The check
-            # must be scoped to the trace: `NOT IN (SELECT span_id FROM spans)`
-            # was global, so an event whose trace_id happened to equal some
-            # OTHER trace's span id was silently skipped and stayed invisible
-            # in every surface.
-            roots |= {r[0] for r in conn.execute(
-                "SELECT DISTINCT trace_id FROM events e"
+            roots = conn.execute(
+                "SELECT adapter_id, session_id, trace_id FROM spans"
+                " WHERE parent_span_id = trace_id"
+                " UNION SELECT adapter_id, session_id, trace_id FROM events"
                 " WHERE type = 'event' AND trace_id IS NOT NULL"
-                "   AND NOT EXISTS (SELECT 1 FROM spans s"
-                "                   WHERE s.span_id = e.trace_id"
-                "                     AND s.trace_id = e.trace_id)")}
-            for trace_id in sorted(roots):
+                " UNION SELECT adapter_id, session_id, trace_id FROM spans"
+                " WHERE synthetic = 1 AND span_id = trace_id"
+                " ORDER BY adapter_id, session_id, trace_id").fetchall()
+            for adapter, session, trace_id in roots:
+                context = (trace_id, adapter, session)
+                existing = conn.execute(
+                    "SELECT synthetic FROM spans WHERE span_id = trace_id"
+                    " AND trace_id = ? AND adapter_id = ? AND session_id IS ?",
+                    context).fetchone()
+                if existing is not None and not existing["synthetic"]:
+                    continue  # a native task span outranks the synthetic one
                 children = conn.execute(
                     "SELECT MIN(COALESCE(start_ts, end_ts)) AS first_ts,"
                     "       MAX(COALESCE(end_ts, start_ts)) AS last_ts,"
@@ -787,35 +814,23 @@ class TraceStore:
                     "           AND synthetic = 0) AS bad,"
                     "       SUM(ended = 0) AS open_children,"
                     "       MIN(COALESCE(model, '')) AS model"
-                    " FROM spans WHERE trace_id = ? AND span_id != ?",
-                    (trace_id, trace_id)).fetchone()
-                # Spanless (event-only) traces take their bounds from events.
+                    " FROM spans WHERE trace_id = ? AND adapter_id = ?"
+                    " AND session_id IS ? AND span_id != trace_id",
+                    context).fetchone()
                 event_bounds = conn.execute(
-                    "SELECT MIN(ts) AS first_ts, MAX(ts) AS last_ts,"
-                    "       MIN(adapter_id) AS adapter_id, MAX(session_id) AS session_id"
-                    " FROM events WHERE trace_id = ?", (trace_id,)).fetchone()
-                first_ts = (children["first_ts"] if children else None) \
-                    or (event_bounds["first_ts"] if event_bounds else None)
-                last_ts = (children["last_ts"] if children else None) \
-                    or (event_bounds["last_ts"] if event_bounds else None)
+                    "SELECT MIN(ts) AS first_ts, MAX(ts) AS last_ts"
+                    " FROM events WHERE trace_id = ? AND adapter_id = ?"
+                    " AND session_id IS ?", context).fetchone()
+                first_ts = children["first_ts"] or event_bounds["first_ts"]
+                last_ts = children["last_ts"] or event_bounds["last_ts"]
                 if first_ts is None:
                     continue
-                existing = conn.execute(
-                    "SELECT synthetic FROM spans WHERE span_id = ? AND trace_id = ?",
-                    (trace_id, trace_id)).fetchone()
-                if existing is not None and not existing["synthetic"]:
-                    continue  # a native task span outranks the synthetic one
-                bad = (children["bad"] if children else 0) or 0
-                open_children = (children["open_children"] if children else 0) or 0
-                # A root whose child never closed is `interrupted`, not `ok`:
-                # the trace-level status already says `incomplete` for exactly
-                # this case, and a root span claiming "ok" while its own trace
-                # claims "incomplete" is the kind of internal disagreement that
-                # makes a reader distrust both numbers.
+                bad = children["bad"] or 0
+                open_children = children["open_children"] or 0
                 status = ("error" if bad else
                           "interrupted" if open_children else "ok")
                 attrs: dict[str, Any] = {"synthetic": True}
-                model = children["model"] if children else ""
+                model = children["model"]
                 if model:
                     attrs["model"] = model
                 conn.execute(
@@ -824,25 +839,14 @@ class TraceStore:
                     "  kind, name, status, start_ts, end_ts, duration_ms,"
                     "  attributes_json, synthetic, ended)"
                     " VALUES (?,?,?,NULL,?, 'task', ?, ?, ?, ?, ?, ?, 1, 1)"
-                    " ON CONFLICT(trace_id, span_id) DO UPDATE SET"
+                    " ON CONFLICT DO UPDATE SET"
                     "   start_ts=excluded.start_ts, end_ts=excluded.end_ts,"
                     "   status=excluded.status,"
                     "   duration_ms=excluded.duration_ms,"
                     "   attributes_json=excluded.attributes_json",
-                    (trace_id, trace_id,
-                     # session/adapter: prefer the events' values (they exist
-                     # even when no span does), else the child spans'.
-                     (event_bounds["session_id"] if event_bounds else None)
-                     or _first_value(conn, "session_id", trace_id),
-                     (event_bounds["adapter_id"] if event_bounds else None)
-                     or _first_value(conn, "adapter_id", trace_id),
+                    (trace_id, trace_id, session, adapter,
                      "task" if not model else f"task ({model})",
-                     status, first_ts, last_ts,
-                     # A derived root has no reported duration; computing it
-                     # from its own bounds is the only honest answer, and
-                     # leaving it NULL made every dashboard percentile read 0ms
-                     # ("tasks are instant"), which is worse than absent.
-                     _duration_ms(first_ts, last_ts),
+                     status, first_ts, last_ts, _duration_ms(first_ts, last_ts),
                      json.dumps(attrs)))
             self._refresh_sessions(conn)
             conn.execute("DELETE FROM meta WHERE key='projections_dirty'")
@@ -871,28 +875,28 @@ class TraceStore:
             " ON CONFLICT(session_id, adapter_id) DO UPDATE SET"
             "   first_ts=MIN(first_ts, excluded.first_ts),"
             "   last_ts=MAX(last_ts, excluded.last_ts)")
-        # Monotonic, like the MAX(... excluded.ended) it replaces: `ended` only
-        # ever flips to 1 here, and a truncation that removes the session_end
-        # goes through rebuild_projections(), which starts the table empty.
+        # Recompute these values in the selected namespace. This also repairs
+        # metadata previously inherited from another adapter's same-named session.
         conn.execute(
-            "UPDATE sessions SET ended = 1 WHERE EXISTS ("
+            "UPDATE sessions SET ended = EXISTS ("
             "  SELECT 1 FROM events e"
             "  WHERE e.type = 'event' AND e.session_id = sessions.session_id"
+            "    AND e.adapter_id = sessions.adapter_id"
             "    AND json_extract(e.payload, '$.event.name') = 'session_end')")
         # model/cwd: first known per session, from llm/tool span projections
         conn.execute(
             "UPDATE sessions SET model = ("
             "   SELECT model FROM spans s"
             "   WHERE s.session_id = sessions.session_id AND s.model IS NOT NULL"
-            "   LIMIT 1)"
-            " WHERE model IS NULL")
+            "     AND s.adapter_id = sessions.adapter_id"
+            "   LIMIT 1)")
         conn.execute(
             "UPDATE sessions SET cwd = ("
             "   SELECT json_extract(s.attributes_json, '$.cwd') FROM spans s"
             "   WHERE s.session_id = sessions.session_id"
+            "     AND s.adapter_id = sessions.adapter_id"
             "     AND json_extract(s.attributes_json, '$.cwd') IS NOT NULL"
-            "   LIMIT 1)"
-            " WHERE cwd IS NULL")
+            "   LIMIT 1)")
 
     def clear_archive(self) -> None:
         """Drop the archived events and every projection; keep USER data.
@@ -907,7 +911,8 @@ class TraceStore:
             for table in ("events", "spans", "sessions", "ingest_files",
                           "session_episodes", "projection_pending"):
                 conn.execute(f"DELETE FROM {table}")
-            conn.execute("DELETE FROM meta WHERE key IN ('projections_dirty','source_replay')")
+            conn.execute("DELETE FROM meta WHERE key IN"
+                         " ('projections_dirty','source_replay','scan_incomplete')")
             self._commit(conn)
 
     def rebuild_projections(self) -> None:
@@ -918,17 +923,16 @@ class TraceStore:
         before ends where the source had them so.
         """
         with self.transaction():
-            with self._write_lock:
-                conn = self._conn()
-                conn.execute("DELETE FROM spans")
-                conn.execute("DELETE FROM sessions")
-                rows = conn.execute(
-                    "SELECT payload FROM events ORDER BY ts, rowid").fetchall()
-                self._commit(conn)
-            for (payload,) in rows:
+            conn = self._conn()
+            conn.execute("DELETE FROM spans")
+            conn.execute("DELETE FROM sessions")
+            # Stream archived payloads: an upgrade can replay a multi-GB index.
+            # Only the projection tables change while this cursor is active.
+            for (payload,) in conn.execute("SELECT payload FROM events ORDER BY ts, rowid"):
                 event = json.loads(payload)
                 if event["type"] in ("span_start", "span_end"):
                     self._upsert_span(event, is_start=event["type"] == "span_start")
+            conn.execute("DELETE FROM projection_pending")
             self.refresh_projections()
 
     # ------------------------------------------------------------------
@@ -1010,6 +1014,15 @@ class TraceStore:
     def replay_required(self) -> bool:
         return self.one("SELECT 1 FROM meta WHERE key='source_replay'") is not None
 
+    def scan_was_incomplete(self) -> bool:
+        return self.one("SELECT 1 FROM meta WHERE key='scan_incomplete'") is not None
+
+    def mark_scan_incomplete(self) -> None:
+        with self._write_lock:
+            conn = self._conn()
+            conn.execute("INSERT OR REPLACE INTO meta VALUES ('scan_incomplete','1')")
+            self._commit(conn)
+
     def prepare_replay(self, paths: list[str]) -> None:
         """Forget reachable sources before ordered replay, in its transaction.
 
@@ -1018,11 +1031,13 @@ class TraceStore:
         Unmounted sources are deliberately left alone.
         """
         conn = self._conn()
+        conn.execute("UPDATE ingest_files SET indexed_bytes = 0")
+        conn.execute("DELETE FROM session_episodes")
         conn.executemany("DELETE FROM events WHERE source_file=?", ((p,) for p in paths))
         self.rebuild_projections()
 
     def finish_replay(self) -> None:
-        self._conn().execute("DELETE FROM meta WHERE key='source_replay'")
+        self._conn().execute("DELETE FROM meta WHERE key IN ('source_replay','scan_incomplete')")
 
     def rekey_file(self, old: str, new: str) -> None:
         """Move a file's rows onto the canonical spelling of its path.
@@ -1148,15 +1163,6 @@ def _identity(event: dict[str, Any]) -> tuple[Any, ...]:
     event that is not the same event.
     """
     return tuple(event.get(field) for field in _IDENTITY_FIELDS)
-
-
-def _first_value(conn: sqlite3.Connection, column: str, trace_id: str) -> str | None:
-    """First non-null `column` among a trace's spans. `column` is a literal
-    from this module, never user input — the f-string cannot be injected."""
-    row = conn.execute(
-        f"SELECT {column} FROM spans WHERE trace_id = ? AND {column} IS NOT NULL"
-        " LIMIT 1", (trace_id,)).fetchone()
-    return row[0] if row else None
 
 
 def _merge_json(existing: str | None, overlay: dict[str, Any]) -> dict[str, Any]:

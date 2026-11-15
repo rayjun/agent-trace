@@ -32,6 +32,10 @@ export = load("export_span", "export-span.py")
 
 class ServiceTests(unittest.TestCase):
     def setUp(self):
+        # Exercise the Linux service logic with mocked commands on any host.
+        platform = patch.object(service.sys, "platform", "linux")
+        platform.start()
+        self.addCleanup(platform.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.config = Path(self.temp.name) / "config with spaces %"

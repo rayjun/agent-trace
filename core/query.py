@@ -131,7 +131,7 @@ FROM spans s
 LEFT JOIN spans root ON root.span_id = s.trace_id
     AND root.trace_id = s.trace_id AND root.kind = 'task'
     AND root.adapter_id = s.adapter_id AND root.session_id IS s.session_id
-GROUP BY s.trace_id
+GROUP BY s.adapter_id, s.session_id, s.trace_id
 """
 
 
@@ -164,6 +164,7 @@ def _row_to_trace(row: sqlite3.Row) -> dict[str, Any]:
 
 
 def list_traces(store: TraceStore, *, agent: str | None = None,
+                session: str | None = None,
                 status: str | None = None, since: str | None = None,
                 limit: int = 50, offset: int = 0) -> dict[str, Any]:
     """Trace list. `since` filters WHOLE traces by their start time.
@@ -179,6 +180,9 @@ def list_traces(store: TraceStore, *, agent: str | None = None,
     if agent:
         where.append("s.adapter_id = ?")
         params.append(agent)
+    if session is not None:
+        where.append("s.session_id = ?")
+        params.append(session)
     if status == "error":
         having.append("errors > 0")
     elif status == "incomplete":
@@ -482,7 +486,9 @@ def session_metrics(store: TraceStore, session_id: str, *,
         values = [r[column] for r in rows if r[column] is not None]
         tokens[key] = sum(values) if values else None
     recent_sql = _TRACE_SELECT.replace(
-        "GROUP BY s.trace_id", "WHERE s.session_id = ? AND s.adapter_id = ? GROUP BY s.trace_id")
+        "GROUP BY s.adapter_id, s.session_id, s.trace_id",
+        "WHERE s.session_id = ? AND s.adapter_id = ?"
+        " GROUP BY s.adapter_id, s.session_id, s.trace_id")
     for column in ("input_tokens", "output_tokens", "cache_read_tokens"):
         recent_sql = recent_sql.replace(f"SUM(COALESCE(s.{column}, 0))",
                                         f"SUM(s.{column})")
@@ -644,7 +650,8 @@ def overview(store: TraceStore) -> dict[str, Any]:
     # errors exclude synthetic task rows: a synthetic root only MIRRORS its
     # children's failure — counting it double-counts every real error.
     totals_row = store.one(
-        "SELECT COUNT(DISTINCT trace_id) AS traces, COUNT(*) AS spans,"
+        "SELECT (SELECT COUNT(*) FROM (SELECT 1 FROM spans"
+        " GROUP BY adapter_id, session_id, trace_id)) AS traces, COUNT(*) AS spans,"
         " SUM(status IN ('error','interrupted','cancelled')"
         "     AND synthetic = 0) AS errors,"
         " SUM(ended = 0) AS unclosed,"
@@ -657,7 +664,9 @@ def overview(store: TraceStore) -> dict[str, Any]:
     # once instead of trusted at every use.
     totals: dict[str, Any] = dict(totals_row) if totals_row else {}
     per_agent = store.query(
-        "SELECT adapter_id, COUNT(DISTINCT trace_id) AS traces,"
+        "SELECT adapter_id, (SELECT COUNT(*) FROM (SELECT 1 FROM spans scoped"
+        " WHERE scoped.adapter_id = spans.adapter_id"
+        " GROUP BY scoped.session_id, scoped.trace_id)) AS traces,"
         " COUNT(*) AS spans,"
         # synthetic task rows only MIRROR a child's failure; counting them
         # would report two errors for one real one (and disagree with the
@@ -737,7 +746,6 @@ def list_adapters(store: TraceStore, *,
             "SELECT path, indexed_bytes, corrupt_lines, last_error, updated_at"
             " FROM ingest_files ORDER BY updated_at DESC LIMIT 50")
     ]
-    discovered = {e.adapter_id: e for e in discovery.discover()}
     adapters = []
     for entry in discovery.discover():
         compat = compatibility.for_adapter(entry.adapter_id)

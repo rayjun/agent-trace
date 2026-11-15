@@ -593,12 +593,12 @@ check("a synthetic root was materialized", root["synthetic"] == 1)
 # now the adapter's own task span arrives for the same id
 n_events = [
     {"v": 2, "event_id": "n" * 32, "type": "span_start",
-     "ts": TS % 0, "observed_at": TS % 0, "adapter_id": "pi",
+     "ts": TS % 0, "observed_at": TS % 0, "adapter_id": "hermes",
      "session_id": "s1", "trace_id": root["span_id"],
      "span_id": root["span_id"],
      "span": {"kind": "task", "name": "real task", "status": "running"}},
     {"v": 2, "event_id": "o" * 32, "type": "span_end",
-     "ts": TS % 1, "observed_at": TS % 1, "adapter_id": "pi",
+     "ts": TS % 1, "observed_at": TS % 1, "adapter_id": "hermes",
      "session_id": "s1", "trace_id": root["span_id"],
      "span_id": root["span_id"],
      "span": {"kind": "task", "name": "real task", "status": "error",
