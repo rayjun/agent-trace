@@ -22,6 +22,14 @@ agree, so the two definitions of `v`/`agent`/`event` cannot drift.
 
 ---
 
+## v1 — optional agent version and Codex session metadata
+
+`agent_version` is an optional string for the native agent's version. Codex live
+imports emit `session_start` from the persisted `session_meta` header so sessions
+without turns remain discoverable. This header supplies session context and does
+not open a turn in the v1-to-v2 converter; replaying it during an active call must
+preserve that call's trace and span identities.
+
 ## v2 — canonical events (parallel introduction)
 
 `schema/events.schema.json` defines the v2 canonical event: Session > Trace >

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import json
+import os
 import time
 from typing import Any
 
@@ -12,6 +13,7 @@ from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.driver import Driver
 from textual.events import Resize
 from textual.widgets import (Button, DataTable, Footer, Input, LoadingIndicator,
                              Select, Sparkline, Static, TabbedContent, TabPane,
@@ -162,11 +164,21 @@ class TraceApp(App):
         Binding("space", "pause", "Pause"),
         Binding("r", "refresh", "Refresh"),
         Binding("/", "search", "Search"),
+        Binding("ctrl+l", "clear_filters", "Show all", priority=True),
         Binding("1", "panel('sessions')", "Sessions"),
         Binding("2", "panel('traces')", "Trace"),
         Binding("3", "panel('detail')", "Details"),
         Binding("escape", "navigate_back", "Back", show=False),
     ]
+
+    def get_driver_class(self) -> type[Driver]:
+        driver = super().get_driver_class()
+        if os.environ.get("HERDR_ENV") == "1":
+            from textual.drivers.linux_driver import LinuxDriver
+            if driver is LinuxDriver:
+                from tui_terminal import HerdrDriver
+                return HerdrDriver
+        return driver
 
     def __init__(self, backend: Any, *, agent: str | None = None,
                  session: str | None = None, interval: float = 2.5) -> None:
@@ -214,6 +226,9 @@ class TraceApp(App):
             yield Select(options, allow_blank=False, value=self.agent_filter or "*", id="agent")
             yield Button("Ⅱ Pause", id="pause", variant="default")
             yield Button("↻", id="refresh")
+        with Horizontal(id="filters"):
+            yield Static("All sessions", id="filter-summary")
+            yield Button("× Show all", id="clear-filters")
         with Horizontal(id="metrics"):
             yield Metric("TOKENS", "tokens")
             yield Metric("TURN P50", "latency")
@@ -254,6 +269,7 @@ class TraceApp(App):
         table = self.query_one("#sessions", DataTable)
         table.add_column("AGENT / SESSION", key="identity", width=25)
         table.add_column("TURNS", key="turns", width=5)
+        self._render_filters()
         self.query_one("#traces", Tree).show_root = False
         self._layout()
         self.set_interval(self.interval, self._tick)
@@ -337,7 +353,14 @@ class TraceApp(App):
             if resolved is not None and not selection_changed:
                 self._select_session(resolved)
             self._last_dashboard = data
+            if not data["sessions"]["sessions"] and self.session_offset > 0:
+                # Deletions can remove the last page while we are viewing it.
+                total = data["sessions"]["total"]
+                self.session_offset = max(0, ((max(1, total) - 1) // PAGE_SIZE) * PAGE_SIZE)
+                self._filter_revision += 1
+                return
             self._render_dashboard(data)
+            self._render_filters(data["sessions"]["total"], data["overview"]["sessions"])
             self._render_sessions(data["sessions"], allow_auto_select=not selection_changed)
             if resolution_error and not selection_changed:
                 self._clear_session()
@@ -393,7 +416,32 @@ class TraceApp(App):
             notes += " · indexing new activity"
         if health.get("errors"):
             notes += f" · {len(health['errors'])} source issues (last snapshot retained)"
+        capture = health.get("capture")
+        if capture and capture["enabled"] and capture["available"]:
+            notes += " · Codex syncing" if capture["last_success"] is None else " · Codex connected"
         self.query_one("#status", Static).update(Text(notes, style=MUTED))
+
+    def _render_filters(self, matching: int | None = None,
+                         total: int | None = None) -> None:
+        search = self.query_one("#search", Input).value
+        filtered = bool(search or self.agent_filter)
+        self.query_one("#filters").display = filtered
+        parts = [f"Filtered: {matching} / {total} sessions" if matching is not None
+                 else "Filters active"]
+        if self.agent_filter:
+            parts.append("agent=" + sane(self.agent_filter))
+        if search:
+            parts.append("search=" + sane(search))
+        self.query_one("#filter-summary", Static).update(Text(" · ".join(parts), style=VIOLET))
+
+    @staticmethod
+    def _session_label(row: dict) -> Text:
+        cwd = (row.get("cwd") or "").rstrip("/").rsplit("/", 1)[-1]
+        sid = sane(row["session_id"]).rsplit("/", 1)[-1]
+        label = Text(sane(row["adapter_id"]), style=CYAN)
+        label.append(" · " + (sane(cwd) or sid[-18:]), style="#e2e8f0")
+        label.append("\n" + sid[-25:], style=MUTED)
+        return label
 
     def _render_sessions(self, data: dict, *, allow_auto_select: bool = True) -> None:
         table = self.query_one("#sessions", DataTable)
@@ -405,17 +453,13 @@ class TraceApp(App):
             if keys != self._session_keys:
                 table.clear()
                 for key, row in row_map.items():
-                    cwd = (row.get("cwd") or "").rstrip("/").rsplit("/", 1)[-1]
-                    sid = sane(row["session_id"]).rsplit("/", 1)[-1]
-                    label = Text(sane(row["adapter_id"]), style=CYAN)
-                    label.append(" · " + (sane(cwd) or sid[-18:]), style="#e2e8f0")
-                    label.append("\n" + sid[-25:], style=MUTED)
-                    table.add_row(label, compact(row["trace_count"]), height=2, key=key)
+                    table.add_row(self._session_label(row), compact(row["trace_count"]), height=2, key=key)
                 self._session_keys = keys
                 if selected in keys:
                     table.move_cursor(row=keys.index(selected), scroll=False)
             else:
                 for key, row in row_map.items():
+                    table.update_cell(key, "identity", self._session_label(row))
                     table.update_cell(key, "turns", compact(row["trace_count"]))
         self._session_rows = row_map
         total = data["total"]
@@ -433,7 +477,9 @@ class TraceApp(App):
                     table.move_cursor(row=rows.index(chosen))
             else:
                 self._clear_session()
-                message = "No sessions match your search." if total == 0 and self.query_one("#search", Input).value else "No sessions yet. New agent activity will appear here."
+                filtered = self.agent_filter or self.query_one("#search", Input).value
+                message = ("No sessions match these filters. Click Show all or press Ctrl+L to restore all sessions."
+                           if filtered else "No sessions yet. New agent activity will appear here.")
                 self._show_info(message)
 
     def _clear_session(self) -> None:
@@ -480,6 +526,12 @@ class TraceApp(App):
             if self.closed or key != self.session_key or epoch != self._session_epoch or offset != self.turn_offset:
                 return
             turns = data["turns"]
+            if not turns["traces"] and offset > 0:
+                self.turn_offset = max(0, ((max(1, turns["total"]) - 1) // PAGE_SIZE) * PAGE_SIZE)
+                self._session_epoch += 1
+                self.run_worker(self._load_session(key, self._session_epoch), group="session-repage",
+                                exclusive=True, exit_on_error=False)
+                return
             tree = self.query_one("#traces", Tree)
             cursor_ref = tree.cursor_node.data if tree.cursor_node else None
             cursor_selection = self._span_epoch
@@ -713,6 +765,7 @@ class TraceApp(App):
             self.initial_session = None
         self._filter_revision += 1
         self.session_offset = 0
+        self._render_filters()
         if self._search_timer:
             self._search_timer.stop()
         self._search_timer = self.set_timer(.3, self.action_refresh)
@@ -722,6 +775,7 @@ class TraceApp(App):
         self.agent_filter = None if event.value == "*" else str(event.value)
         self.session_offset = 0
         self._filter_revision += 1
+        self._render_filters()
         self.action_refresh()
 
     @on(Button.Pressed)
@@ -731,6 +785,8 @@ class TraceApp(App):
             self.action_pause()
         elif name == "refresh":
             self.action_refresh()
+        elif name == "clear-filters":
+            self.action_clear_filters()
         elif name in ("sessions-prev", "sessions-next"):
             self.session_offset = max(0, self.session_offset + (PAGE_SIZE if name.endswith("next") else -PAGE_SIZE))
             self._filter_revision += 1
@@ -768,6 +824,22 @@ class TraceApp(App):
     def action_search(self) -> None:
         self.query_one("#search", Input).focus()
 
+    def action_clear_filters(self) -> None:
+        if self._search_timer:
+            self._search_timer.stop()
+        with self.prevent(Input.Changed, Select.Changed):
+            self.query_one("#search", Input).value = ""
+            self.query_one("#agent", Select).value = "*"
+        self.agent_filter = None
+        self.initial_session = None
+        self.session_offset = 0
+        self._filter_revision += 1
+        self._render_filters()
+        self._active_panel = "sessions"
+        self._layout()
+        self.query_one("#sessions", DataTable).focus()
+        self.action_refresh()
+
     def action_panel(self, panel: str) -> None:
         self._active_panel = panel
         self._layout()
@@ -783,10 +855,10 @@ class TraceApp(App):
 
 def run(args: Any) -> int:
     from agenttrace_common import platform_dir
-    import os
     from pathlib import Path
 
     db = args.db or Path(os.environ.get("AGENTTRACE_DB") or platform_dir() / "agenttrace.db")
-    backend = LocalBackend(db.expanduser(), args.dirs, index=not args.no_index, interval=args.interval)
+    backend = LocalBackend(db.expanduser(), args.dirs, index=not args.no_index,
+                           interval=args.interval, capture=True)
     TraceApp(backend, agent=args.agent, session=args.session, interval=args.interval).run()
     return 0

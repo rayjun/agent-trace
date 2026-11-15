@@ -92,7 +92,7 @@ def main():
     sid = "sess-test-1"
 
     # 1. First import, WITH session_id.
-    # 5 records: the turn's llm_request, the user prompt, the turn's
+    # 6 records: the session header, the turn's llm_request, the user prompt, the turn's
     # llm_response (which carries the token_count usage), and the assistant
     # reply — which Codex logs twice (as a response_item message and again in
     # task_complete.last_agent_message), so both are kept.
@@ -104,7 +104,8 @@ def main():
     run(state, traces, {"hook_event_name": "Stop", "session_id": sid,
                         "transcript_path": str(roll)})
     n1 = len(records(traces))
-    assert n1 == 5, f"expected 5 records on first import, got {n1}"
+    assert n1 == 6, f"expected 6 records on first import, got {n1}"
+    assert records(traces)[0]["event"] == "session_start"
 
     # The pair is closed and carries the usage: this is what makes codex's
     # `token_usage` capability true instead of declared-but-empty.

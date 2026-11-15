@@ -1193,6 +1193,13 @@ def main(argv=None) -> int:
     # commands that scan traces declare them.
     if not getattr(args, "dirs", None):
         args.dirs = default_trace_dirs()
+        if args.cmd == "tui":
+            from tui_sources import codex_trace_dir
+            # Keep a not-yet-created capture directory in the scan set. The
+            # first native session can then appear without restarting the UI.
+            target = codex_trace_dir().resolve()
+            if target not in args.dirs:
+                args.dirs.append(target)
     else:
         args.dirs = [d.expanduser().resolve() for d in args.dirs]
 

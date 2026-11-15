@@ -70,6 +70,16 @@ _DISCRETE_EVENTS = {"user_prompt", "assistant_message", "note"}
 
 #: Records that can begin a human turn.
 EPISODE_EVENTS = {"user_prompt", "session_start"}
+
+
+def _opens_episode(rec: dict[str, Any]) -> bool:
+    # Codex's session_meta is transcript context, not an observed human-turn
+    # boundary. It can be captured/backfilled while a turn is already running.
+    # Let its real prompts/turn IDs choose identities, just as in offline import.
+    return rec.get("event") in EPISODE_EVENTS and not (
+        rec.get("agent") == "codex" and rec.get("event") == "session_start")
+
+
 def _iso_ms(ts: Any) -> float | None:
     """Epoch ms from an ISO-8601 `ts` (UTC, ends in Z). None when unparseable."""
     if not isinstance(ts, str) or len(ts) < 19:
@@ -154,7 +164,7 @@ class EpisodeTracker:
         if turn is not None:
             st[4] = turn                  # the last turn id seen, for the rule above
         event = rec.get("event")
-        if event in EPISODE_EVENTS and ts:
+        if _opens_episode(rec) and ts:
             now = _iso_ms(ts)
             recent_open = bool(st[3]) and now is not None and any(
                 (opened_at := _iso_ms(opened)) is not None
@@ -228,6 +238,7 @@ def _base(rec: dict[str, Any], etype: str) -> dict[str, Any]:
         "observed_at": rec.get("ts"),
         "adapter_id": adapter,
         "agent_name": adapter,
+        "agent_version": rec.get("agent_version"),
         "session_id": rec.get("session_id"),
         # The workspace travels on the envelope, not on one span: it describes
         # the session, and every trace in it inherits the same repository.
@@ -421,7 +432,7 @@ def episode_for(records: Iterable[dict[str, Any]]) -> dict[int, str | None]:
         if rec.get("v") != 1:
             continue
         key = (rec.get("agent") or "unknown", rec.get("session_id") or "")
-        if rec.get("event") in EPISODE_EVENTS and rec.get("ts"):
+        if _opens_episode(rec) and rec.get("ts"):
             current[key] = rec["ts"]
         out[i] = current.get(key)
     return out

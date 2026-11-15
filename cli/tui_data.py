@@ -14,6 +14,7 @@ import agenttrace_common as common
 from core import query
 from core.storage.indexer import Indexer
 from core.storage.sqlite_store import TraceStore
+from tui_sources import CodexSync
 
 T = TypeVar("T")
 SessionKey = tuple[str, str]
@@ -22,7 +23,7 @@ PAGE_SIZE = 30
 
 class LocalBackend:
     def __init__(self, db: Path, dirs: list[Path], *, index: bool = True,
-                 interval: float = 2.5) -> None:
+                 interval: float = 2.5, capture: bool = False) -> None:
         self.db = db
         self.dirs = dirs
         self.index = index
@@ -34,6 +35,7 @@ class LocalBackend:
         self.scans = 0
         self.errors: list[str] = []
         self.updated_at: float | None = None
+        self.capture = CodexSync(dirs) if capture and index else None
 
     def start(self) -> None:
         # Opening an old index may migrate projections; callers run this off UI.
@@ -55,8 +57,12 @@ class LocalBackend:
                     continue
                 self.scanning = True
                 try:
+                    if self.capture is not None:
+                        self.capture.poll(self._stop)
+                    if self._stop.is_set():
+                        break
                     report = indexer.scan_once()
-                    self.errors = report.errors + report.problems
+                    self.errors = report.errors + report.problems + (list(self.capture.errors) if self.capture else [])
                     self.scans += 1
                     self.updated_at = time.time()
                 except Exception as exc:
@@ -102,7 +108,8 @@ class LocalBackend:
                     "SELECT DISTINCT adapter_id FROM sessions ORDER BY adapter_id")],
                 "health": {"scanning": self.scanning, "scans": self.scans,
                            "index": self.index, "errors": list(self.errors),
-                           "updated_at": self.updated_at},
+                           "updated_at": self.updated_at,
+                           "capture": self.capture.health() if self.capture else None},
             }
         return self._read(read)
 

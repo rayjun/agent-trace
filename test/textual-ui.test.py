@@ -20,7 +20,7 @@ if importlib.util.find_spec("textual") is None:
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "cli"), str(ROOT / "common")]
 from agenttrace_tui import BODY_LIMIT, NodeRef, TraceApp, body_text, readable_body, span_forest  # noqa: E402
-from textual.widgets import DataTable, Input, TabbedContent, TextArea, Tree  # noqa: E402
+from textual.widgets import Button, DataTable, Input, Select, TabbedContent, TextArea, Tree  # noqa: E402
 
 
 class PaginatedBackend:
@@ -37,11 +37,7 @@ class PaginatedBackend:
         return getattr(self.base, name)
 
     def dashboard(self, search="", agent=None, offset=0):
-        data = self.base.dashboard(search, agent, offset)
-        rows = data["sessions"]["sessions"]
-        data["sessions"].update(sessions=rows[offset:offset + 30],
-                                has_more=offset + 30 < len(rows))
-        return data
+        return self.base.dashboard(search, agent, offset)
 
     def resolve_session(self, session_id, agent=None):
         if self.block:
@@ -125,7 +121,8 @@ class FakeBackend:
             overview=dict(tokens=dict(input=12000, output=3000, cache_read=9000),
                           task_duration_ms=dict(p50=2400), errors=1, unclosed=2,
                           sessions=len(self.rows), traces=6, spans=20),
-            sessions=dict(total=len(rows), has_more=False, sessions=deepcopy(rows)),
+            sessions=dict(total=len(rows), has_more=offset + 30 < len(rows),
+                          sessions=deepcopy(rows[offset:offset + 30])),
             recent=[dict(tokens=dict(input=100, output=4, cache_read=80), status="ok",
                          duration_ms=2400, unclosed=0)],
             agents=["a", "b"], health=dict(index=False, scans=1), usage_known=True)
@@ -174,6 +171,20 @@ async def running(size=(176, 40), **kwargs):
 
 
 class DashboardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_mouse_selects_sessions_calls_and_detail_tabs(self):
+        async with running() as (app, pilot, backend):
+            await pilot.click("#sessions", offset=(3, 3))
+            await settled(app, pilot)
+            self.assertEqual(app.session_key, ("b", "same"))
+            await pilot.click("#traces", offset=(10, 1))
+            await settled(app, pilot)
+            self.assertEqual(app.span_ref, NodeRef("shared", "call"))
+            details = app.query_one("#details", TabbedContent)
+            await pilot.click(details.get_tab("tab-output"))
+            await pilot.pause(.1)
+            self.assertEqual(details.active, "tab-output")
+            self.assertEqual(app.query_one("#field-output", TextArea).text, "reply from b")
+
     async def test_keyboard_namespace_selection_and_tabs(self):
         async with running() as (app, pilot, backend):
             self.assertEqual(app.session_key, ("a", "same"))
@@ -231,6 +242,76 @@ class DashboardTests(unittest.IsolatedAsyncioTestCase):
             app.action_pause()
             await settled(app, pilot)
             self.assertTrue(app.live)
+
+    async def test_clear_search_and_agent_restores_all_sessions_and_page(self):
+        async with running() as (app, pilot, backend):
+            backend.rows = [dict(adapter_id=agent, session_id=f"s{i}", cwd=f"/work/project-{i}",
+                                 trace_count=i + 1) for i, agent in enumerate(["a", "b"] * 36)]
+            app.action_refresh()
+            await settled(app, pilot)
+            app.query_one("#sessions-next", Button).press()
+            await settled(app, pilot)
+            self.assertEqual(app.session_offset, 30)
+            self.assertEqual(len(app._session_rows), 30)
+            app.query_one("#agent", Select).value = "a"
+            app.query_one("#search", Input).value = "project-2"
+            await pilot.pause(.4)
+            await settled(app, pilot)
+            self.assertTrue(app.query_one("#filters").display)
+            self.assertIn("agent=a", str(app.query_one("#filter-summary").render()))
+            self.assertEqual(app.session_offset, 0)
+            self.assertTrue(all(row["adapter_id"] == "a" and "project-2" in row["cwd"]
+                                for row in app._session_rows.values()))
+            await pilot.press("ctrl+l")
+            await settled(app, pilot)
+            self.assertIsNone(app.agent_filter)
+            self.assertEqual(app.query_one("#search", Input).value, "")
+            self.assertFalse(app.query_one("#filters").display)
+            self.assertEqual(app.session_offset, 0)
+            self.assertIn("/ 72", str(app.query_one("#sessions-page").render()))
+            seen = set(app._session_rows)
+            for _ in range(2):
+                app.query_one("#sessions-next", Button).press()
+                await settled(app, pilot)
+                seen.update(app._session_rows)
+            self.assertEqual(len(seen), 72)
+            self.assertTrue(app.query_one("#sessions-next", Button).disabled)
+
+    async def test_empty_agent_filter_shows_recovery_and_clear_button_works(self):
+        async with running() as (app, pilot, backend):
+            backend.rows = [r for r in backend.rows if r["adapter_id"] == "a"]
+            app.query_one("#agent", Select).value = "b"
+            await settled(app, pilot)
+            self.assertEqual(app._session_rows, {})
+            self.assertIn("Ctrl+L", app.query_one("#field-info", TextArea).text)
+            self.assertIn("0 / 1", str(app.query_one("#filter-summary").render()))
+            app.query_one("#clear-filters", Button).press()
+            await settled(app, pilot)
+            self.assertEqual(app.session_key, ("a", "same"))
+            self.assertEqual(len(app._session_rows), 1)
+
+    async def test_session_label_updates_when_metadata_arrives(self):
+        async with running() as (app, pilot, backend):
+            backend.rows[0]["cwd"] = "/work/new-project-name"
+            app.action_refresh()
+            await settled(app, pilot)
+            row_key = app._session_keys[0]
+            self.assertIn("new-project-name", str(app.query_one("#sessions", DataTable).get_cell(row_key, "identity")))
+
+    async def test_deleted_last_page_recovers_without_hiding_remaining_sessions(self):
+        async with running() as (app, pilot, backend):
+            backend.rows = [dict(adapter_id="a", session_id=f"s{i}", cwd="/work", trace_count=1)
+                            for i in range(35)]
+            app.session_offset = 30
+            app.action_refresh()
+            await settled(app, pilot)
+            self.assertEqual(len(app._session_rows), 5)
+            backend.rows = backend.rows[:20]
+            app.action_refresh()
+            await settled(app, pilot)
+            self.assertEqual(app.session_offset, 0)
+            self.assertEqual(len(app._session_rows), 20)
+            self.assertIn("/ 20", str(app.query_one("#sessions-page").render()))
 
     async def test_failures_keep_last_good_payload_and_recover(self):
         async with running() as (app, pilot, backend):
@@ -522,6 +603,100 @@ class RenderingTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "posix", "PTY smoke test requires POSIX")
 class TerminalTests(unittest.TestCase):
+    def test_herdr_cell_mouse_clicks_work_without_an_initial_pixel_resize(self):
+        import fcntl
+        import json
+        import pty
+        import select
+        import signal
+        import struct
+        import termios
+        import time
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            launcher = Path(directory) / "probe.py"
+            launcher.write_text(f'''
+import json, runpy
+from pathlib import Path
+fixture = runpy.run_path({str(Path(__file__).resolve())!r})
+class Probe(fixture["TraceApp"]):
+    CSS_PATH = {str(ROOT / "cli/agenttrace_tui.tcss")!r}
+    async def on_mount(self):
+        self.set_interval(.05, self.report)
+    def report(self):
+        if not self.ready or not self.session_key:
+            return
+        regions = {{name: list(self.query_one("#" + name).region)
+                   for name in ("pause", "sessions")}}
+        Path({str(state_path)!r}).write_text(json.dumps(dict(
+            live=self.live, session=self.session_key, regions=regions)))
+Probe(fixture["FakeBackend"](), interval=3600).run()
+''')
+            primary, secondary = pty.openpty()
+            fcntl.ioctl(secondary, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 176, 0, 0))
+            process = subprocess.Popen(
+                [sys.executable, str(launcher)], stdin=secondary, stdout=secondary,
+                stderr=secondary, env={**os.environ, "TERM": "xterm-256color", "HERDR_ENV": "1"})
+            os.close(secondary)
+            output = bytearray()
+
+            def wait_for(predicate):
+                deadline = time.monotonic() + 8
+                while time.monotonic() < deadline:
+                    if select.select([primary], [], [], .03)[0]:
+                        output.extend(os.read(primary, 65536))
+                    try:
+                        state = json.loads(state_path.read_text())
+                    except (OSError, ValueError):
+                        continue
+                    if predicate(state):
+                        return state
+                self.fail("terminal click did not reach the expected widget: " + bytes(output[-6000:]).decode(errors="replace"))
+
+            def click(x, y):
+                os.write(primary, f"\x1b[<0;{x+1};{y+1}M\x1b[<0;{x+1};{y+1}m".encode())
+
+            try:
+                state = wait_for(lambda s: s["session"] == ["a", "same"])
+                self.assertIn(b"\x1b[?1006h", output)
+                self.assertIn(b"\x1b[?1016l", output)
+                self.assertNotIn(b"\x1b[?1016h", output)
+                self.assertNotIn(b"\x1b[?2048$p", output)
+                x, y, width, height = state["regions"]["pause"]
+                click(x + width // 2, y + height // 2)
+                wait_for(lambda s: not s["live"])
+                time.sleep(.35)  # Let Textual's button activation debounce expire.
+                click(x + width // 2, y + height // 2)
+                state = wait_for(lambda s: s["live"])
+                x, y, _, _ = state["regions"]["sessions"]
+                click(x + 3, y + 3)
+                wait_for(lambda s: s["session"] == ["b", "same"])
+                # SIGWINCH remains the resize source; mouse clicks still work.
+                fcntl.ioctl(primary, termios.TIOCSWINSZ, struct.pack("HHHH", 38, 160, 0, 0))
+                os.kill(process.pid, signal.SIGWINCH)
+                state = wait_for(lambda s: s["regions"]["pause"][0] != state["regions"]["pause"][0])
+                x, y, width, height = state["regions"]["pause"]
+                time.sleep(.35)  # Finish the resize paint and previous activation.
+                click(x + width // 2, y + height // 2)
+                wait_for(lambda s: not s["live"])
+            finally:
+                try:
+                    os.write(primary, b"\x11")
+                except OSError:
+                    pass
+                deadline = time.monotonic() + 5
+                while process.poll() is None and time.monotonic() < deadline:
+                    if select.select([primary], [], [], .05)[0]:
+                        try:
+                            os.read(primary, 65536)
+                        except OSError:
+                            break
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=5)
+                os.close(primary)
+
     def test_real_cli_starts_in_a_pty_and_restores_terminal_on_quit(self):
         import fcntl
         import pty

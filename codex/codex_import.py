@@ -32,6 +32,8 @@ import hashlib
 import json
 import os
 import sys
+import tempfile
+from contextlib import contextmanager
 from typing import Any
 from datetime import datetime, timezone
 from pathlib import Path
@@ -88,7 +90,7 @@ def _content_to_text(content) -> str:
     return common.flatten_content(content)
 
 
-def _emit(rec: dict) -> None:
+def _emit(rec: dict) -> Path | None:
     """Prepend agent, drop None values, append one JSONL line.
 
     Serialisation, redaction and the locked append are the shared writer's.
@@ -100,7 +102,7 @@ def _emit(rec: dict) -> None:
     out.update(rec)
     if not common.capture_content():
         out = common.strip_content(out)
-    common.emit_record(_trace_dir, "codex", out)
+    return common.emit_record(_trace_dir, "codex", out)
 
 
 # --------------------------------------------------------------------------
@@ -116,7 +118,8 @@ def _token_info(payload: dict) -> dict | None:
     return common.normalize_usage(last, CODEX_USAGE_ALIASES)
 
 
-def parse_rollout(path: Path, since_line: int = 0) -> tuple[int, list[dict], dict]:
+def parse_rollout(path: Path, since_line: int = 0, *,
+                  live: bool = False) -> tuple[int, list[dict], dict]:
     """Parse a rollout jsonl from `since_line`.
 
     Returns (new_line_count, records, meta) where meta carries session facts
@@ -236,8 +239,10 @@ def parse_rollout(path: Path, since_line: int = 0) -> tuple[int, list[dict], dic
         return bool(usage)
 
     try:
-        fh = path.open(encoding="utf-8", errors="replace")
+        fh = path.open("rb")
     except OSError:
+        if live:
+            raise
         return since_line, [], meta
 
     # Every rollout line carries the REAL event time (`timestamp`, ISO). Using
@@ -249,23 +254,34 @@ def parse_rollout(path: Path, since_line: int = 0) -> tuple[int, list[dict], dic
     # would have to be repeated at ten call sites (and missed at the eleventh).
     mark = len(records)
     pending_ts: str | None = None
+    source_lines: list[int] = []
+
+    def stamp_records(source_line: int) -> None:
+        nonlocal mark
+        for rec in records[mark:]:
+            if pending_ts and not rec.get("ts"):
+                rec["ts"] = pending_ts
+        source_lines.extend([source_line] * (len(records) - mark))
+        mark = len(records)
 
     with fh:
-        for n, line in enumerate(fh, 1):
-            if n <= since_line:
-                continue
-            line = line.strip()
+        # Reconstruct context from the prefix, but emit only records belonging
+        # to new complete lines. Skipping the prefix lost session/model/tool
+        # identity whenever a live tail started in the middle of a turn.
+        size = os.fstat(fh.fileno()).st_size
+        while fh.tell() < size:
+            raw = fh.readline(size - fh.tell())
+            if not raw or (live and not raw.endswith(b"\n")):
+                break
+            stamp_records(n)
+            n += 1
+            line = raw.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
             try:
                 obj = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if pending_ts:
-                for rec in records[mark:]:
-                    if not rec.get("ts"):
-                        rec["ts"] = pending_ts
-                mark = len(records)
             raw_ts = obj.get("timestamp")
             pending_ts = raw_ts if isinstance(raw_ts, str) and raw_ts.endswith("Z") else None
             rtype = obj.get("type")
@@ -284,6 +300,11 @@ def parse_rollout(path: Path, since_line: int = 0) -> tuple[int, list[dict], dic
                     meta["system_prompt"] = bi["text"]
                 elif isinstance(bi, str):
                     meta["system_prompt"] = bi
+                meta["session_ts"] = pending_ts
+                if live:
+                    records.append({"event": "session_start", "session_id": meta["session_id"],
+                                    "cwd": meta["cwd"], "agent_version": meta["cli_version"],
+                                    "source_file": str(path)})
                 continue
 
             if rtype == "turn_context":
@@ -406,10 +427,7 @@ def parse_rollout(path: Path, since_line: int = 0) -> tuple[int, list[dict], dic
                     })
                 continue
 
-    if pending_ts:
-        for rec in records[mark:]:
-            if not rec.get("ts"):
-                rec["ts"] = pending_ts
+    stamp_records(n)
 
     # Flush any turn that collected usage but never saw task_complete (the
     # rollout ended mid-turn: a crash, `SIGINT`, or the file still being
@@ -419,7 +437,7 @@ def parse_rollout(path: Path, since_line: int = 0) -> tuple[int, list[dict], dic
     #     `token_count` is the evidence, so closing the llm SPAN is correct;
     #   * a `note` records that the TURN never reported completion, which is
     #     the part that is genuinely unknown.
-    for key in sorted(set(turn_usage) | set(turn_request)):
+    for key in ([] if live else sorted(set(turn_usage) | set(turn_request))):
         # close_turn owns the usage pop; popping here too silently emptied the
         # response it then emitted.
         # `measured=False`: this turn's end is the file's end, not the call's
@@ -441,9 +459,11 @@ def parse_rollout(path: Path, since_line: int = 0) -> tuple[int, list[dict], dic
     # the system prompt is not lost; it is left unclosed, which the
     # materializer reports as `incomplete` rather than pretending the turn
     # finished.
-    if since_line == 0 and meta["system_prompt"] and not turn_emitted:
+    if not live and since_line == 0 and meta["system_prompt"] and not turn_emitted:
         open_turn(None, meta["model"], meta["cwd"], pending_ts)
 
+    stamp_records(n)
+    records = [rec for rec, line in zip(records, source_lines, strict=True) if line > since_line]
     return n, records, meta
 
 
@@ -493,15 +513,47 @@ def _today_trace_file() -> Path:
     return _trace_dir / f"codex-{day}.jsonl"
 
 
-def import_rollout(path: Path, session_id: str | None = None) -> int:
+@contextmanager
+def _import_lock(path: Path):
+    """Serialize the hook and TUI poller before either reads its cursor."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as handle:
+        try:
+            import fcntl
+        except ImportError:
+            yield
+            return
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def import_rollout(path: Path, session_id: str | None = None, *,
+                   live: bool = False) -> int:
     """Import new lines of one rollout file; returns how many records were written."""
+    path = path.expanduser().resolve()
     cur = _cursor_path(path)
+    with _import_lock(cur.with_suffix(".lock")):
+        return _import_rollout(path, cur, live=live)
+
+
+def _import_rollout(path: Path, cur: Path, *, live: bool = False) -> int:
     since = 0
+    stat = path.stat()
+    output_file = _today_trace_file()
+    session_started = False
     if cur.exists():
         try:
             st = json.loads(cur.read_text(encoding="utf-8"))
             if st.get("path") == str(path):
                 since = int(st.get("line", 0))
+                output_file = Path(st.get("output_file") or _today_trace_file())
+                session_started = bool(st.get("session_started"))
+                if stat.st_size < st.get("source_size", 0) or (
+                        st.get("source_inode") is not None and st["source_inode"] != stat.st_ino):
+                    since = 0
         except (json.JSONDecodeError, ValueError, OSError):
             since = 0
     else:
@@ -512,20 +564,42 @@ def import_rollout(path: Path, session_id: str | None = None) -> int:
     # traces to start over and the cursor would keep answering "nothing new"
     # forever, with no new records and no error. Verify the output, not the
     # bookkeeping.
-    if since and not _today_trace_file().exists():
+    if since and not output_file.exists():
         since = 0
 
-    n, records, meta = parse_rollout(path, since)
+    n, records, meta = parse_rollout(path, since, live=live)
+    if n < since:
+        n, records, meta = parse_rollout(path, 0, live=live)
+    if live and meta.get("session_id") and not session_started:
+        # Older cursors can already be at EOF even though their session header
+        # was never captured. Publish that fact once; metadata-only sessions
+        # should be selectable with zero turns rather than silently disappearing.
+        if not any(r["event"] == "session_start" for r in records):
+            records.insert(0, {"event": "session_start", "session_id": meta["session_id"],
+                               "cwd": meta["cwd"], "agent_version": meta["cli_version"],
+                               "ts": meta.get("session_ts") or _iso(stat.st_mtime),
+                               "source_file": str(path)})
+        session_started = True
     for r in records:
-        _emit(r)
+        if _emit(r) is None:
+            raise OSError("Codex trace write failed; import cursor was not advanced")
+    if records:
+        output_file = _today_trace_file()
 
     _state_dir.mkdir(parents=True, exist_ok=True)
+    temporary: str | None = None
     try:
-        cur.write_text(json.dumps({"path": str(path), "line": n,
-                                   "last": _now(), "session_id": meta.get("session_id")}),
-                       encoding="utf-8")
-    except OSError:
-        pass
+        with tempfile.NamedTemporaryFile("w", dir=cur.parent, prefix=".cursor-",
+                                         encoding="utf-8", delete=False) as handle:
+            temporary = handle.name
+            json.dump({"path": str(path), "line": n, "last": _now(),
+                       "session_id": meta.get("session_id"), "source_size": stat.st_size,
+                       "source_inode": stat.st_ino, "output_file": str(output_file),
+                       "session_started": session_started}, handle)
+        os.replace(temporary, cur)
+    finally:
+        if temporary and Path(temporary).exists():
+            Path(temporary).unlink()
     return len(records)
 
 
@@ -554,6 +628,11 @@ def main() -> int:
     through to hook mode and imported whatever rollout happened to be newest.
     """
     args = sys.argv[1:]
+    live = "--live" in args
+    args = [arg for arg in args if arg != "--live"]
+    if live and not args:
+        print("--live requires explicit rollout paths", file=sys.stderr)
+        return 2
 
     if args:
         total = 0
@@ -561,7 +640,7 @@ def main() -> int:
         for arg in args:
             p = Path(arg).expanduser()
             if p.is_file():
-                n = import_rollout(p)
+                n = import_rollout(p, live=live)
                 total += n
                 print(f"{n} records from {p}", file=sys.stderr)
             else:
@@ -585,7 +664,13 @@ def main() -> int:
     if not path:
         return 0
 
-    written = import_rollout(path, session_id or None)
+    try:
+        written = import_rollout(path, session_id or None, live=True)
+    except OSError as exc:
+        # Tracing failures must not interrupt an agent action. Leave the cursor
+        # unchanged so the next hook/poll can retry the records.
+        print(f"agent-trace: capture failed ({type(exc).__name__}); will retry", file=sys.stderr)
+        written = 0
     event = payload.get("hook_event_name") or "?"
     print(f"agent-trace: {event} -> {written} records from {path.name}", file=sys.stderr)
 

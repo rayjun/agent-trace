@@ -19,6 +19,9 @@ Button:hover { background: #33435e; color: #7dd3fc; }
 Button:focus { background: #33435e; text-style: bold; }
 #pause { width: 13; margin-right: 1; }
 #refresh { width: 5; }
+#filters { height: 1; margin: 0 2; }
+#filter-summary { width: 1fr; height: 1; color: #b6a0fa; }
+#clear-filters { width: 13; min-width: 13; height: 1; color: #7dd3fc; background: #263b53; }
 #metrics { height: 5; margin: 1 1; }
 .metric { width: 1fr; height: 5; margin-right: 1; padding: 0 2; border-left: solid #3b4e70; background: #181e2d; }
 .metric-label { height: 1; color: #8492ad; text-style: bold; }

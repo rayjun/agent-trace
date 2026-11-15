@@ -129,8 +129,16 @@ tab retains their complete structure. Event-only turns expose their recorded eve
 Source payloads are fetched only for the selected call. Terminal control codes
 are removed from displayed text, and each preview is limited to 100,000 characters.
 
+With indexing enabled, the console also polls native Codex rollouts under
+`$CODEX_HOME/sessions` (default `~/.codex/sessions`) and incrementally imports
+new or resumed sessions, without requiring installed hooks. Unchanged files are
+skipped. Capture and redaction settings still apply. Newly created sessions
+appear with zero turns until execution starts; incomplete turns stay open until
+a recorded completion. `--no-index` disables both source polling and indexing.
+
 Use `/` to search session IDs, models and folders; the agent selector filters
-the session list. Metric cards always show the whole local archive. Space pauses
+the session list. Active filters show matching/total counts; click **Show all** or
+press Ctrl+L to clear every filter. Metric cards always show the whole local archive. Space pauses
 display refresh (capture/indexing continues), `r` refreshes, `1`/`2`/`3` focus the
 sessions/tree/details, and Ctrl+Q quits. Enter drills down, Tab moves between
 controls, and the mouse can select, scroll and switch detail tabs. Narrow panes

@@ -36,6 +36,7 @@
     },
 
     "session_id": { "type": "string" },
+    "agent_version": { "type": "string", "description": "version of the observed agent, when recorded in source metadata" },
     "turn_id": { "type": "string" },
     "request_id": {
       "type": "string",

@@ -72,8 +72,8 @@ def _codex() -> AdapterRegistryEntry:
     caps.set(Capability.TOOL_CALLS, S.PARTIAL,
              "function_call/output pairs seen after the fact; no tool start clock")
     caps.set(Capability.SESSION_LIFECYCLE, S.PARTIAL,
-             "session_meta gives the id, but no session_start/session_end "
-             "records are ever emitted, so `sessions.ended` stays false")
+             "live capture emits session_start from session_meta; rollouts "
+             "do not establish session_end, so `sessions.ended` stays false")
     caps.set(Capability.TOKEN_USAGE, S.PARTIAL,
              "token_count readings accumulate onto that turn's llm response "
              "(last reading wins, since Codex reports per call and we emit per "
@@ -82,14 +82,14 @@ def _codex() -> AdapterRegistryEntry:
              "tool failures surface as function_call_output with an error "
              "status; provider API errors never reach the rollout file")
     caps.set(Capability.STREAMING, S.UNSUPPORTED,
-             "rollout file is written after completion")
+             "persisted transcript events do not provide provider token-stream telemetry")
     caps.set(Capability.REPLAY_INPUTS, S.UNSUPPORTED,
              "raw request payloads never touch disk")
     return AdapterRegistryEntry(
         adapter_id="codex",
         kind=AdapterKind.PROCESS_HOOK,
         agent_name="codex",
-        integration="lifecycle hook -> incremental rollout importer",
+        integration="lifecycle hooks or TUI polling -> incremental rollout importer",
         agent_versions="responses wire format",
         capabilities=caps,
     )
