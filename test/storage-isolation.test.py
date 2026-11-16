@@ -120,6 +120,167 @@ class Isolation(unittest.TestCase):
         finally:
             clean.close()
 
+    def test_unmounted_source_healing_defers_replay_until_remount_after_restart(self):
+        volume, live = self.base / "volume", self.base / "live"
+        volume.mkdir()
+        live.mkdir()
+
+        def record(name, second, **kw):
+            return dict(v=1, agent="a", session_id="same", turn_id="0",
+                        ts=f"2026-11-12T00:00:{second:02}.000Z", event=name, **kw)
+
+        def write(path, records):
+            path.write_text("".join(json.dumps(r) + "\n" for r in records))
+
+        archived = volume / "a.jsonl"
+        write(archived, [record("llm_request", 1, request_id="r1"),
+                         record("llm_response", 2, request_id="r1")])
+        good = live / "z.jsonl"
+        write(good, [record("user_prompt", 10),
+                     record("llm_request", 11, request_id="r2"),
+                     record("llm_response", 12, request_id="r2")])
+        indexer = Indexer(self.store, [volume, live])
+        self.assertFalse(indexer.scan_once().errors)
+        state = dict(self.store.file_state(str(archived)))
+        old_rows = [tuple(r) for r in self.store.query(
+            "SELECT * FROM events WHERE source_file=? ORDER BY event_id", (str(archived),))]
+        detached = self.base / "detached"
+        volume.rename(detached)
+        bad = live / "bad.jsonl"
+        write(bad, [record("user_prompt", 20)])
+        original = builtins.open
+
+        def deny(path, *args, **kwargs):
+            if Path(path) == bad:
+                raise PermissionError("synthetic unreadable source")
+            return original(path, *args, **kwargs)
+
+        with patch("builtins.open", deny):
+            self.assertTrue(indexer.scan_once().errors)
+        self.assertFalse(indexer.scan_once().errors)
+        # Healing another file must not rewind or re-identify the detached one.
+        self.assertEqual(dict(self.store.file_state(str(archived))), state)
+        self.assertEqual(old_rows, [tuple(r) for r in self.store.query(
+            "SELECT * FROM events WHERE source_file=? ORDER BY event_id", (str(archived),))])
+        self.assertTrue(self.store.scan_was_incomplete())
+        self.assertEqual(self.store.one("SELECT COUNT(*) FROM events")[0], 6)
+        # Healthy tails still publish while ordered identity repair is deferred.
+        with good.open("a") as fh:
+            fh.write(json.dumps(record("llm_request", 21, request_id="r3")) + "\n")
+        self.assertEqual(indexer.scan_once().events_added, 1)
+        self.assertEqual(self.store.file_state(str(good))["indexed_bytes"], good.stat().st_size)
+        self.store.close()
+        self.store = TraceStore(self.base / "index.db")
+        self.assertTrue(self.store.scan_was_incomplete())
+        detached.rename(volume)
+        indexer = Indexer(self.store, [volume, live])
+        self.assertFalse(indexer.scan_once().errors)
+        self.assertFalse(self.store.scan_was_incomplete())
+        self.assertFalse(self.store.replay_required())
+        clean = TraceStore(self.base / "clean.db")
+        try:
+            self.assertFalse(Indexer(clean, [volume, live]).full_rebuild().errors)
+            for sql in ("SELECT * FROM events ORDER BY event_id",
+                        "SELECT * FROM spans ORDER BY adapter_id, session_id, trace_id, span_id",
+                        "SELECT * FROM sessions ORDER BY adapter_id, session_id"):
+                self.assertEqual([tuple(r) for r in self.store.query(sql)],
+                                 [tuple(r) for r in clean.query(sql)])
+            self.assertEqual(self.store.session_seeds(), clean.session_seeds())
+            self.assertEqual(indexer.scan_once().events_added, 0)
+        finally:
+            clean.close()
+
+    def test_pending_replay_preserves_detached_cursor_and_healthy_progress(self):
+        for mutation in ("delete", "replace"):
+            with self.subTest(mutation=mutation):
+                self.store.clear_archive()
+                volume, live = self.base / (mutation + "-volume"), self.base / (mutation + "-live")
+                volume.mkdir()
+                live.mkdir()
+                archived, good, changed = volume / "a.jsonl", live / "z.jsonl", live / "b.jsonl"
+                archived.write_text(json.dumps(dict(v=1, agent="a", session_id="same", turn_id="0",
+                    ts=TS, event="llm_request", request_id="archived")) + "\n")
+                good.write_text(json.dumps(span()) + "\n")
+                changed.write_text(json.dumps(event("b")) + "\n")
+                indexer = Indexer(self.store, [volume, live])
+                self.assertFalse(indexer.scan_once().errors)
+                state = dict(self.store.file_state(str(archived)))
+                archived_rows = [tuple(r) for r in self.store.query(
+                    "SELECT * FROM events WHERE source_file=?", (str(archived),))]
+                detached = self.base / (mutation + "-detached")
+                volume.rename(detached)
+                if mutation == "replace":
+                    # Keep the old inode allocated, avoiding unlink/recreate reuse.
+                    changed.rename(live / "old.source")
+                    changed.write_text(json.dumps(event("b", name="session_end")) + "\n")
+                else:
+                    changed.unlink()
+                with good.open("a") as fh:
+                    fh.write(json.dumps(span(end=True)) + "\n")
+                report = indexer.scan_once()
+                self.assertFalse(report.errors)
+                self.assertEqual(report.files_dropped if mutation == "delete" else report.files_invalidated, 1)
+                self.assertGreaterEqual(report.events_added, 1)
+                self.assertEqual(dict(self.store.file_state(str(archived))), state)
+                self.assertEqual(archived_rows, [tuple(r) for r in self.store.query(
+                    "SELECT * FROM events WHERE source_file=?", (str(archived),))])
+                self.assertEqual(self.store.file_state(str(good))["indexed_bytes"], good.stat().st_size)
+                self.assertTrue(self.store.replay_required())
+                # The store boundary itself also refuses a partial destructive reset.
+                seeds = self.store.session_seeds()
+                with self.store.transaction():
+                    with self.assertRaisesRegex(OSError, "unavailable sources"):
+                        self.store.prepare_replay([str(good)])
+                self.assertEqual(self.store.session_seeds(), seeds)
+                self.store.close()
+                self.store = TraceStore(self.base / "index.db")
+                detached.rename(volume)
+                indexer = Indexer(self.store, [volume, live])
+                self.assertFalse(indexer.scan_once().errors)
+                self.assertFalse(self.store.replay_required())
+                self.assertFalse(self.store.scan_was_incomplete())
+                clean = TraceStore(self.base / (mutation + "-clean.db"))
+                try:
+                    self.assertFalse(Indexer(clean, [volume, live]).full_rebuild().errors)
+                    for sql in ("SELECT * FROM events ORDER BY event_id",
+                                "SELECT * FROM spans ORDER BY adapter_id, session_id, trace_id, span_id"):
+                        self.assertEqual([tuple(r) for r in self.store.query(sql)],
+                                         [tuple(r) for r in clean.query(sql)])
+                    self.assertEqual(self.store.session_seeds(), clean.session_seeds())
+                    self.assertEqual(indexer.scan_once().events_added, 0)
+                finally:
+                    clean.close()
+
+    def test_failed_ordered_replay_rolls_back_then_publishes_healthy_tail(self):
+        directory = self.base / "traces"
+        directory.mkdir()
+        bad, good = directory / "a.jsonl", directory / "z.jsonl"
+        bad.write_text(json.dumps(span("b")) + "\n")
+        good.write_text(json.dumps(span()) + "\n")
+        indexer = Indexer(self.store, [directory])
+        self.assertFalse(indexer.scan_once().errors)
+        state = dict(self.store.file_state(str(bad)))
+        self.store.mark_scan_incomplete()
+        with good.open("a") as fh:
+            fh.write(json.dumps(span(end=True)) + "\n")
+        original = builtins.open
+
+        def deny(path, *args, **kwargs):
+            if Path(path) == bad:
+                raise PermissionError("synthetic unreadable source")
+            return original(path, *args, **kwargs)
+
+        with patch("builtins.open", deny):
+            report = indexer.scan_once()
+        self.assertEqual(report.events_added, 1)
+        self.assertEqual(dict(self.store.file_state(str(bad))), state)
+        self.assertEqual(self.store.one("SELECT COUNT(*) FROM events")[0], 3)
+        self.assertEqual(self.store.file_state(str(good))["indexed_bytes"], good.stat().st_size)
+        self.assertTrue(self.store.scan_was_incomplete())
+        self.assertFalse(indexer.scan_once().errors)
+        self.assertFalse(self.store.scan_was_incomplete())
+        self.assertEqual(indexer.scan_once().events_added, 0)
+
     def test_mid_file_failure_rolls_back_events_counters_and_episode_seed(self):
         directory = self.base / "traces"
         directory.mkdir()

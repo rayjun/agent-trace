@@ -1024,14 +1024,20 @@ class TraceStore:
             self._commit(conn)
 
     def prepare_replay(self, paths: list[str]) -> None:
-        """Forget reachable sources before ordered replay, in its transaction.
+        """Reset a complete source set for atomic, ordered identity replay.
 
         Removing an earlier boundary can change identities in surviving files.
         Keeping old rows and merely deduping a replay preserves obsolete ids.
-        Unmounted sources are deliberately left alone.
+        Missing indexed sources MUST defer the entire reset: their archive and
+        cursor cannot be reconstructed from the reachable subset's end seeds.
+        The caller holds the writer transaction and rolls back on read failure.
         """
+        missing = set(self.indexed_files()) - set(paths)
+        if missing:
+            raise OSError("source replay deferred; unavailable sources: " + ", ".join(sorted(missing)))
         conn = self._conn()
-        conn.execute("UPDATE ingest_files SET indexed_bytes = 0")
+        # Recreate cursors as full-file ingests, including source line numbers.
+        conn.execute("DELETE FROM ingest_files")
         conn.execute("DELETE FROM session_episodes")
         conn.executemany("DELETE FROM events WHERE source_file=?", ((p,) for p in paths))
         self.rebuild_projections()
@@ -1066,9 +1072,9 @@ class TraceStore:
         """Forget source files that no longer exist, and their rows with them.
 
         Same shape as invalidate_file but batched, so deleting N files costs one
-        projection rebuild instead of N. Every surviving file is rewound for the
-        reason invalidate_file documents (an event deduped away from this file
-        lives on in another, whose offset is already past it).
+        projection rebuild instead of N. Request an ordered source replay to
+        recover records deduped into a removed file; preserve surviving cursors
+        and seeds until that complete replay can commit.
         """
         if not paths:
             return 0
@@ -1084,8 +1090,8 @@ class TraceStore:
                 cur = conn.execute("DELETE FROM events WHERE source_file = ?", (path,))
                 dropped += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
                 conn.execute("DELETE FROM ingest_files WHERE path = ?", (path,))
-            conn.execute("UPDATE ingest_files SET indexed_bytes = 0")
-            conn.execute("DELETE FROM session_episodes")
+            # Preserve surviving cursors/seeds until a complete replay can
+            # replace them atomically (some sources may be detached).
             conn.execute("INSERT OR REPLACE INTO meta VALUES ('source_replay','1')")
             self._commit(conn)
             self.rebuild_projections()
@@ -1099,17 +1105,17 @@ class TraceStore:
         only the file we FIRST read an event from: an event that was deduped
         across two files disappears from the archive even though the other
         file still holds it, and nothing would ever re-read it because that
-        file's offset is already past it. So every surviving file is rewound
-        to zero and re-read on the next scan; event_id dedup makes that
-        idempotent, and a rotation is rare enough that the extra pass is the
-        cheap way to keep "JSONL is truth" actually true.
+        file's offset is already past it. Request ordered replay of every
+        surviving source. The reset is deferred until the full source set can
+        be read, so an unmounted source keeps its archive/cursor and healthy
+        tails can still advance with the committed (provisional) episode seeds.
         """
         with self.transaction():
             conn = self._conn()
             conn.execute("DELETE FROM events WHERE source_file = ?", (path,))
             conn.execute("DELETE FROM ingest_files WHERE path = ?", (path,))
-            conn.execute("UPDATE ingest_files SET indexed_bytes = 0")
-            conn.execute("DELETE FROM session_episodes")
+            # Preserve surviving cursors/seeds until a complete replay can
+            # replace them atomically (some sources may be detached).
             conn.execute("INSERT OR REPLACE INTO meta VALUES ('source_replay','1')")
             self._commit(conn)
             self.rebuild_projections()

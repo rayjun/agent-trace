@@ -56,7 +56,7 @@ class LocalBackend:
                 self.scanning = True
                 try:
                     report = indexer.scan_once()
-                    self.errors = report.errors
+                    self.errors = report.errors + report.problems
                     self.scans += 1
                     self.updated_at = time.time()
                 except Exception as exc:
@@ -104,6 +104,21 @@ class LocalBackend:
                            "index": self.index, "errors": list(self.errors),
                            "updated_at": self.updated_at},
             }
+        return self._read(read)
+
+    def resolve_session(self, session_id: str, agent: str | None = None) -> SessionKey:
+        def read(store: TraceStore) -> SessionKey:
+            sql = "SELECT adapter_id FROM sessions WHERE session_id = ?"
+            params = [session_id]
+            if agent is not None:
+                sql += " AND adapter_id = ?"
+                params.append(agent)
+            rows = store.query(sql + " LIMIT 2", tuple(params))
+            if not rows:
+                raise LookupError(f"No exact session match: {session_id}")
+            if len(rows) > 1:
+                raise ValueError(f"Session {session_id} is ambiguous; specify --agent")
+            return rows[0][0], session_id
         return self._read(read)
 
     def session(self, key: SessionKey, offset: int = 0) -> dict[str, Any]:

@@ -180,7 +180,10 @@ while WAL readers remain usable. Replays do not rewrite JSONL.
 Ordinary scans isolate file read failures with savepoints: a failed file keeps its prior
 cursor and episode state, while readable files can still update. Destructive source replays
 remain atomic and require all participating sources to be readable.
-Once failed sources recover, an atomic ordered replay restores episode ordering across split files.
+Temporarily unavailable indexed sources retain their archive and cursor, including across restarts.
+While they are unavailable, healthy tails can advance but episode identities remain provisional;
+destructive replay waits for all indexed sources to return. An atomic ordered replay then restores
+episode ordering across split files.
 
 The source contract remains append-only. Atomic file replacement and truncation are detected;
 a same-inode, non-shrinking in-place rewrite with a newer mtime is not guaranteed to be detected.

@@ -200,7 +200,7 @@ class TuiAPI(unittest.TestCase):
                  patch.object(self.store, "iter_events", side_effect=AssertionError("events read")):
                 result = query.get_trace(self.store, "t", summary=True)
         finally:
-            conn.set_authorizer(None)
+            conn.set_authorizer(lambda *args: sqlite3.SQLITE_OK)
         assert result is not None
         self.assertTrue(reads)
         self.assertEqual(set(result), {"trace_id", "session_id", "adapter_id", "spans"})

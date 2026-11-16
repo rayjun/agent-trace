@@ -20,13 +20,12 @@ Two rules, both learned from this project's own review rounds:
 from __future__ import annotations
 
 import copy
-import json
 import math
 import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 from panel.text import (C_AI, C_BOLD, C_DIM, C_MAGENTA, C_RED, C_RESET,
                         C_YELLOW, _bar, _fmt_tok, clip_plain, sane,
@@ -116,7 +115,7 @@ def percentiles(values: Iterable[float]) -> dict[str, float] | None:
             "min": vals[0], "n": float(n)}
 
 
-def sparkline(values: list[float | None], width: int) -> str:
+def sparkline(values: Sequence[float | None], width: int) -> str:
     """A block sparkline, newest last, scaled to its own maximum."""
     if not values or width <= 0:
         return ""
@@ -653,16 +652,17 @@ def render_line(m: Metrics, width: int) -> str | None:
         else:
             seg += f"{C_DIM} (max {human_ms(lat['max'])}, n={int(lat['n'])}){C_RESET}"
         bits.append(seg)
-    if m.tok_per_s:
-        med = percentiles(m.tok_per_s)["p50"]
+    tps = percentiles(m.tok_per_s)
+    if tps:
+        med = tps["p50"]
         bits.append(f"{C_DIM}{med:.0f} tok/s{C_RESET}")
     # Tokens and cache rate are the stats row's job (session_stats); repeating
     # them here spent the width that latency and cost needed.
     cost = m.cost_text()
     if cost != "—":
         bits.append(f"{C_DIM}{C_BOLD}{cost}{C_RESET}")
-    if m.tool_ms:
-        tl = percentiles(m.tool_ms)
+    tl = m.tool_latency
+    if tl:
         seg = f"{C_YELLOW}tools {int(tl['n'])}{C_RESET}{C_DIM} p50 {human_ms(tl['p50'])}{C_RESET}"
         if tl["n"] >= P95_MIN_SAMPLES:
             seg += f"{C_DIM} p95 {human_ms(tl['p95'])}{C_RESET}"
@@ -769,8 +769,8 @@ def render_overlay(m: Metrics, health_: Health | None, width: int,
                         f"{C_DIM} newest right{C_RESET}")
     else:
         perf.append(f"  {C_DIM}no completed call yet{C_RESET}")
-    if m.tok_per_s:
-        tps = percentiles(m.tok_per_s)
+    tps = percentiles(m.tok_per_s)
+    if tps:
         perf.append(f"  {C_DIM}throughput{C_RESET} {C_BOLD}{tps['p50']:.0f}{C_RESET}"
                     f"{C_DIM} tok/s median · max {tps['max']:.0f}{C_RESET}")
     if m.errors or m.tool_failures:

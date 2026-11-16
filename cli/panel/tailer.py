@@ -178,57 +178,6 @@ def _tail_records(path: Path, want: int, keep,
     return list(reversed(collected)), spent   # newest-first -> file order
 
 
-def _epoch(ts: str) -> float:
-    """Epoch SECONDS from an ISO-8601 ts, for comparing against mtime."""
-    try:
-        from datetime import datetime, timezone
-        base = ts.rstrip("Z")
-        fmt = "%Y-%m-%dT%H:%M:%S.%f" if "." in base else "%Y-%m-%dT%H:%M:%S"
-        return datetime.strptime(base, fmt).replace(
-            tzinfo=timezone.utc).timestamp()
-    except (ValueError, AttributeError):
-        return 0.0
-
-
-def _tails_newer_than(dirs: list[Path], keep, newer_than: str,
-                      want: int, slack_s: float = 120.0) -> list[dict]:
-    """File records newer than `newer_than` — the gap the index has not scanned.
-
-    Trace files are append-only, so a file NOT written since `newer_than` cannot
-    hold anything later than it: the mtime check is exact, not a heuristic. It
-    matters: reading six file tails to find two records cost 1.9s, and the file
-    that actually had them was the newest one.
-    """
-    floor = _epoch(newer_than) - slack_s
-    files: list[Path] = []
-    for d in dirs:
-        try:
-            for p in d.rglob("*.jsonl"):
-                try:
-                    if p.is_file() and p.stat().st_mtime >= floor:
-                        files.append(p)
-                except OSError:
-                    continue      # vanished mid-scan: the exact reader skips it too
-        except OSError:
-            continue
-
-    def _mtime(p: Path) -> float:
-        try:
-            return p.stat().st_mtime
-        except OSError:
-            return 0.0
-    files.sort(key=_mtime, reverse=True)
-    found: list[dict] = []
-    for path in files[:PRELOAD_MAX_FILES]:
-        for rec in _tail_records(path, want, lambda r: keep(r)
-                                 and (r.get("ts") or "") > newer_than):
-            if rec.get("ts") and rec["ts"] > newer_than:
-                found.append(rec)
-        if len(found) >= want:
-            break
-    return found
-
-
 def _rank_by_last_ts(files: list[Path]) -> list[Path]:
     """Files ordered by the timestamp of their LAST record, newest first.
 

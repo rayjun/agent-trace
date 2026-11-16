@@ -10,6 +10,7 @@ import sys
 import subprocess
 import tempfile
 import threading
+from typing import Any
 import unittest
 
 if importlib.util.find_spec("textual") is None:
@@ -19,7 +20,82 @@ if importlib.util.find_spec("textual") is None:
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "cli"), str(ROOT / "common")]
 from agenttrace_tui import BODY_LIMIT, NodeRef, TraceApp, body_text, readable_body, span_forest  # noqa: E402
-from textual.widgets import DataTable, Input, TabbedContent, TextArea  # noqa: E402
+from textual.widgets import DataTable, Input, TabbedContent, TextArea, Tree  # noqa: E402
+
+
+class PaginatedBackend:
+    """Delegate payloads to FakeBackend, but honor the real session page size."""
+    def __init__(self, rows):
+        self.base = FakeBackend()
+        self.base.rows = rows
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.block = False
+        self.resolution_error: Exception | None = None
+
+    def __getattr__(self, name) -> Any:
+        return getattr(self.base, name)
+
+    def dashboard(self, search="", agent=None, offset=0):
+        data = self.base.dashboard(search, agent, offset)
+        rows = data["sessions"]["sessions"]
+        data["sessions"].update(sessions=rows[offset:offset + 30],
+                                has_more=offset + 30 < len(rows))
+        return data
+
+    def resolve_session(self, session_id, agent=None):
+        if self.block:
+            self.entered.set()
+            self.release.wait(5)
+        if self.resolution_error is not None:
+            raise self.resolution_error
+        return self.base.resolve_session(session_id, agent)
+
+    def close(self):
+        self.release.set()
+        self.base.close()
+
+
+class MultiTurnBackend:
+    def __init__(self):
+        self.base = FakeBackend()
+        self.version = "old"
+        self.calls = []
+        self.block_trace: str | None = None
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.fail_delayed = False
+        self.remove_selected_call = False
+
+    def __getattr__(self, name) -> Any:
+        return getattr(self.base, name)
+
+    def session(self, key, offset=0):
+        data = self.base.session(key, offset)
+        row = data["turns"]["traces"][0]
+        data["turns"].update(total=3, traces=[dict(row, trace_id=t)
+                                            for t in ("shared", "second", "third")])
+        return data
+
+    def trace(self, key, trace_id):
+        self.calls.append((key, trace_id))
+        version = self.version
+        if key[0] == "a" and trace_id == self.block_trace:
+            self.entered.set()
+            self.release.wait(5)
+            if self.fail_delayed:
+                raise OSError("old context query failed")
+        if self.remove_selected_call and trace_id == "shared":
+            return dict(spans=[dict(span_id="replacement", parent_span_id=None, kind="llm",
+                                    name=key[0] + " " + version, status="ok", duration_ms=1)])
+        return dict(spans=[dict(span_id="call", parent_span_id=None, kind="llm",
+                               name=key[0] + " " + version, status="ok", duration_ms=1),
+                           dict(span_id="child", parent_span_id="call", kind="tool",
+                                name=version, status="ok", duration_ms=1)])
+
+    def close(self):
+        self.release.set()
+        self.base.close()
 
 
 class FakeBackend:
@@ -40,7 +116,7 @@ class FakeBackend:
         self.closed = True
         self.release.set()
 
-    def dashboard(self, search="", agent=None, offset=0):
+    def dashboard(self, search="", agent=None, offset=0) -> dict:
         if self.failure:
             raise OSError("fixture temporarily unavailable")
         rows = [r for r in self.rows if (agent is None or r["adapter_id"] == agent)
@@ -54,10 +130,19 @@ class FakeBackend:
                          duration_ms=2400, unclosed=0)],
             agents=["a", "b"], health=dict(index=False, scans=1), usage_known=True)
 
-    def session(self, key, offset=0):
+    def session(self, key, offset=0) -> dict:
         return dict(metrics={}, turns=dict(total=1, traces=[dict(
             trace_id="shared", name="Turn " + key[0], status="ok", duration_ms=2400,
             start="2026-11-15T10:00:00.000Z")]))
+
+    def resolve_session(self, session_id, agent=None):
+        matches = {(r["adapter_id"], r["session_id"]) for r in self.rows
+                   if r["session_id"] == session_id and (agent is None or r["adapter_id"] == agent)}
+        if not matches:
+            raise LookupError("session not found")
+        if len(matches) > 1:
+            raise ValueError("session belongs to multiple agents")
+        return next(iter(matches))
 
     def trace(self, key, trace_id):
         return dict(spans=[dict(span_id="call", parent_span_id=None, kind="llm",
@@ -212,6 +297,203 @@ class DashboardTests(unittest.IsolatedAsyncioTestCase):
             app.action_pause()
             await settled(app, pilot)
             self.assertEqual(app.query_one("#field-output", TextArea).text, "newer response")
+
+
+class RegressionTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def session_rows():
+        return [dict(adapter_id="a", session_id=f"target-copy-{i}", trace_count=1)
+                for i in range(30, 0, -1)] + [dict(adapter_id="a", session_id="target", trace_count=1)]
+
+    async def test_explicit_session_resolves_page_two_exactly(self):
+        backend = PaginatedBackend(self.session_rows())
+        app = TraceApp(backend, agent="a", session="target", interval=3600)
+        async with app.run_test() as pilot:
+            await settled(app, pilot)
+            self.assertEqual(app.session_key, ("a", "target"))
+            self.assertEqual(app.session_offset, 0)
+            self.assertFalse(any(r["session_id"] == "target" for r in app._session_rows.values()))
+            app.action_refresh()
+            await settled(app, pilot)
+            self.assertEqual(app.session_key, ("a", "target"))
+
+    async def test_missing_explicit_session_never_substitutes_a_partial_match(self):
+        backend = PaginatedBackend(self.session_rows()[:-1])
+        app = TraceApp(backend, agent="a", session="target", interval=3600)
+        async with app.run_test() as pilot:
+            await settled(app, pilot)
+            self.assertIsNone(app.session_key)
+            self.assertIn("not found", app.query_one("#field-info", TextArea).text)
+            app.action_refresh()
+            await settled(app, pilot)
+            self.assertIsNone(app.session_key)
+
+    async def test_ambiguity_is_detected_across_session_pages(self):
+        rows = self.session_rows()
+        rows[0] = dict(adapter_id="b", session_id="target", trace_count=1)
+        app = TraceApp(PaginatedBackend(rows), session="target", interval=3600)
+        async with app.run_test() as pilot:
+            await settled(app, pilot)
+            self.assertIsNone(app.session_key)
+            self.assertIn("multiple agents", app.query_one("#field-info", TextArea).text)
+
+    async def test_delayed_exact_lookup_cannot_override_changed_filter(self):
+        backend = PaginatedBackend(self.session_rows())
+        backend.block = True
+        app = TraceApp(backend, session="target", interval=3600)
+        async with app.run_test() as pilot:
+            try:
+                self.assertTrue(await asyncio.to_thread(backend.entered.wait, 2))
+                app.query_one("#search", Input).value = "target-copy-29"
+                await pilot.pause(.4)
+            finally:
+                backend.release.set()
+            await settled(app, pilot)
+            self.assertEqual(app.session_key, ("a", "target-copy-29"))
+
+    async def test_pending_exact_lookup_preserves_newer_row_selection(self):
+        for outcome in ("resolved", "missing", "ambiguous", "row_left_page"):
+            with self.subTest(outcome=outcome):
+                backend = PaginatedBackend(self.session_rows())
+                app = TraceApp(backend, agent="a", session="target", interval=3600)
+                async with app.run_test() as pilot:
+                    await settled(app, pilot)
+                    await app.workers.wait_for_complete()
+                    self.assertFalse(app._refreshing)
+                    backend.block = True
+                    if outcome == "row_left_page":
+                        backend.base.rows = [r for r in backend.base.rows
+                                             if r["session_id"] != "target-copy-29"]
+                    app.action_refresh()
+                    try:
+                        self.assertTrue(await asyncio.to_thread(backend.entered.wait, 2))
+                        table = app.query_one("#sessions", DataTable)
+                        table.move_cursor(row=1)
+                        await pilot.pause()
+                        self.assertEqual(app.session_key, ("a", "target-copy-29"))
+                        self.assertIsNone(app.initial_session)
+                        if outcome == "missing":
+                            backend.base.rows.pop()
+                        elif outcome == "ambiguous":
+                            backend.resolution_error = ValueError("ambiguous")
+                    finally:
+                        backend.release.set()
+                    await settled(app, pilot)
+                    self.assertEqual(app.session_key, ("a", "target-copy-29"))
+                    self.assertEqual(app.span_ref, NodeRef("shared", "call"))
+                    self.assertNotIn("not found", app.query_one("#field-info", TextArea).text)
+                    self.assertNotIn("multiple agents", app.query_one("#field-info", TextArea).text)
+
+    async def test_refresh_without_selected_span_updates_other_expanded_turns(self):
+        backend = MultiTurnBackend()
+        app = TraceApp(backend, interval=3600)
+        async with app.run_test() as pilot:
+            await settled(app, pilot)
+            app._turn_nodes["second"].expand()
+            await settled(app, pilot)
+            backend.remove_selected_call = True
+            app.action_refresh()
+            await settled(app, pilot)
+            self.assertIsNone(app.span_ref)
+            backend.calls.clear()
+            backend.version = "after removal"
+            app.action_refresh()
+            await settled(app, pilot)
+            self.assertIn("after removal", str(app._turn_nodes["second"].children[0].label))
+            self.assertEqual(app.span_ref, NodeRef("shared", "replacement"))
+            self.assertTrue(app._turn_nodes["second"].is_expanded)
+            self.assertFalse(app._turn_nodes["third"].is_expanded)
+            self.assertCountEqual(backend.calls, [(("a", "same"), "shared"), (("a", "same"), "second")])
+
+    async def test_independent_expansions_finish_when_another_turn_expands(self):
+        backend = MultiTurnBackend()
+        app = TraceApp(backend, interval=3600)
+        async with app.run_test() as pilot:
+            await settled(app, pilot)
+            backend.block_trace = "second"
+            app._turn_nodes["second"].expand()
+            try:
+                self.assertTrue(await asyncio.to_thread(backend.entered.wait, 2))
+                app._turn_nodes["third"].expand()
+                await pilot.pause(.15)
+                self.assertTrue(app._turn_nodes["third"].children)
+            finally:
+                backend.release.set()
+            await settled(app, pilot)
+            self.assertTrue(app._turn_nodes["second"].children)
+            self.assertTrue(app._turn_nodes["second"].is_expanded)
+
+    async def test_refresh_updates_all_expanded_turns_preserving_tree_state(self):
+        backend = MultiTurnBackend()
+        app = TraceApp(backend, interval=3600)
+        async with app.run_test() as pilot:
+            await settled(app, pilot)
+            app._turn_nodes["second"].expand()
+            await settled(app, pilot)
+            child = app._turn_nodes["second"].children[0]
+            child.expand()
+            await pilot.pause(.1)
+            tree = app.query_one("#traces", Tree)
+            with app.prevent(Tree.NodeSelected):
+                tree.select_node(child.children[0])
+            await pilot.pause(.1)
+            self.assertEqual(tree.cursor_node.data, NodeRef("second", "child"))
+            selected = app.span_ref
+            backend.calls.clear()
+            backend.version = "new"
+            app.action_refresh()
+            await settled(app, pilot)
+            self.assertIn("new", str(app._turn_nodes["second"].children[0].label))
+            self.assertTrue(app._turn_nodes["second"].children[0].is_expanded)
+            self.assertEqual(tree.cursor_node.data, NodeRef("second", "child"))
+            self.assertEqual(app.span_ref, selected)
+            self.assertFalse(app._turn_nodes["third"].is_expanded)
+            self.assertCountEqual(backend.calls, [(("a", "same"), "shared"), (("a", "same"), "second")])
+            backend.calls.clear()
+            backend.version = "timer update"
+            app._tick()
+            await settled(app, pilot)
+            self.assertIn("timer update", str(app._turn_nodes["second"].children[0].label))
+            self.assertEqual(tree.cursor_node.data, NodeRef("second", "child"))
+            self.assertCountEqual(backend.calls, [(("a", "same"), "shared"), (("a", "same"), "second")])
+            # The timer path uses the same refresh, without reopening collapsed turns.
+            app._turn_nodes["second"].collapse()
+            backend.calls.clear()
+            backend.version = "newest"
+            app._tick()
+            await settled(app, pilot)
+            self.assertEqual(backend.calls, [(("a", "same"), "shared")])
+            self.assertFalse(app._turn_nodes["second"].is_expanded)
+            app._turn_nodes["second"].expand()
+            await settled(app, pilot)
+            self.assertIn("newest", str(app._turn_nodes["second"].children[0].label))
+
+    async def test_refresh_and_expand_share_delayed_query_and_discard_old_context(self):
+        for failure in (False, True):
+            with self.subTest(delayed_failure=failure):
+                backend = MultiTurnBackend()
+                app = TraceApp(backend, interval=3600)
+                async with app.run_test() as pilot:
+                    await settled(app, pilot)
+                    backend.calls.clear()
+                    backend.block_trace = "second"
+                    app._turn_nodes["second"].expand()
+                    try:
+                        self.assertTrue(await asyncio.to_thread(backend.entered.wait, 2))
+                        app.action_refresh()
+                        await pilot.pause(.2)
+                        self.assertEqual(backend.calls.count((("a", "same"), "second")), 1)
+                        # Both an expansion and refresh await the old context.
+                        app._select_session(("b", "same"))
+                        await app._load_session(app.session_key, app._session_epoch)
+                        backend.fail_delayed = failure
+                    finally:
+                        backend.release.set()
+                    await settled(app, pilot)
+                    self.assertEqual(app.session_key, ("b", "same"))
+                    self.assertFalse(app._turn_nodes["second"].children)
+                    self.assertIn("b old", str(app._turn_nodes["shared"].children[0].label))
+                    self.assertNotIn("STALE", str(app.query_one("#status").render()))
 
 
 class RenderingTests(unittest.TestCase):

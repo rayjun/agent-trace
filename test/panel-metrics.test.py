@@ -292,7 +292,8 @@ CREATE TABLE ingest_files (path TEXT, size INTEGER, indexed_bytes INTEGER);
 """)
 c.execute("INSERT INTO ingest_files VALUES (?, ?, ?)",
           (str(tmp / "gone.jsonl"), 100, 0))
-c.commit(); c.close()
+c.commit()
+c.close()
 check("a row whose file is gone still counts as behind (the indexer will drop it)",
       health(gone_db, ttl=0).files_behind == 1,
       str(health(gone_db, ttl=0).files_behind))
@@ -309,7 +310,8 @@ c.execute("INSERT INTO ingest_files VALUES (?, ?, ?)",
           (str(tmp / "here.jsonl"), 100, 40))
 c.execute("INSERT INTO ingest_files VALUES (?, ?, ?)",
           (str(tmp / "done.jsonl"), 100, 100))
-c.commit(); c.close()
+c.commit()
+c.close()
 check("a present file with unread bytes is counted as behind",
       health(here_db, ttl=0).files_behind == 1,
       str(health(here_db, ttl=0).files_behind))
@@ -318,7 +320,8 @@ old_db = tmp / "old.db"
 c = sqlite3.connect(old_db)
 c.executescript("CREATE TABLE events (event_id TEXT); CREATE TABLE spans (span_id TEXT);"
                 "CREATE TABLE sessions (session_id TEXT);")
-c.commit(); c.close()
+c.commit()
+c.close()
 ancient = health(old_db, ttl=0)
 check("an older schema reports freshness UNKNOWN, not a clean zero",
       ancient.ok and ancient.files_behind is None, str(ancient.files_behind))

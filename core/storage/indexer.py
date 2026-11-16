@@ -88,10 +88,6 @@ class _SourceChanged(OSError):
         self.path = path
 
 
-class _ReplayReady(Exception):
-    """All sources are readable again; replace provisional episode identities."""
-
-
 class Indexer:
     def __init__(self, store: TraceStore, dirs: list[Path]) -> None:
         self.store = store
@@ -167,8 +163,8 @@ class Indexer:
         present = {str(p) for p in files}
         report.files_rekeyed = self._rekey(present)
         report.files_dropped = self._drop_vanished(present)
-        # Preflight all invalidations before choosing the replay start state.
-        # invalidate_file clears seeds as well as rewinding every file cursor.
+        # Preflight invalidations without disturbing surviving cursors/seeds.
+        # Their state must remain usable if an unavailable source defers replay.
         for path in files:
             try:
                 state = self.store.file_state(resolved_path(path))
@@ -177,27 +173,36 @@ class Indexer:
                     report.files_invalidated += 1
             except OSError as exc:
                 report.errors.append(f"{path}: {exc}")
-        if self.store.replay_required():
-            self._replay_files(files, report, before)
-        else:
+        # Discovery silently skips detached/unreadable directories. Those files
+        # still own archived rows AND a committed cursor; replaying only the
+        # discovered subset would erase their seed context and later duplicate
+        # their records. Keep a durable repair marker even without a read error.
+        unavailable = set(self.store.indexed_files()) - {resolved_path(p) for p in files}
+        repair = self.store.replay_required() or self.store.scan_was_incomplete()
+        if repair and not unavailable:
+            baseline_errors = list(report.errors)
             try:
+                # Failed replay must not erase the prior snapshot or prevent
+                # healthy tails advancing. Roll back its entire destructive
+                # attempt before falling back to provisional incremental ingest.
                 with self.store.transaction():
-                    self._scan_files(files, report, before)
-                    if not report.errors and self.store.scan_was_incomplete():
-                        # A skipped file can hold an earlier prompt boundary.
-                        # Discard this probe's tail identities, then replay from
-                        # empty seeds before publishing the recovered snapshot.
-                        raise _ReplayReady()
-            except _ReplayReady:
+                    self._replay_files(files, report, before)
+                return report
+            except _SourceChanged:
+                raise
+            except OSError as exc:
+                replay_errors = report.errors or [str(exc)]
                 report = ScanReport(files_rekeyed=report.files_rekeyed,
                                     files_dropped=report.files_dropped,
-                                    files_invalidated=report.files_invalidated)
-                self._replay_files(files, report, before)
-            if report.errors:
-                self.store.mark_scan_incomplete()
-        # Ordinary file failures roll back to the file savepoint, including its
-        # cursor and episode state. Healthy files can still publish. Destructive
-        # ordered replay above must remain all-or-nothing.
+                                    files_invalidated=report.files_invalidated,
+                                    errors=list(dict.fromkeys(baseline_errors + replay_errors)))
+        self._scan_files(files, report, before)
+        report.errors = list(dict.fromkeys(report.errors))
+        if report.errors or unavailable:
+            self.store.mark_scan_incomplete()
+        # Provisional identities may be imperfect while a boundary is missing;
+        # retain healthy progress, then atomically replace them in source order
+        # once ALL indexed sources are discoverable and readable again.
         return report
 
     def _replay_files(self, files: list[Path], report: ScanReport,

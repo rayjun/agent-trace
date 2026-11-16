@@ -33,7 +33,6 @@ import signal
 import sys
 import time
 from pathlib import Path
-from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "common"))
@@ -218,8 +217,9 @@ def watch(args) -> int:
     # the window's head on every append, which forced a full re-fold each time.
     trim_slack = max(200, max_lines // 4)
     show_metrics = bool(getattr(args, "metrics", False))
-    db_path = (Path(os.environ.get("AGENTTRACE_DB"))
-               if os.environ.get("AGENTTRACE_DB")
+    db_override = os.environ.get("AGENTTRACE_DB")
+    db_path = (Path(db_override)
+               if db_override
                else platform_dir() / "agenttrace.db")
 
     with Screen() as scr:

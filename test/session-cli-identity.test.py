@@ -41,6 +41,24 @@ class SessionCLIIdentity(unittest.TestCase):
                               cwd=ROOT, env={**os.environ, 'AGENTTRACE_PLATFORM_DIR': self.tmp.name},
                               capture_output=True, text=True, timeout=20)
 
+    def test_tui_filters_survive_both_argument_positions(self):
+        sys.path.insert(0, str(ROOT / 'cli'))
+        import agenttrace
+        parser = agenttrace.build_parser()
+        variants = [
+            ['--agent', 'codex', '--session', 'shared', 'tui', '--no-index'],
+            ['tui', '--agent', 'codex', '--session', 'shared', '--no-index'],
+            ['--agent', 'hermes', '--session', 'old', 'tui',
+             '--agent', 'codex', '--session', 'shared', '--no-index'],
+        ]
+        for argv in variants:
+            with self.subTest(argv=argv):
+                args = parser.parse_args(argv)
+                self.assertEqual((args.agent, args.session), ('codex', 'shared'))
+        args = parser.parse_args(['tui'])
+        self.assertIsNone(getattr(args, 'agent', None))
+        self.assertIsNone(getattr(args, 'session', None))
+
     def test_exact_session_respects_agent(self):
         for agent, tokens in [('hermes', 10), ('codex', 100)]:
             result = self.run_cli('shared', '--agent', agent)

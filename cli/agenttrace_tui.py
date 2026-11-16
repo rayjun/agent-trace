@@ -193,6 +193,7 @@ class TraceApp(App):
         self._agent_options: tuple[str, ...] = ()
         self._turn_nodes: dict[str, TreeNode] = {}
         self._trace_cache: dict[str, list[dict]] = {}
+        self._trace_requests: dict[tuple[SessionKey, int, str], asyncio.Task] = {}
         self._search_timer: Any = None
         self._active_panel = "sessions"
         self._last_dashboard: dict = {}
@@ -314,15 +315,33 @@ class TraceApp(App):
         self._request_started = time.monotonic()
         revision = self._filter_revision
         display_epoch = self._display_epoch
+        initial = self.initial_session
+        session_epoch = self._session_epoch
         try:
             search = self.query_one("#search", Input).value
             data = await asyncio.to_thread(self.backend.dashboard, search,
                                            self.agent_filter, self.session_offset)
+            resolved = None
+            resolution_error = None
+            if initial is not None:
+                # Explicit IDs are exact selectors, independent of search pages.
+                try:
+                    resolved = await asyncio.to_thread(self.backend.resolve_session, initial, self.agent_filter)
+                except ValueError:
+                    resolution_error = "This session ID belongs to multiple agents. Select an agent or choose a row."
+                except LookupError:
+                    resolution_error = "The requested session ID was not found. Choose a row or change the search."
             if self.closed or revision != self._filter_revision or display_epoch != self._display_epoch:
                 return
+            selection_changed = initial != self.initial_session or session_epoch != self._session_epoch
+            if resolved is not None and not selection_changed:
+                self._select_session(resolved)
             self._last_dashboard = data
             self._render_dashboard(data)
-            self._render_sessions(data["sessions"])
+            self._render_sessions(data["sessions"], allow_auto_select=not selection_changed)
+            if resolution_error and not selection_changed:
+                self._clear_session()
+                self._show_info(resolution_error)
             if self.session_key is not None:
                 await self._load_session(self.session_key, self._session_epoch)
             self._last_success = time.time()
@@ -376,7 +395,7 @@ class TraceApp(App):
             notes += f" · {len(health['errors'])} source issues (last snapshot retained)"
         self.query_one("#status", Static).update(Text(notes, style=MUTED))
 
-    def _render_sessions(self, data: dict) -> None:
+    def _render_sessions(self, data: dict, *, allow_auto_select: bool = True) -> None:
         table = self.query_one("#sessions", DataTable)
         rows = data["sessions"]
         row_map = {json.dumps([r["adapter_id"], r["session_id"]]): r for r in rows}
@@ -405,14 +424,10 @@ class TraceApp(App):
         self.query_one("#sessions-prev", Button).disabled = self.session_offset == 0
         self.query_one("#sessions-next", Button).disabled = not data["has_more"]
         if selected not in keys:
+            if self.initial_session is not None or not allow_auto_select:
+                return
             if rows:
-                matches = [r for r in rows if r["session_id"] == self.initial_session]
-                if len(matches) > 1 and self.agent_filter is None:
-                    self._clear_session()
-                    self._show_info("This session ID belongs to multiple agents. Select an agent or choose a row.")
-                    return
-                chosen = next((r for r in rows if r["session_id"] == self.initial_session), rows[0])
-                self.initial_session = None
+                chosen = rows[0]
                 self._select_session((chosen["adapter_id"], chosen["session_id"]))
                 with self.prevent(DataTable.RowHighlighted, DataTable.RowSelected):
                     table.move_cursor(row=rows.index(chosen))
@@ -466,6 +481,8 @@ class TraceApp(App):
                 return
             turns = data["turns"]
             tree = self.query_one("#traces", Tree)
+            cursor_ref = tree.cursor_node.data if tree.cursor_node else None
+            cursor_selection = self._span_epoch
             ids = {r["trace_id"] for r in turns["traces"]}
             with self.prevent(Tree.NodeSelected, Tree.NodeExpanded):
                 for trace_id in list(self._turn_nodes):
@@ -489,14 +506,21 @@ class TraceApp(App):
                 self.span_ref = None
                 self._span_epoch += 1
                 self._show_info("The selected turn left this page. Select another turn.")
-            if n and self.span_ref is None:
-                trace_id = turns["traces"][0]["trace_id"]
-                await self._load_trace(key, epoch, trace_id, choose=True, selection=self._span_epoch)
-            elif self.span_ref is not None:
-                await self._load_trace(key, epoch, self.span_ref.trace_id)
-                if self.span_ref and self.span_ref.span_id:
-                    await self._load_span(key, self.span_ref, self._span_epoch)
-            elif not n:
+            ref, selection = self.span_ref, self._span_epoch
+            visible = {trace_id for trace_id, node in self._turn_nodes.items() if node.is_expanded}
+            auto_trace = turns["traces"][0]["trace_id"] if n and ref is None else None
+            if auto_trace is not None:
+                visible.add(auto_trace)
+            if ref is not None:
+                visible.add(ref.trace_id)
+            await asyncio.gather(*(self._load_trace(key, epoch, trace_id,
+                                                   choose=trace_id == auto_trace, selection=selection)
+                                   for trace_id in visible))
+            self.call_after_refresh(self._restore_tree_cursor, key, epoch, cursor_selection, cursor_ref)
+            if (ref is not None and key == self.session_key and epoch == self._session_epoch
+                    and ref == self.span_ref and selection == self._span_epoch and ref.span_id):
+                await self._load_span(key, ref, selection)
+            if not n:
                 self._show_info("This session has no indexed turns yet.")
         except Exception as exc:
             if epoch == self._session_epoch and key == self.session_key:
@@ -512,10 +536,47 @@ class TraceApp(App):
         label.append("  " + duration(row.get("duration_ms")), style=VIOLET)
         return label
 
+    def _restore_tree_cursor(self, key: SessionKey, epoch: int, selection: int,
+                             ref: NodeRef | None) -> None:
+        if (self.closed or key != self.session_key or epoch != self._session_epoch
+                or selection != self._span_epoch or ref is None):
+            return
+        pending = list(self._turn_nodes.values())
+        tree = self.query_one("#traces", Tree)
+        while pending:
+            node = pending.pop()
+            if node.data == ref:
+                tree.move_cursor(node)
+                return
+            pending.extend(node.children)
+
     async def _load_trace(self, key: SessionKey, epoch: int, trace_id: str,
                           *, choose: bool = False, selection: int | None = None) -> None:
-        data = await asyncio.to_thread(self.backend.trace, key, trace_id)
-        if self.closed or epoch != self._session_epoch or key != self.session_key or trace_id not in self._turn_nodes:
+        node = self._turn_nodes.get(trace_id)
+        if self.closed or epoch != self._session_epoch or key != self.session_key or node is None:
+            return
+        request_key = (key, epoch, trace_id)
+        task = self._trace_requests.get(request_key)
+        if task is None:
+            task = asyncio.create_task(asyncio.to_thread(self.backend.trace, key, trace_id))
+            self._trace_requests[request_key] = task
+
+            def finished(done: asyncio.Task) -> None:
+                if self._trace_requests.get(request_key) is done:
+                    self._trace_requests.pop(request_key, None)
+                # A cancelled UI waiter must not leave an unobserved exception.
+                if not done.cancelled():
+                    done.exception()
+
+            task.add_done_callback(finished)
+        try:
+            data = await asyncio.shield(task)
+        except Exception:
+            if self.closed or epoch != self._session_epoch or key != self.session_key:
+                return
+            raise
+        if (self.closed or epoch != self._session_epoch or key != self.session_key
+                or self._turn_nodes.get(trace_id) is not node):
             return
         if choose and selection is not None and selection != self._span_epoch:
             return
@@ -524,7 +585,6 @@ class TraceApp(App):
             return
         spans = data["spans"]
         visible = [s for s in spans if not (s.get("synthetic") and s["span_id"] == trace_id)] or spans
-        node = self._turn_nodes[trace_id]
         if self._trace_cache.get(trace_id) != visible:
             tree = self.query_one("#traces", Tree)
             cursor_ref = tree.cursor_node.data if tree.cursor_node else None
@@ -549,11 +609,10 @@ class TraceApp(App):
                         child = parent.add(label, NodeRef(trace_id, span["span_id"]),
                                            expand=span["span_id"] in expanded,
                                            allow_expand=bool(children))
-                        if child.data == cursor_ref:
-                            tree.select_node(child)
                         add(child, children)
 
                 add(node, span_forest(visible))
+                self.call_after_refresh(self._restore_tree_cursor, key, epoch, self._span_epoch, cursor_ref)
                 self._trace_cache[trace_id] = visible
                 if choose:
                     node.expand()
@@ -571,14 +630,15 @@ class TraceApp(App):
     @on(Tree.NodeExpanded, "#traces")
     def trace_expanded(self, event: Tree.NodeExpanded) -> None:
         if event.node.data and event.node.data.span_id is None and self.session_key:
-            self.run_worker(self._expand(self.session_key, self._session_epoch, event.node.data), group="expand", exclusive=True,
+            self.run_worker(self._expand(self.session_key, self._session_epoch, event.node.data), group="expand",
                             exit_on_error=False)
 
     async def _expand(self, key: SessionKey, epoch: int, ref: NodeRef) -> None:
         try:
             await self._load_trace(key, epoch, ref.trace_id)
         except Exception as exc:
-            self._error(exc)
+            if epoch == self._session_epoch and key == self.session_key:
+                self._error(exc)
 
     @on(Tree.NodeSelected, "#traces")
     def call_selected(self, event: Tree.NodeSelected) -> None:
@@ -649,6 +709,8 @@ class TraceApp(App):
 
     @on(Input.Changed, "#search")
     def search_changed(self) -> None:
+        if self.query_one("#search", Input).value != self.initial_session:
+            self.initial_session = None
         self._filter_revision += 1
         self.session_offset = 0
         if self._search_timer:

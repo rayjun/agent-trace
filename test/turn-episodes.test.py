@@ -74,7 +74,6 @@ def v1(event: str, sec: float, turn: str | None, **kw) -> dict:
 
 
 def _episodes(records: list[dict]) -> list[str | None]:
-    from core.convert.v1_to_v2 import EpisodeTracker
     tracker = EpisodeTracker()
     return [tracker.step(r) for r in records]
 
@@ -273,7 +272,7 @@ pi_rows = [
     v1("user_prompt", 10, "0", request={"messages": [{"role": "user", "content": "second"}]}),
     *llm_pair("0", 11, "b"),
 ]
-pi_events = [convert_record(r, e) for r, e in zip(pi_rows, _episodes(pi_rows))]
+pi_events = [convert_record(r, e) for r, e in zip(pi_rows, _episodes(pi_rows), strict=False)]
 pi_traces = [c["trace_id"] for c in pi_events if c and c.get("span")
              and c["span_id"].startswith("llm:")]
 check("a turn restarting at the same turn_id after session_end gets its own trace",

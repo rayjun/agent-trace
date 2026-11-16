@@ -19,6 +19,7 @@ import tempfile
 import threading
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 #: The suite talks to a server on 127.0.0.1, and `urllib` sends that through
 #: `http_proxy` when the shell exports one — so the assertions were comparing
@@ -26,7 +27,6 @@ import urllib.request
 #: on a clean shell, red on a laptop running a VPN client. Loopback is never
 #: proxied here, which is also what the product does (llm_judge._opener).
 _NO_PROXY = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))

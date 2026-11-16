@@ -87,6 +87,62 @@ class BackendTests(unittest.TestCase):
         wait_for(lambda: self.backend.dashboard()["sessions"]["total"] == 2)
         self.assertEqual(self.backend.errors, [])
 
+    def test_health_reports_corrupt_lines(self):
+        source = self.dirs / "broken.jsonl"
+        source.write_text("not-json\n" + json.dumps(event("a")) + "\n")
+        self.backend = LocalBackend(self.db, [self.dirs], interval=60)
+        self.backend.start()
+        deadline = time.monotonic() + 5
+        while not self.backend.scans and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertGreaterEqual(self.backend.scans, 1)
+        health = self.backend.dashboard()["health"]
+        self.assertIn("1 unparseable line(s)", health["errors"])
+        self.assertEqual(self.backend.dashboard()["sessions"]["total"], 1)
+
+    def test_health_includes_contract_conflicts_and_io_errors(self):
+        from unittest.mock import patch
+        from core.storage.indexer import Indexer, ScanReport
+        report = ScanReport(events_invalid=2, event_id_conflicts=3,
+                            errors=["synthetic unreadable source"])
+        self.backend = LocalBackend(self.db, [self.dirs], interval=60)
+        with patch.object(Indexer, "scan_once", return_value=report):
+            self.backend.start()
+            deadline = time.monotonic() + 5
+            while not self.backend.scans and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertGreaterEqual(self.backend.scans, 1)
+            self.assertEqual(self.backend.dashboard()["health"]["errors"],
+                             report.errors + report.problems)
+
+    def test_resolve_session_is_exact_and_independent_of_pages(self):
+        store = TraceStore(self.db)
+        for i in range(31):
+            sid = "target" if i == 0 else f"target-copy-{i:02}"
+            record = event("a", sid, i)
+            record["ts"] = f"2026-11-15T00:00:{i:02}.000Z"
+            record["trace_id"] = f"trace-{i}"
+            store.ingest(record)
+        store.ingest(event("b", "shared"))
+        store.ingest(event("a", "shared"))
+        store.refresh_projections()
+        store.close()
+        self.backend = LocalBackend(self.db, [], index=False)
+        self.backend.start()
+        first_page = self.backend.dashboard(search="target", agent="a")["sessions"]
+        self.assertEqual(first_page["total"], 31)
+        self.assertNotIn("target", [r["session_id"] for r in first_page["sessions"]])
+        self.assertEqual(self.backend.resolve_session("target", "a"), ("a", "target"))
+        self.assertEqual(self.backend.resolve_session("target"), ("a", "target"))
+        self.assertEqual(self.backend.resolve_session("shared", "b"), ("b", "shared"))
+        with self.assertRaises(ValueError):
+            self.backend.resolve_session("shared")
+        with self.assertRaises(LookupError):
+            self.backend.resolve_session("target", "b")
+        with self.assertRaises(LookupError):
+            self.backend.resolve_session("target-cop", "a")
+        self.assertIsNone(self.backend.store._local.conn)
+
     def test_no_index_does_not_read_or_change_source_files(self):
         source = self.dirs / "ignored.jsonl"
         content = json.dumps(event("a")) + "\n"

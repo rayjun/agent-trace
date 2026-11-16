@@ -577,8 +577,8 @@ def build_parser() -> argparse.ArgumentParser:
     _dirs(p_watch)
 
     p_tui = sub.add_parser("tui", help="Textual dashboard: sessions, execution tree and call inspector")
-    p_tui.add_argument("--agent", default=None, help="initial adapter filter")
-    p_tui.add_argument("--session", default=None, help="initial session ID")
+    p_tui.add_argument("--agent", default=argparse.SUPPRESS, help="initial adapter filter")
+    p_tui.add_argument("--session", default=argparse.SUPPRESS, help="initial session ID")
     p_tui.add_argument("--db", type=Path, default=None)
     p_tui.add_argument("--interval", type=float, default=2.5, help="refresh interval seconds (minimum 0.5)")
     p_tui.add_argument("--no-index", action="store_true", help="browse the existing index without scanning source files")
