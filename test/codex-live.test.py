@@ -92,6 +92,61 @@ class LiveCapture(unittest.TestCase):
         self.capture()
         self.assertEqual(self.records(), records)
 
+    def test_custom_tools_and_response_item_prompts_reach_work_review(self):
+        from core.review import session_review
+        from core.storage.indexer import Indexer
+        from core.storage.sqlite_store import TraceStore
+        command = 'text(await tools.exec_command({cmd:"pytest -q"}));'
+        rows = opening()[:3] + [
+            line("response_item", {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "CAPTURE_FIXTURE"}]}, 2),
+            line("response_item", {"type": "custom_tool_call", "name": "exec", "call_id": "custom-1", "input": command}, 3),
+            line("response_item", {"type": "custom_tool_call_output", "call_id": "custom-1", "output": [
+                {"type": "text", "text": 'Script completed\nWall time: 0.1 seconds\nOutput:\n{"exit_code":1,"output":"1 failed"}'}]}, 4),
+        ] + closing()[1:]
+        write(self.path, rows)
+        self.capture()
+        records = self.records()
+        self.assertEqual(len([r for r in records if r["event"] == "user_prompt"]), 1)
+        self.assertEqual(next(r for r in records if r["event"] == "tool_call")["tool"]["args"], command)
+        store = TraceStore(self.base / "review.db")
+        try:
+            report = Indexer(store, [self.target]).scan_once()
+            self.assertEqual(report.errors + report.problems, [])
+            review = session_review(store, "session-a", agent="codex")
+            self.assertEqual(review["task"], "CAPTURE_FIXTURE")
+            self.assertEqual(review["state"], "failed")
+            self.assertEqual(review["checks"][0]["command"], "pytest -q")
+        finally:
+            store.close()
+
+    def test_custom_call_tail_recovers_name_and_prompt_without_event_message(self):
+        write(self.path, opening()[:2] + [
+            line("response_item", {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "Fix custom tools"}]}, 2),
+            line("response_item", {"type": "custom_tool_call", "name": "exec", "call_id": "custom-1", "input": "pytest"}, 3)])
+        self.capture()
+        write(self.path, [line("response_item", {"type": "custom_tool_call_output", "call_id": "custom-1", "output": "result"}, 4)], "a")
+        self.capture()
+        self.assertEqual(next(r for r in self.records() if r["event"] == "tool_result")["tool"]["name"], "exec")
+        self.assertEqual(next(r for r in self.records() if r["event"] == "user_prompt")["request"]["messages"][0]["content"], "Fix custom tools")
+
+    def test_late_contextual_prompt_does_not_split_a_native_turn(self):
+        context = line("response_item", {"type": "message", "role": "user", "content": [
+            {"type": "input_text", "text": "Also add regression coverage"}]}, 2)
+        context["timestamp"] = "2026-11-15T01:00:00.000Z"
+        finish = line("event_msg", {"type": "task_complete", "turn_id": "t1",
+                                    "last_agent_message": "Done"}, 3)
+        finish["timestamp"] = "2026-11-15T01:03:00.000Z"
+        write(self.path, opening()[:2] + [context, finish])
+        self.capture()
+        tracker = EpisodeTracker()
+        events = [convert_record(r, tracker.step(r)) for r in self.records()]
+        llm = [e for e in events if e and e["type"] in ("span_start", "span_end")]
+        self.assertEqual(len({e["trace_id"] for e in llm}), 1)
+        prompt = next(r for r in self.records() if r["event"] == "user_prompt")
+        self.assertIs(prompt["episode_boundary"], False)
+
     def test_partial_utf8_line_is_retried_and_not_consumed(self):
         write(self.path, opening())
         n, _, _ = importer.parse_rollout(self.path, live=True)

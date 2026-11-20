@@ -2,28 +2,49 @@
 
 [English](README.md) · [中文](README.zh-CN.md)
 
-**面向 AI Agent 的 local-first 可观测与评估平台。** 追踪、调试、评估你的 agent，数据留在本机。
+**用实际记录复核编码 Agent 的工作。**
 
-每一次模型调用、工具执行、子代理和失败都会写入本地 JSONL 流，索引进 SQLite，并有四种读取方式：命令行、实时 TUI 面板、浏览器 Dashboard，以及一套把历史运行变成可重复测试的评估框架。支持 **Hermes**、**Codex CLI**、**Pi**、**任何使用 OpenTelemetry 的应用**以及 **LangChain/LangGraph**。没有代理、没有云端、不需要账号。
+面向在 **Codex CLI、Hermes、Pi** 之间切换的开发者：找到最近的任务，把 Agent
+的结论与实际执行的检查分开，直接打开失败调用，再把有来源的摘要交给下一次会话。
+所有数据保留在本机。
 
-```bash
-bash install.sh all              # 安装适配器 + CLI
-agenttrace serve --daemon        # 索引进程 + API + Dashboard，监听 127.0.0.1:8741
-```
-
-## 快速开始
+## 从一个刚完成的任务开始
 
 ```bash
-bash install.sh hermes [profile|all]   # 也可以是 pi | codex | cli
-hermes chat -q "Reply with exactly: OK"
-
-agenttrace ls                      # 最近的记录
-agenttrace watch                   # 同样的流量，实时面板
-agenttrace tui                     # Textual 监控台（需按下文安装可选依赖）
-agenttrace session <id>            # 一次对话，每一轮的耗时
-agenttrace report                  # 近期运行的效率信号
-agenttrace serve                   # Dashboard
+bash install.sh cli
+agenttrace review --refresh        # 同步 Codex 原生日志、更新索引、查看工作收件箱
+agenttrace review --session ID --agent codex --markdown > handoff.md
 ```
+
+Codex 直接读取现有 rollout 文件，这条流程无需安装采集 hook，也无需服务器、账号、
+API key 或模型调用。Hermes、Pi 通过 `install.sh` 安装对应适配器。
+`--refresh` 导入变化的 Codex 日志并增量索引配置的 trace 来源；不加时读取现有归档快照。
+缺少会话时使用 `agenttrace doctor` 检查采集情况。
+
+复核集中回答三个问题：
+
+1. **任务是什么、Agent 怎么说？** 分开展示任务原文和 Agent 结论，结论明确标为自述。
+2. **究竟检查过什么？** 展示命令、已记录的结果和调用来源。区分检查失败、已记录检查通过、
+   结果未知、执行轮次未结束、未记录检查和没有执行。Lint 通过不会覆盖另一条失败测试，
+   相同命令成功重跑后会更新该项结果。
+3. **接下来该看哪里？** 打开证据，或导出包含任务、结论、检查、文件引用和来源标识的 Markdown 交接摘要。
+
+复核范围是**最新一轮执行**，历史失败不会永久污染当前结果。检查结果只证明记录中的那次调用，
+不代表当前工作树或 commit 正确；缺失、脱敏或截断的数据不会推断为通过。
+缺少完成记录时显示“轮次未结束”，不会据此断言 Agent 进程仍在运行。
+
+```bash
+agenttrace review --contains my-project --agent codex --limit 12
+agenttrace review --session ID --agent codex --json
+agenttrace review --session ID --agent codex --check
+# --check：0 已记录检查通过；1 存在失败检查；2 未知／未结束／没有检查
+agenttrace tui                     # 交互式工作复核（可选依赖见下文）
+agenttrace serve                   # 浏览器工作收件箱与证据详情
+```
+
+Trace CLI、OTel/LangGraph 适配器、指标、数据集和评估继续提供深入排查能力。
+主流程调整为 **任务 → 检查证据 → 定位问题 → 交接**。
+定位评估、取舍和验收标准见 [docs/decisions.md](docs/decisions.md#d32--work-review-is-the-entry-point)。
 
 ## 架构
 
@@ -83,6 +104,7 @@ flowchart TB
 
 | | |
 |---|---|
+| `agenttrace review [--refresh]` | 最近工作、检查证据、定位来源和 Markdown 交接摘要 |
 | `agenttrace ls` / `show` / `search` | 最近记录 · 一次调用的完整内容 · 跨内容 grep |
 | `agenttrace sessions` / `stats` | 按 session 分组 · 按 agent/model 统计调用、token、错误 |
 | `agenttrace session <id>` | 一次对话：每一轮各自的耗时 |
@@ -107,9 +129,13 @@ python3 -m venv .venv
 python3 cli/agenttrace.py tui
 ```
 
+监控台默认先展示任务、Agent 自述、检查状态和下一步建议；会话行显示任务预览和检查标记。
+按 **e** 或点击 Evidence 直接打开检查证据，按 **h** 打开可复制的交接摘要。
+全局归档指标默认收起，按 **m** 展开。执行树和调用详情继续用于深入排查。
+
 当前 Python 没有 Textual 时，CLI 会自动使用仓库中的 `.venv` 启动 `tui`。其他命令和采集适配器仍不需要第三方依赖。
 
-监控台在后台线程索引本地 trace，无需另起 HTTP 服务或 daemon。左侧选会话，中间展开轮次与嵌套调用，右侧通过 Input／Output／Error／JSON／Events／Info 标签页查看详情；只按需读取选中调用的正文。对话预览会展开消息和多行结果，完整结构保留在 JSON 页；只有 event 的轮次也可查看记录的事件。显示时会清除终端控制字符，每个正文预览最多 100,000 字符。
+监控台在后台线程索引本地 trace，无需另起 HTTP 服务或 daemon。左侧选会话，中间展开轮次与嵌套调用，右侧默认显示 Review 复核摘要，通过 Input／Output／Error／JSON／Events／Info 标签页查看调用详情；只按需读取选中调用的正文。对话预览会展开消息和多行结果，完整结构保留在 JSON 页；只有 event 的轮次也可查看记录的事件。显示时会清除终端控制字符，每个正文预览最多 100,000 字符。
 
 启用索引时，监控台也会持续检查 `$CODEX_HOME/sessions`（默认 `~/.codex/sessions`）中的 Codex 原生日志，增量同步新建和继续执行的会话，无需安装 hooks。未变化的文件会跳过，采集和脱敏设置仍然生效。刚创建的会话以 0 轮显示，执行中的调用会等待真实完成记录；`--no-index` 同时关闭来源同步和索引。
 
@@ -127,7 +153,9 @@ agenttrace tui --db /path/to/index.db /path/to/traces
 
 `agenttrace serve --daemon` 会索引所有已知 trace 目录，在 `http://127.0.0.1:8741` 提供服务，启动日志里给出一次性 token。新 trace 通过 SSE 实时推送。
 
-**Overview**（错误、token、延迟）· **Traces**（搜索与筛选）· **Trace detail**（执行树 + waterfall、span 的输入/输出/错误、工作区、原始 JSON）· **Sessions → Session detail**（每一轮的耗时、占 agent 时间的比例、空档在哪里）· **Datasets / Experiments** · **Adapters**（声明能力 vs 实际观测、采集健康度、缺口）。
+**Work review** 是默认入口：按项目／会话搜索、按 agent 筛选、翻页查看最近任务和检查证据；打开会话可下载交接摘要。
+
+**Archive metrics**（错误、token、延迟）· **Traces**（搜索与筛选）· **Trace detail**（执行树 + waterfall、span 的输入/输出/错误、工作区、原始 JSON）· **Sessions → Session detail**（每一轮的耗时、占 agent 时间的比例、空档在哪里）· **Datasets / Experiments** · **Adapters**（声明能力 vs 实际观测、采集健康度、缺口）。
 
 一个 trace 是**一轮** —— 这就是「一次任务执行」的含义 —— 所以"每次对话耗时"在 session 页面上。
 

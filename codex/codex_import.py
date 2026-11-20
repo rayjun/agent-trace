@@ -152,6 +152,19 @@ def parse_rollout(path: Path, since_line: int = 0, *,
     turn_request: dict[str, str] = {}     # turn key -> request_id
     turn_emitted: set[str] = set()
     closed_turns: set[str] = set()
+    user_prompts: set[tuple[str | None, str]] = set()
+
+    def user_prompt(content: str, *, boundary: bool = True) -> None:
+        # Some versions mirror the message in event_msg and response_item.
+        key = (turn_id, content)
+        if key in user_prompts:
+            return
+        user_prompts.add(key)
+        records.append({"event": "user_prompt", "session_id": meta["session_id"],
+                        "turn_id": turn_id, "cwd": meta["cwd"],
+                        **({"episode_boundary": False} if not boundary else {}),
+                        "request": {"messages": [{"role": "user", "content": _truncate(content)}]},
+                        "source_file": str(path)})
 
     def note_turn_ts(key: str | None, ts: str | None) -> None:
         if key and ts:
@@ -338,15 +351,7 @@ def parse_rollout(path: Path, since_line: int = 0, *,
                         turn_key = open_turn(turn_id, meta["model"], meta["cwd"],
                                              None)
                     note_turn_ts(turn_key, pending_ts)
-                    records.append({
-                        "event": "user_prompt",
-                        "session_id": meta["session_id"],
-                        "turn_id": turn_id,
-                        "cwd": meta["cwd"],
-                        "request": {"messages": [{"role": "user",
-                                                  "content": _truncate(payload.get("message"))}]},
-                        "source_file": str(path),
-                    })
+                    user_prompt(_content_to_text(payload.get("message")))
                 elif ptype == "token_count":
                     u = _token_info(payload)
                     if u:
@@ -390,6 +395,14 @@ def parse_rollout(path: Path, since_line: int = 0, *,
                         if not meta["system_prompt"]:
                             meta["system_prompt"] = _content_to_text(payload.get("content"))
                         continue
+                    if role == "user":
+                        content = _content_to_text(payload.get("content"))
+                        # Host context updates are not tasks. Persist ordinary
+                        # user text without inventing a second turn boundary:
+                        # task_started/turn_context already established it.
+                        if not content.lstrip().startswith(("<environment_context>", "<codex_internal_context")):
+                            user_prompt(content, boundary=False)
+                        continue
                     if role == "assistant":
                         records.append({
                             "event": "assistant_message",
@@ -400,7 +413,7 @@ def parse_rollout(path: Path, since_line: int = 0, *,
                                          "role": role},
                             "source_file": str(path),
                         })
-                elif ptype == "function_call":
+                elif ptype in ("function_call", "custom_tool_call"):
                     name = payload.get("name") or "?"
                     cid = payload.get("call_id") or payload.get("id") or ""
                     if cid:
@@ -411,10 +424,11 @@ def parse_rollout(path: Path, since_line: int = 0, *,
                         "turn_id": turn_id,
                         "model": meta["model"],
                         "tool": {"name": name, "call_id": cid,
-                                 "args": _truncate(payload.get("arguments"))},
+                                 "args": _truncate(payload.get("input") if ptype == "custom_tool_call"
+                                                   else payload.get("arguments"))},
                         "source_file": str(path),
                     })
-                elif ptype == "function_call_output":
+                elif ptype in ("function_call_output", "custom_tool_call_output"):
                     cid = payload.get("call_id") or ""
                     records.append({
                         "event": "tool_result",

@@ -36,6 +36,7 @@ function load(hash) {
   // Minimal valid payloads per endpoint: a renderer that throws on an EMPTY
   // dataset would fail here too, which is the fresh-install case.
   const shapes = [
+    [/\/api\/review/, { reviews: [], total: 0 }],
     [/\/api\/overview/, { traces: 0, spans: 0, errors: 0, sessions: 0,
                             tokens: {}, task_duration_ms: {}, per_agent: [] }],
     [/\/api\/traces\?/, { traces: [], total: 0 }],

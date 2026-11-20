@@ -31,7 +31,6 @@ from pathlib import Path
 from typing import Any
 
 from adapter_sdk.capabilities import AdapterCapabilities
-from adapter_sdk.interfaces import AdapterKind
 
 #: A manifest larger than this is not a manifest; refusing to read it keeps a
 #: hostile or corrupt file from being slurped into memory on every CLI run.

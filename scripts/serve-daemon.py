@@ -74,7 +74,7 @@ def main(argv: list[str]) -> int:
     # Import AFTER detaching: a failure here lands in the log file, not in a
     # terminal that is already gone.
     from core.storage.discovery import default_trace_dirs
-    from server.main import load_or_create_token, platform_dir as _pd, serve
+    from server.main import serve
 
     dirs = [d.expanduser().resolve() for d in args.dirs] or default_trace_dirs()
     db = args.db or platform_dir() / "agenttrace.db"

@@ -171,6 +171,51 @@ async def running(size=(176, 40), **kwargs):
 
 
 class DashboardTests(unittest.IsolatedAsyncioTestCase):
+    async def test_work_review_is_primary_and_opens_evidence_and_portable_handoff(self):
+        backend = FakeBackend()
+        original = backend.session
+        def session(key, offset=0):
+            data = original(key, offset)
+            data["review"] = dict(adapter_id=key[0], session_id=key[1], cwd="/work/project",
+                trace_id="shared", task="Fix the failing task 中文", conclusion="Agent says done",
+                state="failed", label="Checks failed", scope="Latest turn only; not current worktree approval",
+                next_action="Open the failed output and rerun the check.", limited=False, files=[], failures=[],
+                checks=[dict(command="pytest -q", state="failed", span_id="call", trace_id="shared",
+                             output_excerpt="1 failed")])
+            return data
+        backend.session = session
+        app = TraceApp(backend, interval=3600)
+        async with app.run_test(size=(176, 40)) as pilot:
+            await settled(app, pilot)
+            self.assertFalse(app.query_one("#metrics").display)
+            self.assertEqual(app.query_one("#details", TabbedContent).active, "tab-review")
+            self.assertIn("pytest -q", app.query_one("#field-review", TextArea).text)
+            await pilot.resize_terminal(80, 30)
+            await pilot.pause(.1)
+            app.action_panel("detail")
+            await pilot.press("escape")
+            self.assertEqual(app._active_panel, "sessions")
+            await pilot.resize_terminal(176, 40)
+            await pilot.pause(.1)
+            self.assertIn("Checks failed", str(app.query_one("#review-state").render()))
+            self.assertIn("Fix the failing task 中文", str(app.query_one("#review-task").render()))
+            await pilot.click("#review-evidence")
+            await settled(app, pilot)
+            self.assertEqual(app.span_ref, NodeRef("shared", "call"))
+            await pilot.click("#handoff")
+            await pilot.pause(.1)
+            text = app.screen.query_one("#handoff-text", TextArea).text
+            self.assertIn("unverified self-report", text)
+            self.assertIn("pytest -q", text)
+            self.assertIn("a / same", text)
+            app.action_refresh()
+            await settled(app, pilot)
+            await pilot.press("escape")
+            await pilot.pause(.1)
+            self.assertIs(app.screen, app.screen_stack[0])
+            app.action_metrics()
+            self.assertTrue(app.query_one("#metrics").display)
+
     async def test_mouse_selects_sessions_calls_and_detail_tabs(self):
         async with running() as (app, pilot, backend):
             await pilot.click("#sessions", offset=(3, 3))
@@ -578,6 +623,19 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RenderingTests(unittest.TestCase):
+    def test_long_project_and_task_fit_the_two_line_session_row(self):
+        from rich.console import Console
+        console = Console(width=25, record=True, file=open(os.devnull, "w"))
+        try:
+            console.print(TraceApp._session_label(dict(adapter_id="codex", session_id="long-session-id",
+                cwd="/work/an-extremely-long-project-name", task="Fix 缓存 invalidation and add tests", review_state="failed")))
+            lines = console.export_text().splitlines()
+            self.assertEqual(len(lines), 2)
+            self.assertIn("codex", lines[0])
+            self.assertIn("Fix 缓存", lines[1])
+        finally:
+            console.file.close()
+
     def test_messages_and_provider_results_render_as_readable_text(self):
         request = {"messages": [{"role": "user", "content": "第一行\n第二行"}]}
         self.assertEqual(readable_body(request, "input"), "USER\n第一行\n第二行")

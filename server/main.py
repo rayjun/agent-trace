@@ -256,6 +256,14 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- routing ------------------------------------------------------------
 
+    def finish(self) -> None:
+        try:
+            super().finish()
+        finally:
+            # Request threads own their SQLite connections. Closing the store
+            # in the server's main thread cannot release these WAL readers.
+            self.state.store.close()
+
     def do_GET(self) -> None:  # noqa: N802 (stdlib naming)
         try:
             self._do_get()
@@ -457,6 +465,19 @@ class Handler(BaseHTTPRequestHandler):
             })
         elif path == "/api/overview":
             self._send_json(overview(store))
+        elif path == "/api/review":
+            from core.review import inbox, markdown, session_review
+            session = _one(qs, "session")
+            if session is not None:
+                review = session_review(store, session, agent=_one(qs, "agent"))
+                if review is not None:
+                    review["handoff_markdown"] = markdown(review)
+                self._send_json(review if review is not None else {"error": "session not found"},
+                                200 if review is not None else 404)
+            else:
+                self._send_json(inbox(store, agent=_one(qs, "agent"), search=_one(qs, "search") or "",
+                                      model=_one(qs, "model"), since=_one(qs, "since"),
+                                      limit=_int(qs, "limit", 12), offset=_int(qs, "offset", 0)))
         elif path == "/api/traces":
             self._send_json(list_traces(
                 store,

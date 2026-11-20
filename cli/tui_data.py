@@ -94,10 +94,16 @@ class LocalBackend:
     def dashboard(self, search: str = "", agent: str | None = None,
                   offset: int = 0) -> dict[str, Any]:
         def read(store: TraceStore) -> dict[str, Any]:
+            from core.review import session_review
+            sessions = query.list_sessions(store, search=search, agent=agent, offset=offset, limit=PAGE_SIZE)
+            for row in sessions["sessions"]:
+                review = session_review(store, row["session_id"], agent=row["adapter_id"])
+                if review:
+                    row["task"] = review["task"]
+                    row["review_state"] = review["state"]
             return {
                 "overview": query.overview(store),
-                "sessions": query.list_sessions(store, search=search, agent=agent,
-                                                 offset=offset, limit=PAGE_SIZE),
+                "sessions": sessions,
                 "recent": query.list_traces(store, limit=24)["traces"],
                 "usage_known": bool(store.one(
                     "SELECT 1 FROM spans WHERE input_tokens IS NOT NULL"
@@ -130,8 +136,10 @@ class LocalBackend:
 
     def session(self, key: SessionKey, offset: int = 0) -> dict[str, Any]:
         def read(store: TraceStore) -> dict[str, Any]:
+            from core.review import session_review
             agent, session = key
-            return {"turns": query.list_traces(store, agent=agent, session=session,
+            return {"review": session_review(store, session, agent=agent),
+                    "turns": query.list_traces(store, agent=agent, session=session,
                                                offset=offset, limit=PAGE_SIZE)}
         return self._read(read)
 

@@ -10,12 +10,18 @@
 <header id="topbar">
   <span class="brand">⌁ agent-trace</span>
   <nav>
-    <a href="#/overview" data-route="overview">Overview</a>
-    <a href="#/traces" data-route="traces">Traces</a>
+    <a href="#/review" data-route="review">Work review</a>
     <a href="#/sessions" data-route="sessions">Sessions</a>
-    <a href="#/datasets" data-route="datasets">Datasets</a>
-    <a href="#/experiments" data-route="experiments">Experiments</a>
-    <a href="#/adapters" data-route="adapters">Adapters</a>
+    <a href="#/traces" data-route="traces">Traces</a>
+    <details id="advanced-nav">
+      <summary>Advanced</summary>
+      <div>
+        <a href="#/overview" data-route="overview">Archive metrics</a>
+        <a href="#/datasets" data-route="datasets">Datasets</a>
+        <a href="#/experiments" data-route="experiments">Experiments</a>
+        <a href="#/adapters" data-route="adapters">Capture health</a>
+      </div>
+    </details>
   </nav>
   <span id="live" class="live off" title="live updates">●</span>
 </header>

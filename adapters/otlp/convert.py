@@ -543,12 +543,12 @@ def import_payload(payload: dict[str, Any],
         # container spans exist only to carry discrete events (see export)
         container = bool(attrs.get(f"{ATTR_PREFIX}container"))
 
-        def _eid(etype: str, ts: str | None) -> str:
+        def _eid(etype: str, ts: str | None, adapter: str = resolved_adapter,
+                 trace_id: str = ids["trace_id"], span_id: str = ids["span_id"]) -> str:
             # Canonical span identity, so importing an export of a trace we
             # already hold DEDUPS instead of duplicating it. The producer's
             # own id wins when it survives (it is exact by construction).
-            return span_event_id(resolved_adapter, ids["trace_id"],
-                                 ids["span_id"], etype)
+            return span_event_id(adapter, trace_id, span_id, etype)
 
         # A synthetic span is DERIVED data (the materializer invented the task
         # root to give a v1 turn a parent), not an observation. Importing it as

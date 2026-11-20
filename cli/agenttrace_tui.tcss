@@ -85,3 +85,17 @@ Screen.narrow #agent { width: 20; }
 Screen.narrow #pause { width: 11; }
 Screen.narrow .metric-caption { display: none; }
 Screen.narrow #metrics, Screen.narrow .metric { height: 2; }
+
+#work-summary { height: 5; margin: 0 1 1 1; padding: 0 1; border-left: solid #7dd3fc; background: #181e2d; }
+#review-actions { height: 1; }
+#review-state { width: 1fr; height: 1; text-style: bold; }
+#review-actions Button { height: 1; width: 15; min-width: 10; margin-left: 1; }
+#review-task, #review-conclusion, #review-next { height: 1; text-overflow: ellipsis; }
+#review-next { color: #94a3bd; }
+HandoffScreen { align: center middle; background: #080c14 75%; }
+#handoff-dialog { width: 90%; height: 90%; border: round #7dd3fc; background: #151b28; padding: 1 2; }
+#handoff-title { height: 2; color: #7dd3fc; text-style: bold; }
+#handoff-text { height: 1fr; }
+#handoff-actions { height: 3; align-horizontal: right; }
+#handoff-actions Button { width: 16; margin-left: 1; }
+Screen.narrow #work-summary { height: 5; }

@@ -253,3 +253,44 @@ there is nothing to recover there.
 | `~/.agenttrace/ingest-faults.jsonl` | events the capture path could not write (throttled, 256 KiB cap) |
 | `~/.agenttrace/server.{pid,log,token}` | dashboard process, log, API token |
 | `~/.agenttrace/coverage.json` | the earliest install line observed per adapter |
+
+## Work review and handoff
+
+```bash
+agenttrace review --refresh
+agenttrace review --contains project-name --agent codex --limit 12
+agenttrace review --session SESSION_ID --agent codex --markdown > handoff.md
+agenttrace review --session SESSION_ID --agent codex --json
+agenttrace review --session SESSION_ID --agent codex --check
+```
+
+`review` reads the index; `--refresh` first synchronizes native Codex sources and
+indexes trace directories. It stands aside during an explicit index rebuild.
+Refresh/capture failures return 2 instead of claiming the snapshot is current.
+With no existing archive, supplied trace directories are indexed once. `--db`
+selects an archive; trailing directories select sources for initial indexing or
+explicit refresh, not a retrospective filter on an existing archive.
+
+`--contains` searches indexed cwd/model/adapter/session metadata, not full
+prompts. `--agent` accepts adapter IDs including third-party adapters; `--model`
+is exact and `--since` uses the session last-activity timestamp. A direct
+`--session` selector is exact and needs `--agent` when IDs are ambiguous.
+
+`--check` requires a session and exits 0 only for recognized passing recorded
+checks; 1 for a failed check; 2 for missing/unknown/truncated/open evidence,
+missing sessions or refresh errors. It reviews the latest captured turn and
+cannot establish that current working-tree changes were covered by those checks.
+A successful lint does not erase a failed test. A successful exact-command rerun
+does replace that command's earlier result. Checks with `||` or collect-only
+flags are not accepted as proof of a passing run.
+
+The TUI's **e** opens evidence, **h** opens a handoff with a copy button, and
+**m** expands archive metrics. The browser opens Work review by default, with
+filter/paging controls and Download handoff on a session review. These use the
+same core review semantics as the CLI.
+
+Authenticated APIs: `GET /api/review?limit=12&offset=0&agent=codex&search=project`
+and `GET /api/review?session=SESSION_ID&agent=codex`. The latter includes
+`handoff_markdown`; ambiguous session IDs return 409, missing IDs return 404.
+Capture privacy settings remain authoritative: metadata-only/redacted content
+cannot be recovered by a review or handoff export.

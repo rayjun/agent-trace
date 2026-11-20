@@ -76,7 +76,7 @@ def _opens_episode(rec: dict[str, Any]) -> bool:
     # Codex's session_meta is transcript context, not an observed human-turn
     # boundary. It can be captured/backfilled while a turn is already running.
     # Let its real prompts/turn IDs choose identities, just as in offline import.
-    return rec.get("event") in EPISODE_EVENTS and not (
+    return rec.get("episode_boundary") is not False and rec.get("event") in EPISODE_EVENTS and not (
         rec.get("agent") == "codex" and rec.get("event") == "session_start")
 
 

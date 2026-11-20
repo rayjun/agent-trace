@@ -74,6 +74,7 @@ function kindDot(kind) { return `<span class="kind-dot kind-${esc(kind)}"></span
 /* ------------------------------------------------------------------ */
 
 const routes = {
+  review: renderWorkReview,
   overview: renderOverview,
   traces: renderTraces,
   trace: renderTraceDetail,
@@ -87,9 +88,10 @@ const routes = {
 };
 
 let currentRender = null; // re-invoked on SSE change events
+let reviewRevision = 0;
 
 function router() {
-  const hash = location.hash || "#/overview";
+  const hash = location.hash || "#/review";
   // The route is the part BEFORE the query. Splitting the whole hash on "/" made
   // `#/traces?agent=pi` a route name nobody has a renderer for, so the filter
   // silently fell through to the Overview page. A renderer that needs the query
@@ -255,7 +257,11 @@ function buildRows(spans) {
 }
 
 async function renderTraceDetail(traceId, selectedSpan) {
-  const t = await api(`traces/${encodeURIComponent(traceId)}`);
+  const params = new URLSearchParams(location.hash.split("?")[1] || "");
+  const namespace = new URLSearchParams();
+  for (const key of ["agent", "session"]) if (params.has(key)) namespace.set(key, params.get(key));
+  const t = await api(`traces/${encodeURIComponent(traceId)}?${namespace}`);
+  selectedSpan = selectedSpan || params.get("span");
   const rows = buildRows(t.spans);
   const t0 = t.start, t1 = t.end;
   const total = Math.max(1, (Date.parse(t1) || 0) - (Date.parse(t0) || 0));
@@ -755,4 +761,81 @@ if (!TOKEN) {
 } else {
   router();
   connectSse();
+}
+
+/* Work review: task -> recorded checks -> source evidence -> portable handoff. */
+function reviewHref(review, trace = false, span = null) {
+  const q = new URLSearchParams({agent: review.adapter_id, session: review.session_id});
+  if (span) q.set("span", span);
+  return trace ? `#/trace/${encodeURIComponent(review.trace_id)}?${q}` : `#/review?${q}`;
+}
+function reviewCard(review, detail = false) {
+  const statusClass = {failed: "error", passed: "ok", open: "incomplete"}[review.state] || "unknown";
+  const checks = review.checks || [];
+  const excerpt = (text, limit) => detail || text.length <= limit ? text : text.slice(0, limit) + "…";
+  return `<article class="panel work-card">
+    <div class="work-meta"><span class="badge ${statusClass}">${esc(review.label)}</span>
+      <span>${esc(review.adapter_id)}</span><span class="dim">${esc(review.cwd || "Project not captured")}</span>
+      <span class="dim">${esc(fmtTs(review.updated_at))}</span></div>
+    <h1><a href="${esc(reviewHref(review))}">${esc(excerpt(review.task || "Task text not captured", 180))}</a></h1>
+    <div class="work-conclusion"><span class="dim">Agent says · unverified self-report</span>
+      <p>${esc(excerpt(review.conclusion || "No conclusion captured.", 400))}</p></div>
+    <p class="work-next">${esc(review.next_action)}</p>
+    ${checks.length ? `<div class="work-checks">${checks.map(c => `<div class="work-check">
+      <span class="badge ${c.state === "failed" ? "error" : c.state === "passed" ? "ok" : "unknown"}">${esc(c.state)}</span>
+      <a class="mono" href="${esc(reviewHref(review, true, c.span_id))}">${esc(c.command)}</a>
+      ${detail ? `<pre class="body">${esc(c.output_excerpt || "No output captured.")}</pre><small class="dim">span ${esc(c.span_id)}</small>` : ""}
+    </div>`).join("")}</div>` : '<p class="dim">No recognized check invocation recorded in this turn.</p>'}
+    ${(review.failures || []).length ? `<details class="work-failures"><summary>${review.failures.length} recorded tool failures · may have recovered</summary>
+      ${review.failures.map(f => `<p><a href="${esc(reviewHref(review, true, f.span_id))}">${esc(f.name)}</a> · ${esc(f.message)}</p>`).join("")}</details>` : ""}
+    ${review.limited ? '<p class="note">Review was bounded. Omitted calls or bodies can prevent a verdict.</p>' : ""}
+    <p class="note">${esc(review.scope)}</p>
+    <div class="work-links"><a href="${esc(reviewHref(review))}">Review & handoff</a>
+      ${review.trace_id ? `<a href="${esc(reviewHref(review, true))}">Inspect execution</a>` : ""}
+      <span class="mono dim">${esc(review.session_id)}</span></div>
+  </article>`;
+}
+async function renderWorkReview() {
+  const revision = ++reviewRevision, hash = location.hash;
+  // Preserve an in-progress filter edit during live updates.
+  if (document.activeElement?.closest?.("#review-filters")) return;
+  const q = new URLSearchParams(hash.split("?")[1] || "");
+  const data = await api(`review?${q}`);
+  if (revision !== reviewRevision || location.hash !== hash) return;
+  const single = q.has("session");
+  const reviews = single ? [data] : (data.reviews || []);
+  app.innerHTML = `<section class="work-heading"><div><h1>Review agent work</h1>
+    <p class="dim">What happened, what was checked, and where to look next.</p></div>
+    ${single ? '<a href="#/review">← All work</a><button id="download-handoff">Download handoff</button>' : ""}</section>
+    ${single ? "" : `<form id="review-filters" class="filters">
+      <input id="review-search" aria-label="Search project or session" placeholder="Project, model or session" value="${esc(q.get("search") || "")}">
+      <input id="review-agent" aria-label="Agent" placeholder="All agents" value="${esc(q.get("agent") || "")}">
+      <button type="submit">Filter</button><a href="#/review">Show all</a></form>
+      <p class="dim">${reviews.length} of ${data.total || 0} sessions · newest activity first · latest turn per session</p>`}
+    ${reviews.map(r => reviewCard(r, single)).join("") || `<div class="panel"><h1>No work captured yet</h1>
+      <p>Run an agent task, then <code>agenttrace index</code>. If a session is missing, run <code>agenttrace doctor</code> to check capture.</p>
+      <a href="#/adapters">Inspect capture health</a></div>`}
+    ${!single ? `<div class="work-pages">${Number(data.offset) > 0 ? '<button id="review-prev">← Newer</button>' : ""}
+      ${data.has_more ? '<button id="review-next">Older →</button>' : ""}</div>` : ""}`;
+  document.getElementById("review-filters")?.addEventListener("submit", event => {
+    event.preventDefault();
+    const filters = new URLSearchParams();
+    for (const [id, key] of [["review-search", "search"], ["review-agent", "agent"]]) {
+      const value = document.getElementById(id).value.trim();
+      if (value) filters.set(key, value);
+    }
+    location.hash = `#/review?${filters}`;
+  });
+  for (const [id, delta] of [["review-prev", -12], ["review-next", 12]]) {
+    document.getElementById(id)?.addEventListener("click", () => {
+      q.set("offset", Math.max(0, (Number(data.offset) || 0) + delta));
+      location.hash = `#/review?${q}`;
+    });
+  }
+  document.getElementById("download-handoff")?.addEventListener("click", () => {
+    const blob = new Blob([data.handoff_markdown || ""], {type: "text/markdown;charset=utf-8"});
+    const url = URL.createObjectURL(blob), anchor = document.createElement("a");
+    anchor.href = url; anchor.download = "agent-work-review.md"; anchor.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  });
 }

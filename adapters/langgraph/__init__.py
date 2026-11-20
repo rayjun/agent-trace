@@ -33,9 +33,10 @@ import uuid
 from typing import Any
 
 from adapter_sdk.capabilities import AdapterCapabilities, Capability, SupportLevel
-from adapter_sdk.event_sink import JsonlEventSink
+from adapter_sdk.event_sink import JsonlEventSink as JsonlEventSink
 from adapter_sdk.interfaces import AdapterHealth, AdapterKind, BaseAdapter, EventSink
-from core.schema.model import TERMINAL_STATUSES, derive_event_id, now_iso
+from core.schema.model import TERMINAL_STATUSES as TERMINAL_STATUSES
+from core.schema.model import derive_event_id, now_iso
 
 __all__ = ["LangGraphAdapter", "CallbackTraceHandler"]
 

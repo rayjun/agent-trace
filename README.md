@@ -2,34 +2,56 @@
 
 [English](README.md) · [中文](README.zh-CN.md)
 
-**Local-first observability & evaluation for AI agents.** Trace, debug and
-evaluate your agents — and keep the data on your machine.
+**Review coding-agent work with recorded evidence.**
 
-Every model call, tool execution, subagent and failure lands in a local JSONL
-stream, gets indexed into SQLite, and can be read four ways: a CLI, a live TUI
-panel, a browser dashboard, and an evaluation harness that turns past runs into
-repeatable tests. Works with **Hermes**, **Codex CLI**, **Pi**, **anything that
-speaks OpenTelemetry**, and **LangChain/LangGraph**. No proxy, no cloud, no
-account.
+For developers moving between **Codex CLI, Hermes and Pi**, agent-trace is a
+local work-review desk: find the recent task, separate the agent's conclusion
+from the checks it actually ran, open the failing call, and carry a sourced
+handoff into the next session. Data stays on your machine.
 
-```bash
-bash install.sh all              # adapters + CLI
-agenttrace serve --daemon        # indexer + API + dashboard on 127.0.0.1:8741
-```
-
-## Quick start
+## Start with one completed task
 
 ```bash
-bash install.sh hermes [profile|all]   # or: pi | codex | cli
-hermes chat -q "Reply with exactly: OK"
-
-agenttrace ls                      # recent records
-agenttrace watch                   # the same traffic, live
-agenttrace tui                     # Textual console (optional setup below)
-agenttrace session <id>            # one conversation, every turn timed
-agenttrace report                  # efficiency signals across recent runs
-agenttrace serve                   # the dashboard
+bash install.sh cli
+agenttrace review --refresh        # sync native Codex logs + index + work inbox
+agenttrace review --session ID --agent codex --markdown > handoff.md
 ```
+
+Codex uses existing native rollout files, so this workflow needs no capture hook,
+server, account, API key or model call. Install `hermes` or `pi` through
+`install.sh` to capture those agents. Refresh imports changed Codex files and
+indexes configured trace sources. An existing archive is otherwise read as a
+snapshot; `agenttrace doctor` explains capture gaps.
+
+The review answers three questions:
+
+1. **What was the task and what did the agent say?** The recorded prompt and
+   conclusion are shown separately; the latter is a self-report.
+2. **What was checked?** Commands, captured results and source span IDs. States
+   distinguish failed checks, passed recorded checks, unknown results, open
+   turns, no checks and no execution. A successful lint does not clear a failed
+   test; a successful rerun of the same command replaces its earlier result.
+3. **What should I inspect next?** Open the evidence or export a Markdown brief
+   with task, conclusion, checks, recorded file references and source identities.
+
+Reviews cover the **latest recorded turn**, not all historical errors. Checks
+are evidence about an invocation, not proof that the current working tree or
+commit is correct. Missing/redacted/truncated data never becomes a pass. A turn
+without completion is called **open**, not assumed to be a live agent.
+
+```bash
+agenttrace review --contains my-project --agent codex --limit 12
+agenttrace review --session ID --agent codex --json
+agenttrace review --session ID --agent codex --check
+# --check: 0 = recorded checks passed; 1 = a check failed; 2 = unknown/open/no checks
+agenttrace tui                     # interactive work review (optional setup below)
+agenttrace serve                   # browser work inbox and evidence inspection
+```
+
+The existing trace CLI, OTel/LangGraph adapters, metrics, datasets and evaluation
+remain available for deeper investigation. The product's primary workflow is
+**task → check evidence → inspect → handoff**. Positioning and tradeoffs are
+recorded in [docs/decisions.md](docs/decisions.md#d32--work-review-is-the-entry-point).
 
 ## Architecture
 
@@ -93,6 +115,7 @@ is in [docs/decisions.md](docs/decisions.md).
 
 | | |
 |---|---|
+| `agenttrace review [--refresh]` | recent work, recorded checks, source evidence and Markdown handoffs |
 | `agenttrace ls` / `show` / `search` | recent records · one call in full · grep across content |
 | `agenttrace sessions` / `stats` | group by session · calls, tokens, errors per agent/model |
 | `agenttrace session <id>` | a conversation: every turn with its own duration |
@@ -121,8 +144,15 @@ python3 cli/agenttrace.py tui
 The CLI automatically uses this `.venv` for `tui` when the current Python lacks
 Textual. Other commands and capture adapters remain dependency-free.
 
-The console indexes local trace directories in a background thread, with no HTTP
-server or extra daemon. Browse sessions on the left, expand turns and nested
+The console opens with a work-review summary: task, agent conclusion, recorded
+check state and a suggested next inspection. Session rows show task previews and
+check markers. The Review tab is the default reading view; raw calls remain
+one action away. Press **e** (or click Evidence) to open the failed check, and
+**h** for a portable handoff with a copy action. **m** expands archive metrics;
+they are hidden initially so the task stays in view.
+
+It indexes local trace directories in a background thread, with no HTTP server
+or extra daemon. Browse sessions on the left, expand turns and nested
 calls in the middle, and inspect Input / Output / Error / JSON / Events / Info on the right.
 Conversation previews unwrap captured messages and multiline results; the JSON
 tab retains their complete structure. Event-only turns expose their recorded events.
@@ -162,7 +192,11 @@ open of an old archive may take longer while projections migrate in the backgrou
 `http://127.0.0.1:8741` with a one-time token in the startup line. Updates
 arrive live over SSE.
 
-**Overview** (errors, tokens, latency) · **Traces** (search and filter) ·
+**Work review** is the default: a filterable, paginated inbox of tasks, agent
+conclusions and recorded checks. Open a review for output excerpts and a
+Download handoff action; check links preserve adapter, session, trace and span.
+
+**Archive metrics** (errors, tokens, latency) · **Traces** (search and filter) ·
 **Trace detail** (execution tree + waterfall, span input/output/errors, the
 workspace, raw JSON) · **Sessions → Session detail** (each turn's duration, its
 share of agent time, and where the gaps were) · **Datasets / Experiments** ·
@@ -339,7 +373,7 @@ Five ship: **hermes**, **codex**, **pi**, **otlp**, **langgraph**. Capabilities
 are declared at four levels — `supported`, `partial`, `unsupported`, `unknown` —
 so a gap reads as "this adapter did not provide this field" rather than as an
 empty string. Codex, for instance, declares `streaming: unsupported` because its
-rollout file is written after completion.
+persisted transcript records do not expose provider token-stream telemetry.
 
 Third-party adapters are found via a manifest or an entry point **without being
 imported**; code runs only when you explicitly ask. See

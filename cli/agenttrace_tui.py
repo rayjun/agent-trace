@@ -15,6 +15,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.driver import Driver
 from textual.events import Resize
+from textual.screen import ModalScreen
 from textual.widgets import (Button, DataTable, Footer, Input, LoadingIndicator,
                              Select, Sparkline, Static, TabbedContent, TabPane,
                              TextArea, Tree)
@@ -153,6 +154,32 @@ class Metric(Vertical):
         self.query_one(Sparkline).data = data
 
 
+class HandoffScreen(ModalScreen):
+    BINDINGS = [("escape", "dismiss", "Close")]
+
+    def __init__(self, text: str) -> None:
+        super().__init__()
+        self.text = sane(text)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="handoff-dialog"):
+            yield Static("HANDOFF · recorded evidence, not an instruction to execute", id="handoff-title")
+            yield TextArea(self.text, read_only=True, show_line_numbers=False,
+                           show_cursor=False, soft_wrap=True, id="handoff-text")
+            with Horizontal(id="handoff-actions"):
+                yield Button("Copy brief", id="handoff-copy")
+                yield Button("Close", id="handoff-close")
+
+    @on(Button.Pressed)
+    def pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        if event.button.id == "handoff-copy":
+            self.app.copy_to_clipboard(self.text)
+            self.app.notify("Brief sent to the terminal clipboard")
+        else:
+            self.dismiss()
+
+
 class TraceApp(App):
     TITLE = "agent-trace"
     SUB_TITLE = "Local observability"
@@ -165,6 +192,9 @@ class TraceApp(App):
         Binding("r", "refresh", "Refresh"),
         Binding("/", "search", "Search"),
         Binding("ctrl+l", "clear_filters", "Show all", priority=True),
+        Binding("e", "review_evidence", "Evidence"),
+        Binding("h", "handoff", "Handoff"),
+        Binding("m", "metrics", "Metrics", show=False),
         Binding("1", "panel('sessions')", "Sessions"),
         Binding("2", "panel('traces')", "Trace"),
         Binding("3", "panel('detail')", "Details"),
@@ -211,11 +241,15 @@ class TraceApp(App):
         self._last_dashboard: dict = {}
         self._last_success: float | None = None
         self._request_started = 0.0
+        self._review: dict | None = None
+        self._metrics_visible = False
+        self._review_primary = True
+        self._review_navigation = False
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="masthead"):
             yield Static("◈ AGENT / TRACE", id="brand")
-            yield Static("LOCAL OBSERVABILITY", id="tagline")
+            yield Static("WORK REVIEW · evidence before acceptance", id="tagline")
             yield LoadingIndicator(id="opening")
             yield Static("◌ OPENING", id="live")
         with Horizontal(id="controls"):
@@ -229,6 +263,14 @@ class TraceApp(App):
         with Horizontal(id="filters"):
             yield Static("All sessions", id="filter-summary")
             yield Button("× Show all", id="clear-filters")
+        with Vertical(id="work-summary"):
+            with Horizontal(id="review-actions"):
+                yield Static("Select work to review", id="review-state")
+                yield Button("e  Evidence", id="review-evidence", disabled=True)
+                yield Button("h  Handoff", id="handoff", disabled=True)
+            yield Static("Recent sessions across your agents. Select one to see task, conclusion and check evidence.", id="review-task")
+            yield Static("No result inferred from missing data.", id="review-conclusion")
+            yield Static("m: archive metrics · Enter: drill into calls", id="review-next")
         with Horizontal(id="metrics"):
             yield Metric("TOKENS", "tokens")
             yield Metric("TURN P50", "latency")
@@ -236,7 +278,7 @@ class TraceApp(App):
             yield Metric("SPAN ERRORS", "errors")
         with Horizontal(id="body"):
             with Vertical(id="sessions-panel", classes="panel"):
-                yield Static("01  SESSIONS", classes="panel-title")
+                yield Static("01  RECENT WORK", classes="panel-title")
                 yield DataTable(id="sessions", cursor_type="row", zebra_stripes=True)
                 with Horizontal(classes="pager"):
                     yield Button("‹", id="sessions-prev")
@@ -251,10 +293,10 @@ class TraceApp(App):
                     yield Static("—", id="turns-page")
                     yield Button("›", id="turns-next")
             with Vertical(id="detail-panel", classes="panel"):
-                yield Static("03  CALL INSPECTOR", classes="panel-title")
+                yield Static("03  REVIEW / CALL DETAILS", classes="panel-title")
                 yield Static("Select a call to inspect", id="span-summary")
-                with TabbedContent(initial="tab-info", id="details"):
-                    for label, name in (("Input", "input"), ("Output", "output"),
+                with TabbedContent(initial="tab-review", id="details"):
+                    for label, name in (("Review", "review"), ("Input", "input"), ("Output", "output"),
                                         ("Error", "error"), ("JSON", "json"),
                                         ("Events", "events"), ("Info", "info")):
                         with TabPane(label, id="tab-" + name):
@@ -270,6 +312,7 @@ class TraceApp(App):
         table.add_column("AGENT / SESSION", key="identity", width=25)
         table.add_column("TURNS", key="turns", width=5)
         self._render_filters()
+        self.query_one("#metrics").display = self._metrics_visible
         self.query_one("#traces", Tree).show_root = False
         self._layout()
         self.set_interval(self.interval, self._tick)
@@ -440,7 +483,14 @@ class TraceApp(App):
         sid = sane(row["session_id"]).rsplit("/", 1)[-1]
         label = Text(sane(row["adapter_id"]), style=CYAN)
         label.append(" · " + (sane(cwd) or sid[-18:]), style="#e2e8f0")
-        label.append("\n" + sid[-25:], style=MUTED)
+        label.truncate(25, overflow="ellipsis")
+        state = row.get("review_state") or ""
+        icon = {"failed": "! ", "passed": "✓ ", "open": "◌ ", "unknown": "? "}.get(state, "")
+        preview = Text(icon + sane(row.get("task") or sid[-25:]).replace("\n", " "),
+                       style=RED if state == "failed" else GREEN if state == "passed" else MUTED)
+        preview.truncate(25, overflow="ellipsis")
+        label.append("\n")
+        label.append_text(preview)
         return label
 
     def _render_sessions(self, data: dict, *, allow_auto_select: bool = True) -> None:
@@ -483,6 +533,9 @@ class TraceApp(App):
                 self._show_info(message)
 
     def _clear_session(self) -> None:
+        self._review_primary = True
+        self._review_navigation = False
+        self._render_review(None)
         self.session_key = None
         self.span_ref = None
         self._session_epoch += 1
@@ -513,6 +566,7 @@ class TraceApp(App):
             key = (row["adapter_id"], row["session_id"])
             self._select_session(key)
             if isinstance(event, DataTable.RowSelected):
+                self._review_navigation = True
                 self._active_panel = "traces"
                 self._layout()
                 self.query_one("#traces", Tree).focus()
@@ -525,6 +579,11 @@ class TraceApp(App):
             data = await asyncio.to_thread(self.backend.session, key, offset)
             if self.closed or key != self.session_key or epoch != self._session_epoch or offset != self.turn_offset:
                 return
+            self._render_review(data.get("review"))
+            if self._review_navigation and self._review:
+                self._active_panel = "detail"
+                self._layout()
+            self._review_navigation = False
             turns = data["turns"]
             if not turns["traces"] and offset > 0:
                 self.turn_offset = max(0, ((max(1, turns["total"]) - 1) // PAGE_SIZE) * PAGE_SIZE)
@@ -573,7 +632,10 @@ class TraceApp(App):
                     and ref == self.span_ref and selection == self._span_epoch and ref.span_id):
                 await self._load_span(key, ref, selection)
             if not n:
-                self._show_info("This session has no indexed turns yet.")
+                if self._review:
+                    self.query_one("#details", TabbedContent).active = "tab-review"
+                else:
+                    self._show_info("This session has no indexed turns yet.")
         except Exception as exc:
             if epoch == self._session_epoch and key == self.session_key:
                 self._error(exc)
@@ -697,6 +759,7 @@ class TraceApp(App):
         ref = event.node.data
         if not ref or not self.session_key:
             return
+        self._review_primary = False
         self._active_panel = "detail"
         self._layout()
         self.span_ref = ref
@@ -736,6 +799,7 @@ class TraceApp(App):
             self._set_body("info", info, reset=new)
             if new:
                 self.query_one("#details", TabbedContent).active = (
+                    "tab-review" if self._review_primary and self._review else
                     "tab-error" if span.get("error") else "tab-output" if span.get("output") is not None
                     else "tab-input" if span.get("input") is not None
                     else "tab-events" if span.get("events") else "tab-info")
@@ -787,6 +851,10 @@ class TraceApp(App):
             self.action_refresh()
         elif name == "clear-filters":
             self.action_clear_filters()
+        elif name == "review-evidence":
+            self.action_review_evidence()
+        elif name == "handoff":
+            self.action_handoff()
         elif name in ("sessions-prev", "sessions-next"):
             self.session_offset = max(0, self.session_offset + (PAGE_SIZE if name.endswith("next") else -PAGE_SIZE))
             self._filter_revision += 1
@@ -821,6 +889,63 @@ class TraceApp(App):
             self.query_one("#opening").display = True
             self.run_worker(self._initialize(), group="startup", exit_on_error=False)
 
+    def _render_review(self, review: dict | None) -> None:
+        self._review = review
+        self.query_one("#handoff", Button).disabled = review is None
+        self.query_one("#review-evidence", Button).disabled = not review or not (review["checks"] or review.get("failures"))
+        if review is None:
+            self._set_body("review", "Select a session to review its task, conclusion and check evidence.", reset=True)
+            for name, text in (("state", "Select work to review"), ("task", "Task text not available yet."),
+                               ("conclusion", "Conclusion and verification are reported separately."),
+                               ("next", "Select a session · e: evidence · h: handoff · m: metrics")):
+                self.query_one("#review-" + name, Static).update(Text(text, style=MUTED))
+            return
+        from core.review import markdown
+        self._set_body("review", markdown(review))
+        color = RED if review["state"] == "failed" else GREEN if review["state"] == "passed" else VIOLET
+        failures = len(review.get("failures", []))
+        extra = f" · {failures} tool failures" if failures else ""
+        self.query_one("#review-state", Static).update(Text(review["label"] + " · latest turn" + extra, style=color))
+        for name, text in (("task", "TASK  " + (review.get("task") or "Task text not captured.")),
+                           ("conclusion", "AGENT SAYS  " + (review.get("conclusion") or "No conclusion captured.")),
+                           ("next", review["next_action"])):
+            self.query_one("#review-" + name, Static).update(Text(sane(text).replace("\n", " "), style=MUTED if name == "next" else "#e2e8f0"))
+
+    def action_metrics(self) -> None:
+        self._metrics_visible = not self._metrics_visible
+        self.query_one("#metrics").display = self._metrics_visible
+
+    def action_handoff(self) -> None:
+        if self._review:
+            from core.review import markdown
+            self.push_screen(HandoffScreen(markdown(self._review)))
+
+    def action_review_evidence(self) -> None:
+        if self._review and self.session_key and (self._review["checks"] or self._review.get("failures")):
+            self._review_primary = False
+            checks = self._review["checks"]
+            failures = self._review.get("failures", [])
+            check = next((c for c in reversed(checks) if c["state"] == "failed"),
+                         failures[-1] if failures else checks[-1])
+            self.run_worker(self._open_review_evidence(self.session_key, self._session_epoch, check),
+                            group="review-evidence", exclusive=True, exit_on_error=False)
+
+    async def _open_review_evidence(self, key: SessionKey, epoch: int, check: dict) -> None:
+        try:
+            if self.turn_offset:
+                self.turn_offset = 0
+                await self._load_session(key, epoch)
+            if key != self.session_key or epoch != self._session_epoch:
+                return
+            self.span_ref = NodeRef(check["trace_id"], check["span_id"])
+            self._span_epoch += 1
+            self._active_panel = "detail"
+            self._layout()
+            await self._load_span(key, self.span_ref, self._span_epoch, new=True)
+        except Exception as exc:
+            if key == self.session_key and epoch == self._session_epoch:
+                self._error(exc)
+
     def action_search(self) -> None:
         self.query_one("#search", Input).focus()
 
@@ -850,7 +975,8 @@ class TraceApp(App):
         if isinstance(self.focused, Input):
             self.query_one("#sessions", DataTable).focus()
         else:
-            self.action_panel("traces" if self._active_panel == "detail" else "sessions")
+            reviewing = self.query_one("#details", TabbedContent).active == "tab-review"
+            self.action_panel("traces" if self._active_panel == "detail" and not reviewing else "sessions")
 
 
 def run(args: Any) -> int:

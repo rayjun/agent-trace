@@ -225,3 +225,18 @@ inside `span.attributes.file`.
    database: the honest answer to "read old files" is a version bump plus a
    reader that understands both, or a note in the release that old files are
    best read with the old CLI.
+
+## v1 — contextual prompts without a new episode
+
+Optional boolean `episode_boundary: false` records prompt text that belongs to
+an already-established native turn. Codex response-item user messages use it:
+steering/context text can arrive long after `task_started`, and must not split
+an existing request/result pair. Existing records without this field retain
+their original identity rules. Both function and custom-tool call pairs are
+captured. Host environment/internal messages are excluded from task text;
+mirrored user messages are deduplicated within their native turn.
+
+Previously skipped custom-tool messages and user text behind old import cursors
+are not retroactively invented or replayed. Historical repair requires a
+controlled source backfill and ordered index replay; the ordinary upgrade does
+not rewrite capture files or silently rebuild an existing archive.

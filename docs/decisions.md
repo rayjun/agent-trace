@@ -658,3 +658,107 @@ What was checked and found *correct*, so it is not "fixed": the indexer's crash
 recovery. Killing it mid-file leaves the offset unadvanced, and the next run
 re-ingests from the last committed offset to the full count (verified at 120k
 records); only the `sessions` projection waits for a completed pass.
+
+## D32 — Work review is the entry point
+
+The product had accumulated capture adapters, raw record commands, two terminal
+interfaces, a browser dashboard and playback evaluation. The first screen still
+asked a developer to interpret lifetime token totals, latency distributions and
+span trees before answering a practical question. Repeated problems locating
+sessions and clicking through the TUI exposed the cost: the user had to maintain
+and learn an observability tool while already supervising coding agents.
+
+### Positioning judgment
+
+The primary user is a developer who works across local coding agents and
+repositories. Their repeated job is **reviewing the work before accepting it or
+handing it to another session**. The product promise is a short, sourced account
+of the task, the agent's claim, recorded verification, and the place to inspect.
+A source reference must retain adapter + session + trace + span; a bare result
+with no route back to the invocation is insufficient.
+
+This is a product hypothesis, not a claim of validated demand. The present
+implementation can establish usability and evidence correctness; retention and
+willingness to depend on the tool require repeated real use.
+
+The alternatives considered:
+
+| direction | judgment |
+|---|---|
+| A more elaborate live metrics dashboard | Improves presentation but leaves the user to turn counters into a decision. Lifetime cache/token figures have little relation to whether today's task was checked. Metrics remain available on demand. |
+| A general LLM observability/evaluation platform | Langfuse and LangSmith already document tracing, debugging and evaluation as their core workflows. Replicating their breadth would increase setup and maintenance without making local coding work clearer. |
+| Another agent launcher/orchestrator | Herdr and the agents already own processes, panes and prompts. Trace data alone cannot reliably establish whether an open span corresponds to a live process, so this product must not invent control semantics. |
+| A local work-review desk with portable evidence | Fits existing multi-agent capture and requires no new model call. It creates a repeatable moment of use: finish a task, inspect what was actually checked, and carry the evidence forward. This is the chosen primary workflow. |
+
+References consulted: [Langfuse observability](https://langfuse.com/docs/observability/overview),
+[LangSmith observability](https://www.langchain.com/langsmith/observability).
+These establish competitor scope; the positioning decision above is our
+inference from that scope and the observed local workflow, not a market-size or
+uniqueness claim.
+
+### What changed
+
+- `agenttrace review --refresh` is a server-free path from existing Codex
+  rollouts to a work inbox. `review` alone reads the indexed snapshot. A session
+  selector yields a sourced brief, `--markdown` makes it portable, and `--json`
+  exposes the same semantics to tooling.
+- `--check` is deliberately a **recorded-check gate**: 0 means recognized checks
+  passed in that captured turn, 1 means a recognized check failed, and 2 means
+  the capture cannot establish a passing result. It does not approve a commit.
+- The TUI starts with task, self-reported conclusion, check state and next
+  inspection. Evidence opens the source call; Handoff opens a copyable brief.
+  Session rows carry task previews/check markers. Archive metrics require `m`.
+- The browser starts on Work review, with project/session search, agent filter,
+  paging, per-session evidence and a Markdown download. Deep links retain every
+  namespace component. Archive metrics and raw traces remain secondary tools.
+- `core/review.py` supplies the semantics to all three surfaces. Review is a
+  bounded, read-only snapshot, not a second mutable data store. It performs no
+  model call and executes no captured command.
+
+### Evidence contract
+
+The scope is the **latest recorded turn of one adapter/session**, not an
+arbitrary time window or every historical failure. An unrelated successful
+command cannot erase a failed check; only a later result for the exact same
+command replaces its previous result. Commands executed through ordinary shell
+tools, literal Codex exec wrappers, and correlated process polls are recognized.
+Dynamic code that cannot be interpreted safely remains unknown.
+
+Check recognition does not match words merely quoted by echo, grep, a prompt or
+an LLM. Known exit envelopes take precedence; generic tool `status=ok` without
+exit/output evidence is insufficient. Output/command truncation and the call
+limit are disclosed and prevent a passing aggregate. A turn with no recorded
+checks is neutral, not an assertion that the task required tests. An unclosed
+turn is not evidence of a running process. File references are not a diff, and
+captured checks are not tied to the current worktree's subsequent mutations.
+
+Task text and agent conclusions remain quoted source material. Check output is
+escaped in HTML and bounded before crossing the SQL/UI boundary. The Markdown
+brief labels the agent conclusion as a self-report, includes source identities,
+and identifies captured content as untrusted material. No automatic repair,
+command execution, external sharing, or composite quality score is introduced.
+
+### Capture gap discovered by using the product
+
+The actual local Codex transcript contained hundreds of `custom_tool_call` /
+`custom_tool_call_output` records which the importer did not handle. User prompts
+also arrived as response-item messages rather than the older `user_message`
+event. A convincing review UI over that capture would report missing evidence
+for the very work being reviewed. Both formats are now parsed, with incremental
+context recovery and duplicate-message handling. Contextual prompt text carries
+`episode_boundary=false` so new metadata cannot split an established turn.
+Existing import cursors are respected; missing historical data is not made up.
+
+### Acceptance and remaining product questions
+
+Acceptance requires real native log → capture → index → review evidence,
+isolation for same-named sessions/traces, missing-data and failed-check behavior,
+CLI exit contracts, API authentication and 404/409 semantics, browser escaping
+and source links, and mouse/keyboard/resize behavior in the TUI. Performance is
+measured against the existing local archive rather than inferred from fixtures.
+CI lint, types, Pi typecheck and the full local test suite remain release gates.
+
+After release, the useful measures are time to reach a failing invocation,
+whether the handoff removes the need to reopen the old transcript, and repeated
+use after completing tasks. More charts, auto-generated judgments, and new
+orchestration controls should wait for evidence that they improve those jobs.

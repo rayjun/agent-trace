@@ -11,6 +11,8 @@ run() {
 }
 run "codex incremental import" python3 test/codex-import.test.py
 run "Codex native live capture" python3 test/codex-live.test.py
+run "work review + handoff + gates" python3 test/work-review.test.py
+run "work review browser flows" node test/work-review.test.mjs
 run "adapter regressions"      python3 test/adapters.test.py
 run "hermes deployed plugin"   python3 test/hermes-deploy.test.py
 run "release version"         python3 test/release.test.py

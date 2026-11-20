@@ -37,6 +37,7 @@
 
     "session_id": { "type": "string" },
     "agent_version": { "type": "string", "description": "version of the observed agent, when recorded in source metadata" },
+    "episode_boundary": { "type": "boolean", "description": "false for contextual prompt text whose native turn was already established" },
     "turn_id": { "type": "string" },
     "request_id": {
       "type": "string",

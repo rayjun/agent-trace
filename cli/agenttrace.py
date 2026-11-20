@@ -654,6 +654,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_report.add_argument("--db", type=Path, default=None)
     _dirs(p_report)
 
+    p_review = sub.add_parser("review", help="review recent work and recorded check evidence; export a handoff")
+    for flag in ("agent", "session", "model", "since"):
+        p_review.add_argument("--" + flag, default=argparse.SUPPRESS)
+    p_review.add_argument("--contains", default=argparse.SUPPRESS, help="search indexed project, model, session or agent")
+    p_review.add_argument("--limit", type=int, default=argparse.SUPPRESS, help="recent sessions, capped at 30")
+    p_review.add_argument("--db", type=Path, default=None)
+    p_review.add_argument("--refresh", action="store_true", help="sync native Codex and index trace sources before review")
+    p_review.add_argument("--json", action="store_true", help="machine-readable review")
+    p_review.add_argument("--markdown", action="store_true", help="portable handoff for --session")
+    p_review.add_argument("--check", action="store_true", help="--session gate: 0 recorded checks passed, 1 failed, 2 unknown/open")
+    _dirs(p_review)
+
     p_otlp = sub.add_parser("otlp", help="import/export OTLP JSON (M4)")
     otlp_sub = p_otlp.add_subparsers(dest="otlp_cmd", required=True)
     p_oi = otlp_sub.add_parser("import", help="OTLP JSON file -> trace dirs")
@@ -1073,6 +1085,74 @@ def cmd_report(args) -> int:
     return 0
 
 
+def cmd_review(args) -> int:
+    from core.review import inbox, markdown, session_review
+    from core.storage.indexer import Indexer
+    from core.storage.sqlite_store import TraceStore
+    from panel.text import sane
+    from server.main import platform_dir
+
+    if (args.markdown or args.check) and not args.session:
+        print("--markdown and --check require --session (and --agent for ambiguous IDs)", file=sys.stderr)
+        return 2
+    if args.json and args.markdown:
+        print("choose --json or --markdown", file=sys.stderr)
+        return 2
+    if args.event or args.reverse or (args.session and (args.model or args.since or args.contains)):
+        print("review uses session/project filters; --session is an exact selector, not a filtered inbox", file=sys.stderr)
+        return 2
+    db = args.db or Path(os.environ.get("AGENTTRACE_DB") or platform_dir() / "agenttrace.db")
+    store = TraceStore(db.expanduser())
+    try:
+        # Existing archives are read as-is; users control indexing separately.
+        # A fresh install can review supplied JSONL without running a server.
+        if args.refresh or not store.one("SELECT 1 FROM sessions LIMIT 1"):
+            if common.index_locked():
+                print("Index rebuild in progress; wait before refreshing this review", file=sys.stderr)
+                return 2
+            if args.refresh:
+                import threading
+                from tui_sources import CodexSync
+                capture = CodexSync(args.dirs)
+                capture.poll(threading.Event())
+                if capture.errors:
+                    print("Capture incomplete: " + "; ".join(capture.errors), file=sys.stderr)
+                    return 2
+            report = Indexer(store, args.dirs).scan_once()
+            if report.errors or report.problems:
+                print("Index incomplete: " + "; ".join(report.errors + report.problems), file=sys.stderr)
+                return 2
+        if args.session:
+            review = session_review(store, args.session, agent=args.agent)
+            if review is None:
+                print("session not found; run agenttrace index or choose an indexed session", file=sys.stderr)
+                return 2
+            print(json.dumps(review, ensure_ascii=False, indent=2) if args.json else sane(markdown(review)))
+            return (0 if review["state"] == "passed" else 1 if review["state"] == "failed" else 2) if args.check else 0
+        data = inbox(store, agent=args.agent, search=args.contains or "", limit=args.limit,
+                     model=args.model, since=args.since)
+        if args.json:
+            print(json.dumps(data, ensure_ascii=False, indent=2))
+        else:
+            print("WORK REVIEW · latest recorded turn per session")
+            print("Indexed snapshot · use review --refresh to collect new activity.")
+            print("Recorded checks are evidence, not approval of the current worktree.\n")
+            for row in data["reviews"]:
+                print(sane(f"{row['label']} · {row['adapter_id']} · {row.get('cwd') or 'project unknown'}"))
+                print(sane("  " + (row.get("task") or row.get("conclusion") or "No task text captured").replace("\n", " ")[:160]))
+                print(sane(f"  session: {row['session_id']}"))
+                print(sane("  " + row["next_action"]) + "\n")
+            if not data["reviews"]:
+                print("No indexed sessions. Run agenttrace doctor, then agenttrace index.")
+            print(f"Showing {len(data['reviews'])} / {data['total']} sessions. Use review --session ID --agent ADAPTER --markdown for a handoff.")
+        return 0
+    except ValueError as exc:
+        print(sane(str(exc)), file=sys.stderr)
+        return 2
+    finally:
+        store.close()
+
+
 def cmd_otlp(args) -> int:
     from adapters.otlp import export_traces, import_file
     from core.query import get_trace, list_traces
@@ -1193,7 +1273,7 @@ def main(argv=None) -> int:
     # commands that scan traces declare them.
     if not getattr(args, "dirs", None):
         args.dirs = default_trace_dirs()
-        if args.cmd == "tui":
+        if args.cmd == "tui" or (args.cmd == "review" and args.refresh):
             from tui_sources import codex_trace_dir
             # Keep a not-yet-created capture directory in the scan set. The
             # first native session can then appear without restarting the UI.
@@ -1207,7 +1287,7 @@ def main(argv=None) -> int:
         "ls": cmd_ls, "show": cmd_show, "search": cmd_search,
         "sessions": cmd_sessions, "stats": cmd_stats, "watch": cmd_watch,
         "serve": cmd_serve, "index": cmd_index, "doctor": cmd_doctor,
-        "adapter": cmd_adapter, "otlp": cmd_otlp, "report": cmd_report,
+        "adapter": cmd_adapter, "otlp": cmd_otlp, "report": cmd_report, "review": cmd_review,
         "session": cmd_session,
         "tui": cmd_tui,
     }[args.cmd](args)
