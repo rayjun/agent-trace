@@ -22,7 +22,7 @@ function setup(hash = "#/review", respond = () => ({reviews: [review], total: 20
     return {ok: true, json: async () => respond(String(url)), text: async () => ""};
   };
   const code = (boot ? source : source.replace(/\n  router\(\);\n  connectSse\(\);/, "\n"))
-    + "\nreturn {renderWorkReview, renderTraceDetail, router};";
+    + "\nreturn {renderWorkReview, renderTraceDetail, renderRepository, router};";
   return {...new Function(code)(), elements, calls};
 }
 {
@@ -86,3 +86,31 @@ function setup(hash = "#/review", respond = () => ({reviews: [review], total: 20
   assert.match(ui.elements.app.innerHTML, /No work captured/);
 }
 console.log("PASS — work review: default entry, evidence links, namespace, escaping, handoff, filters, pagination, stale-response protection");
+
+
+{
+  const file = 'src/a & b.txt';
+  const ui = setup('#/worktree?file=' + encodeURIComponent(file), () => ({
+    state: "stale", label: "Check evidence is out of date", root: "/project",
+    branch: "main", head: "0123456789abcdef", staged_matches_worktree: false,
+    files: [{index: "M", worktree: "M", path: file}],
+    checks: [{name: "tests", required: true, state: "stale", exit_code: 0,
+      argv: ["pytest", "-q"], output: "<script>test-output</script>", id: 1}],
+    diff: {staged: "+<img src=x>", unstaged: "+working"},
+    selected: {adapter_id:"codex", session_id:"/sessions/a & b"}, session_selected: true,
+    sessions: [{adapter_id:"codex", session_id:"/sessions/a & b"}],
+    history: {turns: [review], limited: false, total: 1},
+    handoff_markdown: "# Repository review"
+  }));
+  await ui.renderRepository();
+  const html = ui.elements.app.innerHTML;
+  assert.equal(new URLSearchParams(ui.calls[0].split("?")[1]).get("file"), file);
+  assert.match(html, /Check evidence is out of date/);
+  assert.match(html, /Working copy includes changes outside the Git index/);
+  assert.match(html, /&lt;img src=x&gt;/);
+  assert.ok(!html.includes("<script>"));
+  assert.match(html, /from_turn=shared/);
+  assert.match(html, /span=call%2F1/);
+  assert.equal(typeof ui.elements["download-repository"].events.click, "function");
+}
+console.log("PASS — repository review: stale evidence, split diff, safe output, task history, handoff");

@@ -580,6 +580,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_tui.add_argument("--agent", default=argparse.SUPPRESS, help="initial adapter filter")
     p_tui.add_argument("--session", default=argparse.SUPPRESS, help="initial session ID")
     p_tui.add_argument("--db", type=Path, default=None)
+    p_tui.add_argument("--archive", action="store_true", help="open session archive instead of repository review")
+    p_tui.add_argument("--repo", type=Path, default=None, help="review a specified Git worktree")
     p_tui.add_argument("--interval", type=float, default=2.5, help="refresh interval seconds (minimum 0.5)")
     p_tui.add_argument("--no-index", action="store_true", help="browse the existing index without scanning source files")
     _dirs(p_tui)
@@ -595,6 +597,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_serve.add_argument("--interval", type=float, default=1.0,
                          help="trace-dir scan interval seconds")
     p_serve.add_argument("--verbose", action="store_true")
+    p_serve.add_argument("--repo", type=Path, help="serve repository review for this local worktree")
     p_serve.add_argument("--daemon", action="store_true",
                          help="detach and keep running (survives this shell); "
                               "writes ~/.agenttrace/server.pid + server.log")
@@ -662,9 +665,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_review.add_argument("--db", type=Path, default=None)
     p_review.add_argument("--refresh", action="store_true", help="sync native Codex and index trace sources before review")
     p_review.add_argument("--json", action="store_true", help="machine-readable review")
-    p_review.add_argument("--markdown", action="store_true", help="portable handoff for --session")
-    p_review.add_argument("--check", action="store_true", help="--session gate: 0 recorded checks passed, 1 failed, 2 unknown/open")
+    p_review.add_argument("--markdown", action="store_true", help="portable repository or session handoff")
+    p_review.add_argument("--check", action="store_true", help="exit 0 for passed checks, 1 for failed checks, 2 for unavailable evidence")
+    p_review.add_argument("--staged", action="store_true", help="with --check, require the tested worktree to match the Git index")
+    p_review.add_argument("--repo", type=Path, help="review this Git worktree (default: current repository)")
+    p_review.add_argument("--archive", action="store_true", help="review indexed sessions")
+    p_review.add_argument("--require", action="append", default=[], metavar="NAME", help="require this local check (repeatable)")
+    p_review.add_argument("--from-turn", help="start session history at this trace ID")
+    p_review.add_argument("--diff", metavar="FILE", help="show the staged/unstaged or untracked diff for this file")
     _dirs(p_review)
+
+    p_check = sub.add_parser("check", help="run an explicit check and record the Git snapshot it verified")
+    p_check.add_argument("--repo", type=Path, help="run from the root of this Git worktree")
+    p_check.add_argument("--db", type=Path, default=None)
+    p_check.add_argument("--session", help="associate this check with an indexed session in the worktree")
+    p_check.add_argument("--agent", help="adapter when the session ID is ambiguous")
+    p_check.add_argument("name", help="check name")
+    p_check.add_argument("command", nargs=argparse.REMAINDER, help="-- PROGRAM [ARG ...], or omit to use the configured check")
 
     p_otlp = sub.add_parser("otlp", help="import/export OTLP JSON (M4)")
     otlp_sub = p_otlp.add_subparsers(dest="otlp_cmd", required=True)
@@ -694,6 +711,7 @@ def cmd_serve(args) -> int:
     """Indexer + local HTTP API + dashboard. Imports are lazy: `agenttrace ls`
     must keep starting fast and dependency-free for users who never serve."""
     from server.main import platform_dir, serve
+    from core.review_git import repository_root
 
     pid_file = platform_dir() / "server.pid"
     if args.stop or args.status:
@@ -731,6 +749,10 @@ def cmd_serve(args) -> int:
         print(f"stopped dashboard (pid {pid})")
         return 0
 
+    repo = repository_root(args.repo.expanduser()) if args.repo is not None else None
+    if args.repo is not None and (repo is None or args.host not in {"localhost", "127.0.0.1", "::1"}):
+        print("--repo requires a Git worktree and a loopback server", file=sys.stderr)
+        return 2
     if args.daemon:
         # Re-exec through the launcher so the server lands in its own session.
         launcher = Path(__file__).resolve().parent.parent / "scripts" / "serve-daemon.py"
@@ -738,13 +760,15 @@ def cmd_serve(args) -> int:
                "--port", str(args.port), "--interval", str(args.interval)]
         if args.db:
             cmd += ["--db", str(args.db)]
+        if repo:
+            cmd += ["--repo", str(repo)]
         cmd += [str(d) for d in args.dirs]
         return subprocess.call(cmd)
 
     db = args.db or Path(os.environ.get("AGENTTRACE_DB")
                          or platform_dir() / "agenttrace.db")
     serve(host=args.host, port=args.port, db_path=db, dirs=args.dirs,
-          scan_interval=args.interval, verbose=args.verbose)
+          scan_interval=args.interval, verbose=args.verbose, repository=repo)
     return 0
 
 
@@ -1086,17 +1110,34 @@ def cmd_report(args) -> int:
 
 
 def cmd_review(args) -> int:
+    from core.repo_review import repository_diff, repository_markdown, repository_review
     from core.review import inbox, markdown, session_review
+    from core.review_git import GitReviewError, repository_root
     from core.storage.indexer import Indexer
     from core.storage.sqlite_store import TraceStore
     from panel.text import sane
     from server.main import platform_dir
 
-    if (args.markdown or args.check) and not args.session:
-        print("--markdown and --check require --session (and --agent for ambiguous IDs)", file=sys.stderr)
+    use_repo = args.repo is not None or not any((args.archive, args.session, args.agent,
+                                                  args.model, args.since, args.contains))
+    root = repository_root((args.repo or Path.cwd()).expanduser()) if use_repo else None
+    if args.staged and (not args.check or root is None):
+        print("--staged requires a repository review with --check", file=sys.stderr)
+        return 2
+    if args.repo is not None and (root is None or args.archive or any((args.contains, args.model, args.since))):
+        print("--repo requires a Git worktree and is incompatible with archive filters", file=sys.stderr)
+        return 2
+    if (args.require or args.diff or args.from_turn) and (root is None or (args.from_turn and not args.session)):
+        print("--require, --diff and --from-turn need a repository review; --from-turn also needs --session", file=sys.stderr)
+        return 2
+    if (args.markdown or args.check) and not args.session and root is None:
+        print("Open a Git worktree or specify --session for this review", file=sys.stderr)
         return 2
     if args.json and args.markdown:
         print("choose --json or --markdown", file=sys.stderr)
+        return 2
+    if args.diff and args.markdown:
+        print("Use --diff for a patch preview or --markdown for the review handoff", file=sys.stderr)
         return 2
     if args.event or args.reverse or (args.session and (args.model or args.since or args.contains)):
         print("review uses session/project filters; --session is an exact selector, not a filtered inbox", file=sys.stderr)
@@ -1106,7 +1147,7 @@ def cmd_review(args) -> int:
     try:
         # Existing archives are read as-is; users control indexing separately.
         # A fresh install can review supplied JSONL without running a server.
-        if args.refresh or not store.one("SELECT 1 FROM sessions LIMIT 1"):
+        if args.refresh or (root is None and not store.one("SELECT 1 FROM sessions LIMIT 1")):
             if common.index_locked():
                 print("Index rebuild in progress; wait before refreshing this review", file=sys.stderr)
                 return 2
@@ -1122,13 +1163,35 @@ def cmd_review(args) -> int:
             if report.errors or report.problems:
                 print("Index incomplete: " + "; ".join(report.errors + report.problems), file=sys.stderr)
                 return 2
+        if root is not None:
+            review = repository_review(store, root, required=args.require, session=args.session,
+                                       agent=args.agent, from_turn=args.from_turn)
+            if args.diff:
+                review["diff"] = repository_diff(root, args.diff)
+            if args.json:
+                print(json.dumps(review, indent=2))
+            elif args.markdown:
+                print(sane(repository_markdown(review)))
+            elif args.diff:
+                for area, diff in review["diff"].items():
+                    if diff:
+                        print(sane(f"{area.upper()} · {args.diff}\n{diff}"))
+            else:
+                _print_repository_review(review)
+            if args.check:
+                if args.staged and not review["staged_matches_worktree"]:
+                    print("Working copy differs from the Git index. Stage the intended changes and rerun the checks.",
+                          file=sys.stderr)
+                    return 2
+                return {"passed": 0, "failed": 1}.get(review["state"], 2)
+            return 0
         if args.session:
-            review = session_review(store, args.session, agent=args.agent)
-            if review is None:
+            archived = session_review(store, args.session, agent=args.agent)
+            if archived is None:
                 print("session not found; run agenttrace index or choose an indexed session", file=sys.stderr)
                 return 2
-            print(json.dumps(review, ensure_ascii=False, indent=2) if args.json else sane(markdown(review)))
-            return (0 if review["state"] == "passed" else 1 if review["state"] == "failed" else 2) if args.check else 0
+            print(json.dumps(archived, ensure_ascii=False, indent=2) if args.json else sane(markdown(archived)))
+            return (0 if archived["state"] == "passed" else 1 if archived["state"] == "failed" else 2) if args.check else 0
         data = inbox(store, agent=args.agent, search=args.contains or "", limit=args.limit,
                      model=args.model, since=args.since)
         if args.json:
@@ -1146,7 +1209,75 @@ def cmd_review(args) -> int:
                 print("No indexed sessions. Run agenttrace doctor, then agenttrace index.")
             print(f"Showing {len(data['reviews'])} / {data['total']} sessions. Use review --session ID --agent ADAPTER --markdown for a handoff.")
         return 0
-    except ValueError as exc:
+    except (ValueError, GitReviewError, OSError) as exc:
+        print(sane(str(exc)), file=sys.stderr)
+        return 2
+    finally:
+        store.close()
+
+
+def _print_repository_review(review: dict) -> None:
+    from panel.text import sane
+
+    head = (review["head"] or "unborn")[:12]
+    print(sane(f"{review['root']} · {review['branch'] or 'detached'} · {head}\n{review['label']}"))
+    if not review["staged_matches_worktree"]:
+        print("The working copy includes changes outside the Git index.")
+    if review["unavailable"]:
+        print(sane(review["unavailable"]))
+    if review["policy_error"]:
+        print(sane(review["policy_error"]))
+    print(f"\n{len(review['files'])} changed files")
+    for file in review["files"]:
+        print(sane(f"  {file['index']}{file['worktree']}  {file['path']}"))
+    print("\nLocal checks")
+    for check in review["checks"]:
+        requirement = "required" if check["required"] else "recorded"
+        print(sane(f"  {check['name']} · {check['state']} · {requirement}"))
+        if check.get("output") and check["state"] in ("failed", "unknown"):
+            print(sane(check["output"]))
+    if not review["checks"]:
+        print("  Record a check with agenttrace check NAME -- PROGRAM [ARG ...]")
+    history = review["history"]
+    if history["turns"]:
+        selected = review["selected"]
+        print(sane(f"\nSession evidence · {selected['adapter_id']} / {selected['session_id']}"))
+        print("  Trace checks are historical until verified against a worktree snapshot.")
+        for turn in reversed(history["turns"]):
+            task = " ".join((turn["task"] or "Task text unavailable").split())
+            print(sane(f"  {turn['trace_id']} · {task[:120]} · {len(turn['checks'])} captured checks"))
+        if history["limited"]:
+            print(f"  Showing {len(history['turns'])} of {history['total']} turns")
+    print("\nUse review --diff FILE for changes or review --markdown for a handoff.")
+
+
+def cmd_check(args) -> int:
+    from core.repo_review import record_check
+    from core.review_git import GitReviewError, repository_root
+    from core.storage.sqlite_store import TraceStore
+    from panel.text import sane
+    from server.main import platform_dir
+
+    if args.agent and not args.session:
+        print("--agent requires --session when recording a check", file=sys.stderr)
+        return 2
+    root = repository_root((args.repo or Path.cwd()).expanduser())
+    if root is None:
+        print("Run check in a Git worktree or supply --repo", file=sys.stderr)
+        return 2
+    command = args.command
+    if command[:1] == ["--"]:
+        command = command[1:]
+    db = args.db or Path(os.environ.get("AGENTTRACE_DB") or platform_dir() / "agenttrace.db")
+    store = TraceStore(db.expanduser())
+    try:
+        result = record_check(store, root, args.name, command, session=args.session,
+                              agent=args.agent, terminal=getattr(sys.stderr, "buffer", None))
+        print(sane(f"{args.name} · {result['state']} · run #{result['id']}"))
+        if result["detail"]:
+            print(sane(result["detail"]), file=sys.stderr)
+        return {"passed": 0, "failed": 1}.get(result["state"], 2)
+    except (OSError, ValueError, GitReviewError) as exc:
         print(sane(str(exc)), file=sys.stderr)
         return 2
     finally:
@@ -1238,12 +1369,14 @@ def cmd_tui(args) -> int:
         if runner.is_file() and Path(sys.prefix).resolve() != runner.parent.parent.resolve():
             command = [str(runner), str(root / "cli" / "agenttrace.py"), "tui",
                        "--interval", str(args.interval)]
-            for name in ("db", "agent", "session"):
+            for name in ("db", "agent", "session", "repo"):
                 value = getattr(args, name, None)
                 if value is not None:
                     command += ["--" + name, str(value)]
             if args.no_index:
                 command.append("--no-index")
+            if args.archive:
+                command.append("--archive")
             command += [str(d) for d in args.dirs]
             return subprocess.call(command)
         print("The Textual dashboard needs optional dependencies. Install with:\n"
@@ -1288,7 +1421,7 @@ def main(argv=None) -> int:
         "sessions": cmd_sessions, "stats": cmd_stats, "watch": cmd_watch,
         "serve": cmd_serve, "index": cmd_index, "doctor": cmd_doctor,
         "adapter": cmd_adapter, "otlp": cmd_otlp, "report": cmd_report, "review": cmd_review,
-        "session": cmd_session,
+        "session": cmd_session, "check": cmd_check,
         "tui": cmd_tui,
     }[args.cmd](args)
 

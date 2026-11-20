@@ -74,6 +74,7 @@ function kindDot(kind) { return `<span class="kind-dot kind-${esc(kind)}"></span
 /* ------------------------------------------------------------------ */
 
 const routes = {
+  worktree: renderRepository,
   review: renderWorkReview,
   overview: renderOverview,
   traces: renderTraces,
@@ -89,9 +90,11 @@ const routes = {
 
 let currentRender = null; // re-invoked on SSE change events
 let reviewRevision = 0;
+let repositoryRevision = 0;
+let repositoryRenderKey = "";
 
 function router() {
-  const hash = location.hash || "#/review";
+  const hash = location.hash || (window.__AGENTTRACE_WORKTREE__ ? "#/worktree" : "#/review");
   // The route is the part BEFORE the query. Splitting the whole hash on "/" made
   // `#/traces?agent=pi` a route name nobody has a renderer for, so the filter
   // silently fell through to the Overview page. A renderer that needs the query
@@ -108,7 +111,9 @@ function router() {
       (a.dataset.route === "traces" && name === "trace"));
   });
   const fn = routes[name] || renderOverview;
+  const requestedHash = location.hash;
   currentRender = () => fn(arg).catch(e => {
+    if (location.hash !== requestedHash) return;
     // Say WHICH route failed and what it was given: a bare "error" gave no clue
     // that the id arriving here was still escaped.
     app.innerHTML = `<div class="panel"><h1>error</h1>
@@ -759,6 +764,13 @@ function connectSse() {
 if (!TOKEN) {
   app.innerHTML = missingTokenNotice();
 } else {
+  if (window.__AGENTTRACE_WORKTREE__) {
+    document.getElementById("worktree-nav").hidden = false;
+    setInterval(() => {
+      const hash = location.hash || "#/worktree";
+      if (hash.split("?")[0] === "#/worktree" && !document.hidden) currentRender?.();
+    }, 5000);
+  }
   router();
   connectSse();
 }
@@ -832,10 +844,84 @@ async function renderWorkReview() {
       location.hash = `#/review?${q}`;
     });
   }
-  document.getElementById("download-handoff")?.addEventListener("click", () => {
-    const blob = new Blob([data.handoff_markdown || ""], {type: "text/markdown;charset=utf-8"});
-    const url = URL.createObjectURL(blob), anchor = document.createElement("a");
-    anchor.href = url; anchor.download = "agent-work-review.md"; anchor.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-  });
+  document.getElementById("download-handoff")?.addEventListener("click", () =>
+    downloadMarkdown(data.handoff_markdown, "agent-work-review.md"));
+}
+
+function worktreeHref(q, updates) {
+  const params = new URLSearchParams(q);
+  for (const [key, value] of Object.entries(updates)) {
+    if (value == null) params.delete(key);
+    else params.set(key, value);
+  }
+  return "#/worktree?" + params;
+}
+
+async function renderRepository() {
+  const hash = location.hash;
+  const revision = ++repositoryRevision;
+  const q = new URLSearchParams(hash.split("?")[1] || "");
+  const data = await api("worktree?" + q);
+  if (revision !== repositoryRevision || hash !== location.hash) return;
+  const renderKey = hash + JSON.stringify(data);
+  if (repositoryRenderKey === renderKey && app.querySelector("#refresh-repository")) return;
+  repositoryRenderKey = renderKey;
+  const expanded = new Set(Array.from(app.querySelectorAll(".repo-check[open]"), el => el.dataset.name));
+  const statusClass = {passed: "ok", failed: "error", stale: "incomplete"}[data.state] || "unknown";
+  const file = q.get("file");
+  const selected = data.selected;
+  const history = data.history;
+  app.innerHTML = `
+    <section class="panel work-card">
+      <div class="work-meta"><span class="badge ${statusClass}">${esc(data.label)}</span>
+        <span class="mono">${esc(data.branch || "detached")} · ${esc((data.head || "unborn").slice(0, 12))}</span></div>
+      <h1>${esc(data.root.split("/").pop())}</h1>
+      <p class="dim mono">${esc(data.root)}</p>
+      ${data.staged_matches_worktree ? "" : '<p>Working copy includes changes outside the Git index.</p>'}
+      ${data.unavailable ? `<p>${esc(data.unavailable)}</p>` : ""}
+      ${data.policy_error ? `<p>${esc(data.policy_error)}</p>` : ""}
+      <div class="work-links"><button id="refresh-repository">Refresh</button>
+        <button id="download-repository">Download handoff</button><a href="#/review">Session archive</a></div>
+    </section>
+    <div class="repo-grid">
+      <section class="panel work-card"><h2>${data.files.length} changed files</h2>
+        ${data.files.map(f => `<p><span class="mono dim">${esc(f.index + f.worktree)}</span>
+          <a aria-current="${f.path === file}" href="${esc(worktreeHref(q, {file: f.path}))}">${esc(f.path)}</a></p>`).join("")
+          || '<p class="dim">The worktree has no changes.</p>'}</section>
+      <section class="panel work-card"><h2>${file ? esc(file) : "Diff preview"}</h2>
+        ${data.diff ? Object.entries(data.diff).filter(([, patch]) => patch).map(([area, patch]) =>
+            `<h3>${esc(area)}</h3><pre class="body">${esc(patch)}</pre>`).join("") || '<p>No textual diff.</p>'
+          : '<p class="dim">Select a changed file.</p>'}</section>
+    </div>
+    <section class="panel work-card"><h2>Local checks</h2>
+      ${data.checks.map(c => `<details class="work-check repo-check" data-name="${esc(c.name)}"${expanded.has(c.name) ? " open" : ""}>
+        <summary><b>${esc(c.name)}</b> · ${esc(c.state)}${c.required ? " · required" : ""}</summary>
+        <p class="mono">${esc((c.argv || []).join(" "))}</p>
+        ${c.id ? `<p>Run #${esc(c.id)} · exit ${esc(c.exit_code ?? "unavailable")} · snapshot ${esc((c.fingerprint || "").slice(0, 12))}</p>` : ""}
+        <pre class="body">${esc(c.output || "No recorded output.")}</pre>
+        ${c.trace_id && c.session_id ? `<a href="${esc(reviewHref(c, true))}">Open source turn</a>` : ""}
+        </details>`).join("") || '<p>Record a check with <code>agenttrace check NAME -- PROGRAM [ARG ...]</code>.</p>'}
+    </section>
+    <section class="panel work-card"><h2>${data.session_selected ? "Selected session" : "Recent project activity"}</h2>
+      ${data.sessions.map(s => `<a class="repo-session" href="${esc(worktreeHref(q,
+        {agent: s.adapter_id, session: s.session_id, from_turn: null}))}">${esc(s.adapter_id)} · ${esc(s.session_id)}</a>`).join("")}
+      ${selected ? '<p class="dim">Historical trace checks have no code snapshot binding.</p>' : '<p>No indexed sessions for this worktree.</p>'}
+      ${history.turns.map(turn => `<div class="repo-turn">
+        ${reviewCard(turn, true)}
+        <a href="${esc(worktreeHref(q, {agent: turn.adapter_id, session: turn.session_id, from_turn: turn.trace_id}))}">Start history here</a>
+      </div>`).join("")}
+      ${history.limited ? `<p>Showing ${history.turns.length} of ${history.total} turns.</p>` : ""}
+    </section>`;
+  document.getElementById("refresh-repository")?.addEventListener("click", () => currentRender?.());
+  document.getElementById("download-repository")?.addEventListener("click", () =>
+    downloadMarkdown(data.handoff_markdown, "agent-worktree-review.md"));
+}
+
+function downloadMarkdown(text, name) {
+  const blob = new Blob([text || ""], {type: "text/markdown;charset=utf-8"});
+  const url = URL.createObjectURL(blob), anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = name;
+  anchor.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }

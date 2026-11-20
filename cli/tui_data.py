@@ -119,6 +119,12 @@ class LocalBackend:
             }
         return self._read(read)
 
+    def repository(self, root: Path, session: str | None = None,
+                   agent: str | None = None, from_turn: str | None = None) -> dict[str, Any]:
+        from core.repo_review import repository_review
+        return self._read(lambda store: repository_review(store, root, session=session, agent=agent,
+                                                           from_turn=from_turn))
+
     def resolve_session(self, session_id: str, agent: str | None = None) -> SessionKey:
         def read(store: TraceStore) -> SessionKey:
             sql = "SELECT adapter_id FROM sessions WHERE session_id = ?"

@@ -9,49 +9,59 @@ local work-review desk: find the recent task, separate the agent's conclusion
 from the checks it actually ran, open the failing call, and carry a sourced
 handoff into the next session. Data stays on your machine.
 
-## Start with one completed task
+## Review the current repository
+
+Run these commands from a Git worktree. Replace the example test command with
+the check your repository uses.
 
 ```bash
 bash install.sh cli
-agenttrace review --refresh        # sync native Codex logs + index + work inbox
-agenttrace review --session ID --agent codex --markdown > handoff.md
+agenttrace review                              # changed files and verification state
+agenttrace review --diff src/example.py        # staged and unstaged diffs
+agenttrace check tests -- python3 -m pytest -q # record the process exit and snapshot
+agenttrace review --require tests --check
+agenttrace review --require tests --check --staged
+agenttrace review --markdown                  # copy or redirect the handoff
 ```
 
-Codex uses existing native rollout files, so this workflow needs no capture hook,
-server, account, API key or model call. Install `hermes` or `pi` through
-`install.sh` to capture those agents. Refresh imports changed Codex files and
-indexes configured trace sources. An existing archive is otherwise read as a
-snapshot; `agenttrace doctor` explains capture gaps.
+The repository view includes tracked changes and non-ignored untracked files.
+Each check records the Git HEAD, index and worktree file contents observed before
+and after execution. Edits and staging changes age out previous results.
+`--staged` additionally compares the working copy with the Git index.
+Exit 0 means the required checks passed on the current snapshot, 1 means a
+current check failed, and 2 means evidence is missing, stale or unavailable.
+Pass `--require NAME` for each required check, or define the set in an optional
+`.agenttrace-review.json` at the worktree root:
 
-The review answers three questions:
+```json
+{"checks":{"tests":["python3","-m","pytest","-q"],"lint":["ruff","check","."]}}
+```
 
-1. **What was the task and what did the agent say?** The recorded prompt and
-   conclusion are shown separately; the latter is a self-report.
-2. **What was checked?** Commands, captured results and source span IDs. States
-   distinguish failed checks, passed recorded checks, unknown results, open
-   turns, no checks and no execution. A successful lint does not clear a failed
-   test; a successful rerun of the same command replaces its earlier result.
-3. **What should I inspect next?** Open the evidence or export a Markdown brief
-   with task, conclusion, checks, recorded file references and source identities.
-
-Reviews cover the **latest recorded turn**, not all historical errors. Checks
-are evidence about an invocation, not proof that the current working tree or
-commit is correct. Missing/redacted/truncated data never becomes a pass. A turn
-without completion is called **open**, not assumed to be a live agent.
+Then run `agenttrace check tests` or `agenttrace check lint` explicitly. The
+review screens never execute checks. Snapshots cover Git-visible files. Ignored
+build output, installed dependencies, outside services, and environment state
+remain outside that scope. Submodules and snapshots that exceed the file or
+content limit show unavailable verification.
 
 ```bash
-agenttrace review --contains my-project --agent codex --limit 12
-agenttrace review --session ID --agent codex --json
-agenttrace review --session ID --agent codex --check
-# --check: 0 = recorded checks passed; 1 = a check failed; 2 = unknown/open/no checks
-agenttrace tui                     # interactive work review (optional setup below)
-agenttrace serve                   # browser work inbox and evidence inspection
+agenttrace tui                         # repository review when launched inside Git
+agenttrace serve --repo .              # authenticated loopback worktree dashboard
+agenttrace review --refresh            # sync native Codex transcripts and index sources
+agenttrace review --archive            # session inbox
+agenttrace review --session ID --agent codex --markdown
+agenttrace review --repo . --session ID --agent codex --from-turn TRACE_ID --markdown
 ```
 
-The existing trace CLI, OTel/LangGraph adapters, metrics, datasets and evaluation
-remain available for deeper investigation. The product's primary workflow is
-**task → check evidence → inspect → handoff**. Positioning and tradeoffs are
-recorded in [docs/decisions.md](docs/decisions.md#d32--work-review-is-the-entry-point).
+The repository view keeps local checks that still match the current snapshot
+across Agent turns. Use History to inspect archived prompts, claims, and
+commands, or select a starting turn to limit it to one task. Archived checks
+appear with their original span IDs and remain historical evidence. The
+session-only `--check` reports the recorded invocation's outcome. Use the
+repository gate for the current working copy.
+
+Codex reads native rollouts without capture hooks. Install the matching adapter
+for Hermes or Pi. Trace inspection, metrics, datasets and evaluation remain
+available for deeper investigation. See [the product decisions](docs/decisions.md).
 
 ## Architecture
 
@@ -115,7 +125,8 @@ is in [docs/decisions.md](docs/decisions.md).
 
 | | |
 |---|---|
-| `agenttrace review [--refresh]` | recent work, recorded checks, source evidence and Markdown handoffs |
+| `agenttrace review [--refresh]` | current Git changes, check evidence, session history and Markdown handoffs |
+| `agenttrace check NAME -- PROGRAM [ARG ...]` | run and record a check against a Git snapshot |
 | `agenttrace ls` / `show` / `search` | recent records · one call in full · grep across content |
 | `agenttrace sessions` / `stats` | group by session · calls, tokens, errors per agent/model |
 | `agenttrace session <id>` | a conversation: every turn with its own duration |

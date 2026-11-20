@@ -60,6 +60,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--interval", type=float, default=1.0,
                         help="trace-dir scan interval in seconds")
     parser.add_argument("--db", type=Path, default=None)
+    parser.add_argument("--repo", type=Path, default=None)
     parser.add_argument("--foreground", action="store_true",
                         help="do not detach (useful for debugging)")
     parser.add_argument("dirs", nargs="*", type=Path,
@@ -82,7 +83,7 @@ def main(argv: list[str]) -> int:
     print(f"pid={os.getpid()} db={db} dirs={[str(d) for d in dirs]}")
     try:
         serve(host=args.host, port=args.port, db_path=db, dirs=dirs,
-              scan_interval=args.interval, verbose=True)
+              scan_interval=args.interval, verbose=True, repository=args.repo)
     except Exception:                       # noqa: BLE001
         import traceback
         traceback.print_exc()

@@ -5,6 +5,7 @@ import asyncio
 from dataclasses import dataclass
 import json
 import os
+from pathlib import Path
 import time
 from typing import Any
 
@@ -24,6 +25,7 @@ from textual.widgets.tree import TreeNode
 from panel.text import sane
 from agenttrace_common import flatten_content
 from tui_data import PAGE_SIZE, LocalBackend, SessionKey
+from tui_repository import Evidence, RepositoryScreen
 
 CYAN = "#7dd3fc"
 VIOLET = "#b6a0fa"
@@ -195,6 +197,7 @@ class TraceApp(App):
         Binding("e", "review_evidence", "Evidence"),
         Binding("h", "handoff", "Handoff"),
         Binding("m", "metrics", "Metrics", show=False),
+        Binding("w", "repository", "Worktree"),
         Binding("1", "panel('sessions')", "Sessions"),
         Binding("2", "panel('traces')", "Trace"),
         Binding("3", "panel('detail')", "Details"),
@@ -211,10 +214,13 @@ class TraceApp(App):
         return driver
 
     def __init__(self, backend: Any, *, agent: str | None = None,
-                 session: str | None = None, interval: float = 2.5) -> None:
+                 session: str | None = None, interval: float = 2.5,
+                 repository: Path | None = None, open_repository: bool = False) -> None:
         super().__init__()
         self.backend = backend
         self.interval = interval
+        self.repository_root = repository
+        self.open_repository = open_repository
         self.agent_filter = agent
         self.initial_session = session
         self.live = True
@@ -330,6 +336,9 @@ class TraceApp(App):
             self.ready = True
             self.query_one("#opening").display = False
             await self._refresh()
+            if self.open_repository:
+                self.open_repository = False
+                self.action_repository()
         except Exception as exc:
             self.query_one("#opening").display = False
             self._error(exc)
@@ -920,6 +929,29 @@ class TraceApp(App):
             from core.review import markdown
             self.push_screen(HandoffScreen(markdown(self._review)))
 
+    def action_repository(self) -> None:
+        if self.repository_root is None or not self.ready:
+            return
+        self.push_screen(RepositoryScreen(self.repository_root, self.backend), self._repository_source)
+
+    def _repository_source(self, source: Evidence | None) -> None:
+        if source is None:
+            return
+        agent, session, trace, span = source
+        with self.prevent(Input.Changed, Select.Changed):
+            self.query_one("#search", Input).value = session
+        self.session_offset = 0
+        self.initial_session = session
+        self.agent_filter = agent
+        self._filter_revision += 1
+        key = (agent, session)
+        self._select_session(key)
+        if trace and span:
+            self.run_worker(self._open_review_evidence(key, self._session_epoch,
+                                                       {"trace_id": trace, "span_id": span}),
+                            group="review-evidence", exclusive=True, exit_on_error=False)
+        self.action_refresh()
+
     def action_review_evidence(self) -> None:
         if self._review and self.session_key and (self._review["checks"] or self._review.get("failures")):
             self._review_primary = False
@@ -981,10 +1013,16 @@ class TraceApp(App):
 
 def run(args: Any) -> int:
     from agenttrace_common import platform_dir
-    from pathlib import Path
+    from core.review_git import repository_root
 
     db = args.db or Path(os.environ.get("AGENTTRACE_DB") or platform_dir() / "agenttrace.db")
     backend = LocalBackend(db.expanduser(), args.dirs, index=not args.no_index,
                            interval=args.interval, capture=True)
-    TraceApp(backend, agent=args.agent, session=args.session, interval=args.interval).run()
+    root = repository_root((args.repo or Path.cwd()).expanduser())
+    if args.repo and root is None:
+        print("--repo requires a Git worktree")
+        return 2
+    open_repo = not args.archive and (args.repo is not None or not any((args.session, args.agent, args.no_index)))
+    TraceApp(backend, agent=args.agent, session=args.session, interval=args.interval,
+             repository=root, open_repository=open_repo).run()
     return 0

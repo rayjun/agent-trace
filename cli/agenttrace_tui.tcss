@@ -99,3 +99,14 @@ HandoffScreen { align: center middle; background: #080c14 75%; }
 #handoff-actions { height: 3; align-horizontal: right; }
 #handoff-actions Button { width: 16; margin-left: 1; }
 Screen.narrow #work-summary { height: 5; }
+
+RepositoryScreen { background: #101722; }
+#repo-main { height: 1fr; padding: 0 1; }
+#repo-heading { height: 1; color: #7dd3fc; text-style: bold; }
+#repo-location, #repo-result, #repo-help { height: auto; max-height: 2; }
+#repo-location, #repo-help { color: #a5b4c9; }
+#repo-controls { height: 3; margin: 1 0; }
+#repo-controls Button { min-width: 11; margin-right: 1; }
+#repo-content { height: 1fr; }
+#repo-items { height: 2fr; border: round #374966; }
+#repo-detail { height: 3fr; border: round #374966; }

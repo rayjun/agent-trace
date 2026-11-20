@@ -4,6 +4,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from copy import deepcopy
 import importlib.util
+import json
 import os
 from pathlib import Path
 import sys
@@ -20,7 +21,52 @@ if importlib.util.find_spec("textual") is None:
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "cli"), str(ROOT / "common")]
 from agenttrace_tui import BODY_LIMIT, NodeRef, TraceApp, body_text, readable_body, span_forest  # noqa: E402
-from textual.widgets import Button, DataTable, Input, Select, TabbedContent, TextArea, Tree  # noqa: E402
+from textual.widgets import Button, DataTable, Input, Select, Static, TabbedContent, TextArea, Tree  # noqa: E402
+
+
+class RepositoryUITests(unittest.IsolatedAsyncioTestCase):
+    async def test_open_diff_and_refresh_check_after_worktree_edit(self):
+        from core.repo_review import record_check
+        from core.storage.sqlite_store import TraceStore
+        from tui_data import LocalBackend
+        from tui_repository import RepositoryScreen
+
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
+            root = parent / "example"
+            root.mkdir()
+            subprocess.run(["git", "init", "-q", root], check=True)
+            source = root / "example.txt"
+            source.write_text("expected content\n")
+            command = [sys.executable, "-c",
+                       "from pathlib import Path; assert 'expected content' in Path('example.txt').read_text()"]
+            (root / ".agenttrace-review.json").write_text(json.dumps({"checks": {"test": command}}))
+            store = TraceStore(parent / "review.db")
+            try:
+                self.assertEqual(record_check(store, root, "test", [])["state"], "passed")
+            finally:
+                store.close()
+            app = TraceApp(LocalBackend(store.path, [], index=False), repository=root, open_repository=True)
+            async with app.run_test(size=(90, 30)) as pilot:
+                async def wait_for(condition):
+                    for _ in range(60):
+                        await pilot.pause(.1)
+                        if condition():
+                            return
+                    self.fail("Repository review did not reach the expected state")
+
+                await wait_for(lambda: isinstance(app.screen, RepositoryScreen) and app.screen.review is not None)
+                screen = app.screen
+                self.assertIn("Required checks passed", str(screen.query_one("#repo-result", Static).render()))
+                await pilot.press("down", "enter")
+                await wait_for(lambda: "+expected content" in screen.query_one(TextArea).text)
+                await pilot.press("c", "enter")
+                self.assertIn("exit 0", screen.query_one(TextArea).text)
+                source.write_text("edited content\n")
+                await pilot.press("r")
+                await wait_for(lambda: "out of date" in str(screen.query_one("#repo-result", Static).render()))
+                await pilot.press("escape", "w")
+                self.assertIsInstance(app.screen, RepositoryScreen)
 
 
 class PaginatedBackend:

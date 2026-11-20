@@ -104,11 +104,12 @@ class ServerState:
     """Everything handlers need, in one place, no module-level globals."""
 
     def __init__(self, store: TraceStore, indexer: Indexer, token: str,
-                 scan_interval: float = 1.0) -> None:
+                 scan_interval: float = 1.0, repository: Path | None = None) -> None:
         self.store = store
         self.indexer = indexer
         self.token = token
         self.scan_interval = scan_interval
+        self.repository = repository
         #: Where the index lock lives; None means the default platform dir.
         self.platform = None
         self.started_at = time.time()
@@ -465,6 +466,26 @@ class Handler(BaseHTTPRequestHandler):
             })
         elif path == "/api/overview":
             self._send_json(overview(store))
+        elif path == "/api/worktree":
+            from core.repo_review import repository_diff, repository_markdown, repository_review
+            from core.review_git import GitReviewError
+            root = self.state.repository
+            if root is None:
+                self._send_json({"error": "Start agenttrace serve --repo PATH to open a worktree"}, 404)
+                return
+            try:
+                work = repository_review(store, root, session=_one(qs, "session"),
+                                           agent=_one(qs, "agent"), from_turn=_one(qs, "from_turn"))
+                file = _one(qs, "file")
+                if file is not None:
+                    work["diff"] = repository_diff(root, file, allow_clean=True)
+                work["handoff_markdown"] = repository_markdown(work)
+            except AmbiguousSessionError:
+                raise
+            except (ValueError, GitReviewError, OSError) as exc:
+                self._send_json({"error": str(exc)}, 400)
+                return
+            self._send_json(work)
         elif path == "/api/review":
             from core.review import inbox, markdown, session_review
             session = _one(qs, "session")
@@ -569,6 +590,7 @@ class Handler(BaseHTTPRequestHandler):
         # too produced `window.<token> = "<token>"`, so the page set a global
         # nobody reads and every API call went out with an empty token.
         index = index.replace("__AGENTTRACE_TOKEN_VALUE__", self.state.token)
+        index = index.replace("__AGENTTRACE_WORKTREE_ENABLED__", "true" if self.state.repository else "false")
         if TOKEN_PLACEHOLDER in index:
             # A page whose bootstrap failed must say so, not silently 401.
             print("agent-trace: index.html still contains the token placeholder",
@@ -629,8 +651,10 @@ def _int(qs: dict[str, list[str]], key: str, default: int) -> int:
 
 def make_server(store: TraceStore, indexer: Indexer, *, host: str, port: int,
                 token: str, scan_interval: float = 1.0,
-                verbose: bool = False) -> TraceHTTPServer:
-    state = ServerState(store, indexer, token, scan_interval)
+                verbose: bool = False, repository: Path | None = None) -> TraceHTTPServer:
+    if repository is not None and host not in {"localhost", "127.0.0.1", "::1"}:
+        raise ValueError("Worktree review requires a loopback server")
+    state = ServerState(store, indexer, token, scan_interval, repository)
     server = TraceHTTPServer((host, port), Handler)
     server.state = state
     server.verbose = verbose
@@ -664,12 +688,12 @@ def _report_startup_coverage(state: ServerState, db_path: Path) -> None:
 
 def serve(*, host: str, port: int, db_path: Path, dirs: list[Path],
           scan_interval: float = 1.0, verbose: bool = False,
-          pidfile: bool = True) -> None:
+          pidfile: bool = True, repository: Path | None = None) -> None:
     store = TraceStore(db_path)
     indexer = Indexer(store, dirs)
     token = load_or_create_token()
     server = make_server(store, indexer, host=host, port=port, token=token,
-                         scan_interval=scan_interval, verbose=verbose)
+                         scan_interval=scan_interval, verbose=verbose, repository=repository)
     if pidfile:
         write_pidfile(os.getpid())
     if host not in ("127.0.0.1", "localhost", "::1"):

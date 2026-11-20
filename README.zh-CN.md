@@ -8,43 +8,49 @@
 的结论与实际执行的检查分开，直接打开失败调用，再把有来源的摘要交给下一次会话。
 所有数据保留在本机。
 
-## 从一个刚完成的任务开始
+## 在当前仓库复核
+
+从 Git 工作树执行以下命令。把示例里的测试命令换成项目实际使用的检查。
 
 ```bash
 bash install.sh cli
-agenttrace review --refresh        # 同步 Codex 原生日志、更新索引、查看工作收件箱
-agenttrace review --session ID --agent codex --markdown > handoff.md
+agenttrace review                              # 当前改动和验证状态
+agenttrace review --diff src/example.py        # 暂存和未暂存的差异
+agenttrace check tests -- python3 -m pytest -q # 记录实际进程退出码和代码快照
+agenttrace review --require tests --check
+agenttrace review --require tests --check --staged
+agenttrace review --markdown                  # 导出交接摘要，也可重定向到文件
 ```
 
-Codex 直接读取现有 rollout 文件，这条流程无需安装采集 hook，也无需服务器、账号、
-API key 或模型调用。Hermes、Pi 通过 `install.sh` 安装对应适配器。
-`--refresh` 导入变化的 Codex 日志并增量索引配置的 trace 来源；不加时读取现有归档快照。
-缺少会话时使用 `agenttrace doctor` 检查采集情况。
+本地检查比对执行前后的 Git HEAD、暂存区和工作副本内容。继续编辑或暂存后，之前的
+检查结果会显示为过期。`--staged` 额外验证工作副本与暂存区的内容一致。
+退出码 0 表示当前快照的必需检查全部通过，1 表示当前检查失败，2 表示缺少证据、
+结果过期或无法确认。可重复使用 `--require NAME`，也可以在仓库根目录配置必需检查：
 
-复核集中回答三个问题：
+```json
+{"checks":{"tests":["python3","-m","pytest","-q"],"lint":["ruff","check","."]}}
+```
 
-1. **任务是什么、Agent 怎么说？** 分开展示任务原文和 Agent 结论，结论明确标为自述。
-2. **究竟检查过什么？** 展示命令、已记录的结果和调用来源。区分检查失败、已记录检查通过、
-   结果未知、执行轮次未结束、未记录检查和没有执行。Lint 通过不会覆盖另一条失败测试，
-   相同命令成功重跑后会更新该项结果。
-3. **接下来该看哪里？** 打开证据，或导出包含任务、结论、检查、文件引用和来源标识的 Markdown 交接摘要。
-
-复核范围是**最新一轮执行**，历史失败不会永久污染当前结果。检查结果只证明记录中的那次调用，
-不代表当前工作树或 commit 正确；缺失、脱敏或截断的数据不会推断为通过。
-缺少完成记录时显示“轮次未结束”，不会据此断言 Agent 进程仍在运行。
+将它保存为 `.agenttrace-review.json` 后，显式执行 `agenttrace check tests`
+或 `agenttrace check lint`。打开复核页面不会触发命令。快照覆盖 Git 可见的文件。
+被忽略的构建产物、外部服务、已安装的依赖和运行环境在快照范围之外。子模块、冲突和尚未
+读取完毕的代码状态会显示为无法验证。
 
 ```bash
-agenttrace review --contains my-project --agent codex --limit 12
-agenttrace review --session ID --agent codex --json
-agenttrace review --session ID --agent codex --check
-# --check：0 已记录检查通过；1 存在失败检查；2 未知／未结束／没有检查
-agenttrace tui                     # 交互式工作复核（可选依赖见下文）
-agenttrace serve                   # 浏览器工作收件箱与证据详情
+agenttrace tui                         # 在仓库中默认进入工作树复核
+agenttrace serve --repo .              # 在本机浏览器复核指定仓库
+agenttrace review --refresh            # 同步原生 Codex 日志、更新索引
+agenttrace review --archive            # 所有已归档会话
+agenttrace review --session ID --agent codex --markdown
+agenttrace review --repo . --session ID --agent codex --from-turn TRACE_ID --markdown
 ```
 
-Trace CLI、OTel/LangGraph 适配器、指标、数据集和评估继续提供深入排查能力。
-主流程调整为 **任务 → 检查证据 → 定位问题 → 交接**。
-定位评估、取舍和验收标准见 [docs/decisions.md](docs/decisions.md#d32--work-review-is-the-entry-point)。
+有效的本地检查可以跨 Agent 轮次复用。History 显示会话中的任务、Agent 自述和原始调用，
+也可以选择一轮作为本次任务的起点。历史 trace 检查附带来源，单独使用会话级
+`--check` 时只返回记录中那次调用的结果。当前代码是否经过验证由仓库级检查判断。
+
+Codex 直接读原生日志，无需安装采集 hook。Hermes、Pi 可安装对应适配器。执行树、指标和
+评估仍可用于深入排查。设计取舍见 [产品决策](docs/decisions.md)。
 
 ## 架构
 
@@ -104,7 +110,8 @@ flowchart TB
 
 | | |
 |---|---|
-| `agenttrace review [--refresh]` | 最近工作、检查证据、定位来源和 Markdown 交接摘要 |
+| `agenttrace review [--refresh]` | 当前代码差异、检查证据、会话历史和交接摘要 |
+| `agenttrace check NAME -- PROGRAM [ARG ...]` | 在当前 Git 快照上执行并记录检查 |
 | `agenttrace ls` / `show` / `search` | 最近记录 · 一次调用的完整内容 · 跨内容 grep |
 | `agenttrace sessions` / `stats` | 按 session 分组 · 按 agent/model 统计调用、token、错误 |
 | `agenttrace session <id>` | 一次对话：每一轮各自的耗时 |

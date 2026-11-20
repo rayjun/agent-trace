@@ -71,6 +71,20 @@ class WorkReviewTests(unittest.TestCase):
         self.add(output=None, code=None)
         self.assertEqual(self.review()["state"], "unknown")
 
+    def test_informational_shell_lists_and_stdout_only_are_not_success_evidence(self):
+        self.add(cmd="pytest --version", output="pytest 8.4.0")
+        self.assertEqual(self.review()["state"], "unverified")
+        self.add(cmd="pytest -q; echo finished", output="finished")
+        self.assertEqual(self.review()["state"], "unknown")
+        self.add(cmd="pytest -q", output="2 passed", code=None, trace="fresh")
+        self.assertEqual(self.review()["state"], "unknown")
+        self.add(cmd="pytest -q", output="2 passed\nProcess exited with code 0", code=None, trace="fresh")
+        self.assertEqual(self.review()["state"], "unknown")
+        self.add(cmd="pytest -q",
+                 output="Chunk ID: test\nWall time: 0.2 seconds\nProcess exited with code 0\nFinal output:\n2 passed",
+                 code=None, trace="fresh")
+        self.assertEqual(self.review()["state"], "passed")
+
     def test_open_turn_and_check_are_not_approval_or_proof_of_a_live_agent(self):
         self.add(ended=False, status="running", output=None, code=None)
         review = self.review()

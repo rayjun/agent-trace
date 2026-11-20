@@ -29,7 +29,25 @@ _JS_TOKEN = re.compile(r'''\s+|//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"|'(?:\\.
 _EXIT = re.compile(r"^(?:Process exited with code|Process exit code:)\s*(-?\d+)\s*$", re.M)
 _SESSION = re.compile(r"^Process running with session ID\s+(\d+)\s*$", re.M)
 _FAIL = re.compile(r"(?:^\s*(?:FAILED(?:\s|$)|FAIL(?:\s|:|$)|ERROR collecting)|\b[1-9]\d* failed\b|SOME TESTS FAILED)", re.I | re.M)
-_PASS = re.compile(r"(?:\b\d+ passed\b|^\s*(?:OK|PASS)(?:\s|$)|ALL TESTS PASSED|All checks passed)", re.I | re.M)
+_INFORMATIONAL_FLAGS = {"--version", "--help", "-h", "-V", "--collect-only", "--co", "--listTests",
+                        "--list-tests", "--dry-run", "--showConfig", "--show-config", "--print-config",
+                        "--fixtures", "--fixtures-per-test", "--if-present", "--passWithNoTests",
+                        "--pass-with-no-tests", "-list"}
+
+
+def _informational(args: list[str]) -> bool:
+    return any(arg.split("=", 1)[0] in _INFORMATIONAL_FLAGS for arg in args)
+
+
+def _single_check_process(command: str) -> bool:
+    """Only associate a successful tool exit with one unambiguous invocation."""
+    if any(ch in command for ch in "\n\r;&|<>()`$"):
+        return False
+    try:
+        args = shlex.split(command)
+    except ValueError:
+        return False
+    return bool(args) and not _informational(args)
 
 
 def _text(value: Any) -> str:
@@ -145,6 +163,8 @@ def is_check(command: str) -> bool:
             continue
         exe = Path(tokens[0]).name
         args = tokens[1:]
+        if _informational(args):
+            continue
         if exe in {"pytest", "py.test", "unittest", "vitest", "jest", "tox", "rspec", "ruff", "mypy"}:
             return True
         if exe in {"python", "python3", "python3.10", "python3.12", "python3.14", "bash", "sh", "node"}:
@@ -197,10 +217,14 @@ def _result(output: Any) -> tuple[list[int], str | None, str]:
                 session = str(item["session_id"])
             if (isinstance(code, int) or item.get("session_id") is not None) and "output" in item:
                 bodies.append((code, _text(item["output"])))
-    if not codes:
-        codes = [int(m[1]) for m in _EXIT.finditer(text)]
-    if session is None and (match := _SESSION.search(text)):
-        session = match[1]
+    # Older shell tools use a text header followed by the actual stdout.
+    # A line printed by the command body cannot declare its own exit code.
+    if text.startswith(("Chunk ID:", "Wall time:")):
+        header = re.split(r"\n(?:Final output|Output):", text, maxsplit=1)[0]
+        if not codes:
+            codes = [int(m[1]) for m in _EXIT.finditer(header)]
+        if session is None and (match := _SESSION.search(header)):
+            session = match[1]
     if text.startswith("Script running with cell ID "):
         session = "cell:" + text.splitlines()[0].removeprefix("Script running with cell ID ").strip()
     if bodies:
@@ -250,16 +274,18 @@ def session_review(store: TraceStore, session_id: str, *,
 
 
 def _session_review(store: TraceStore, session_id: str, *,
-                    agent: str | None = None) -> dict[str, Any] | None:
+                    agent: str | None = None, trace_id: str | None = None) -> dict[str, Any] | None:
     adapter = query._session_agent(store, session_id, agent)
     if adapter is None:
         return None
     session = store.one("SELECT * FROM sessions WHERE adapter_id=? AND session_id=?", (adapter, session_id))
+    trace_filter = "" if trace_id is None else " AND trace_id=?"
     latest = store.one(
         "SELECT trace_id, MIN(COALESCE(start_ts,end_ts)) AS started,"
         " MAX(COALESCE(end_ts,start_ts)) AS updated FROM spans"
-        " WHERE adapter_id=? AND session_id=? GROUP BY trace_id ORDER BY started DESC, trace_id DESC LIMIT 1",
-        (adapter, session_id))
+        " WHERE adapter_id=? AND session_id=?" + trace_filter
+        + " GROUP BY trace_id ORDER BY started DESC, trace_id DESC LIMIT 1",
+        (adapter, session_id) if trace_id is None else (adapter, session_id, trace_id))
     result: dict[str, Any] = {
         "adapter_id": adapter, "session_id": session_id,
         "cwd": session["cwd"] if session else None,
@@ -336,7 +362,7 @@ def _session_review(store: TraceStore, session_id: str, *,
                 state = "unknown" if codes else "failed"
             elif not row["ended"] or session_key:
                 state = "open"
-            elif not row["clipped"] and (codes or _PASS.search(output)) and "--collect-only" not in command and "||" not in command:
+            elif not row["clipped"] and len(codes) == 1 and _single_check_process(command):
                 state = "passed"
             checks[command] = {
                 "command": command, "state": state, "span_id": row["span_id"],
@@ -367,6 +393,25 @@ def _session_review(store: TraceStore, session_id: str, *,
     if result["failures"]:
         result["next_action"] += " Inspect recorded tool failures in context; they may have been recovered."
     return result
+
+
+def session_history(store: TraceStore, session_id: str, *, agent: str,
+                    from_turn: str | None = None, limit: int = 12) -> dict[str, Any]:
+    with _snapshot(store):
+        rows = store.query(
+            "SELECT trace_id, MIN(COALESCE(start_ts,end_ts)) AS started FROM spans"
+            " WHERE adapter_id=? AND session_id=? GROUP BY trace_id ORDER BY started DESC, trace_id DESC",
+            (agent, session_id))
+        ids = [row["trace_id"] for row in rows]
+        if from_turn is not None:
+            if from_turn not in ids:
+                raise ValueError("Starting turn does not belong to this session")
+            ids = ids[:ids.index(from_turn) + 1]
+        return {
+            "from_turn": from_turn, "total": len(ids), "limited": len(ids) > limit,
+            "turns": [review for trace_id in ids[:limit]
+                      if (review := _session_review(store, session_id, agent=agent, trace_id=trace_id)) is not None],
+        }
 
 
 def inbox(store: TraceStore, *, agent: str | None = None, search: str = "",

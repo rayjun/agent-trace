@@ -179,22 +179,33 @@ test('real HTTP: closing polling cancels a pending fetch without state updates',
 
 test('real HTTP: persistent 401 retries once and cancels pending siblings', async () => {
   let roots = 0, pending = 0, closed = 0
+  const attempts = new Map()
   const server = createServer((req, res) => {
     if (req.url === '/') {
-      roots++; res.end('window.__AGENTTRACE_TOKEN__ = "fixture-rejected"'); return
+      roots++; res.end(`window.__AGENTTRACE_TOKEN__ = "fixture-rejected-${roots}"`); return
     }
     if (req.url === '/api/health') { res.end(JSON.stringify({ building: false })); return }
+    const token = req.headers.authorization
+    const attempt = attempts.get(token) || { traces: false, overview: null }
+    attempts.set(token, attempt)
     if (req.url.startsWith('/api/traces')) {
-      pending++; res.on('close', () => { closed++ }); return
+      pending++; res.on('close', () => { closed++ })
+      attempt.traces = true
+    } else {
+      attempt.overview = res
     }
-    res.writeHead(401); res.end('{}')
+    // Let the sibling reach the server before sending the 401. Otherwise
+    // cancellation can correctly happen before the sibling opens a socket.
+    if (attempt.traces && attempt.overview) {
+      attempt.overview.writeHead(401); attempt.overview.end('{}')
+    }
   })
   await new Promise(r => server.listen(0, '127.0.0.1', r))
   try {
     await assert.rejects(snapshot(`http://127.0.0.1:${server.address().port}`), /HTTP 401/)
     for (let i = 0; i < 100 && closed < pending; i++) await sleep(5)
     assert.equal(roots, 2)
-    assert.ok(pending > 0)
+    assert.equal(pending, 2)
     assert.equal(closed, pending)
   } finally { server.closeAllConnections(); await new Promise(r => server.close(r)) }
 })

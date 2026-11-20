@@ -762,3 +762,43 @@ After release, the useful measures are time to reach a failing invocation,
 whether the handoff removes the need to reopen the old transcript, and repeated
 use after completing tasks. More charts, auto-generated judgments, and new
 orchestration controls should wait for evidence that they improve those jobs.
+
+## D33 — Repository review starts with the change being submitted
+
+The earlier interface depended on captured check commands in a session's latest
+turn. A local audit recognized a check in only 2 of 272 sessions. Repository
+review now starts at the worktree. The changed-files list and staged/unstaged
+diff are available before any Agent activity is indexed. Checks explicitly run
+through the CLI record a process exit and a snapshot of the worktree. Reviews
+show results as missing, stale, running, unknown, failed or passed.
+
+A snapshot binds HEAD, the contents of the Git index, tracked worktree file
+bytes and non-ignored untracked files. The recorder compares these observations
+before and after an invocation. The optional staged gate also compares the bytes
+and executable or symlink modes against the index blobs. An index-only change
+expires prior checks even when the working copy happens to contain the same
+bytes. Running and completed results are stored separately from the trace index
+and survive an archive rebuild. A snapshot covers observed Git-visible files
+within a bounded read. It cannot attest to ignored files, external services,
+installed dependencies, or transient changes between observations.
+
+The repository gate accepts the configured named commands, or an explicit set
+of required names. It only executes commands through the operator's explicit
+CLI request. Authenticated browser worktree review is restricted to the
+loopback server and the repository selected at startup. The terminal view
+copies commands and summaries, and links captured historical evidence into the
+session archive. A session and an optional starting turn select the historical
+task context. Snapshot-bound local checks remain valid across further turns
+while the verified code stays the same.
+
+Archive review still records useful historical signals. It requires one
+unambiguous check invocation and explicit process-exit evidence before it
+shows a pass. Runners queried for help, version, or test enumeration do not
+satisfy that criterion. Compound shell commands with a successful outer exit
+remain unknown. Historical check results do not satisfy the repository gate.
+
+Verification replays real historical patches in an isolated clone, compares
+the file set and exit status against Git, then introduces an untracked edit to
+exercise the stale and staged gates. This measures the correctness and latency
+of the workflow on representative changes. Measuring repeated use by developers
+still requires observing their work.

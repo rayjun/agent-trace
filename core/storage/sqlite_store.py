@@ -43,6 +43,27 @@ CREATE TABLE IF NOT EXISTS meta (
   value TEXT NOT NULL
 );
 
+-- Explicit local verification survives trace rebuilds. Each run belongs to
+-- one worktree and the code snapshot observed when its process started.
+CREATE TABLE IF NOT EXISTS review_check_runs (
+  id INTEGER PRIMARY KEY,
+  root TEXT NOT NULL,
+  name TEXT NOT NULL,
+  argv TEXT NOT NULL,
+  argv_digest TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  head TEXT,
+  adapter_id TEXT,
+  session_id TEXT,
+  trace_id TEXT,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  exit_code INTEGER,
+  state TEXT NOT NULL,
+  output TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_review_check_root ON review_check_runs (root, name, id DESC);
+
 -- Durable redo queue: archive commits never leave an unrecorded projection gap.
 CREATE TABLE IF NOT EXISTS projection_pending (
   event_id TEXT PRIMARY KEY

@@ -156,3 +156,11 @@ a { color: var(--llm); }
 #advanced-nav summary { cursor: pointer; padding: 4px 10px; border-radius: 6px; }
 #advanced-nav > div { position: absolute; top: 100%; left: 0; min-width: 180px; padding: 8px; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 8px 24px #0006; }
 #advanced-nav a { display: block; white-space: nowrap; }
+
+.repo-grid { display: grid; grid-template-columns: minmax(15rem, 1fr) minmax(0, 2fr); gap: 16px; }
+.repo-grid p, .repo-session { overflow-wrap: anywhere; }
+.repo-grid a[aria-current="true"] { color: var(--text); font-weight: 700; }
+.repo-session { display: block; margin: 4px 0; }
+.repo-turn { margin-top: 16px; }
+.repo-turn .work-card { margin-bottom: 4px; }
+@media (max-width: 700px) { .repo-grid { grid-template-columns: 1fr; } }
