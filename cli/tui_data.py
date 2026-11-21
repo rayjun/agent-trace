@@ -120,10 +120,29 @@ class LocalBackend:
         return self._read(read)
 
     def repository(self, root: Path, session: str | None = None,
-                   agent: str | None = None, from_turn: str | None = None) -> dict[str, Any]:
+                   agent: str | None = None, from_turn: str | None = None, *,
+                   auto_select_session: bool = True,
+                   allow_missing_session: bool = False, include_task: bool = False) -> dict[str, Any]:
         from core.repo_review import repository_review
-        return self._read(lambda store: repository_review(store, root, session=session, agent=agent,
-                                                           from_turn=from_turn))
+        return self._read(lambda store: repository_review(
+            store, root, session=session, agent=agent, from_turn=from_turn,
+            auto_select_session=auto_select_session, allow_missing_session=allow_missing_session,
+            include_task=include_task))
+
+    def save_worktree_task(self, root: Path, checkout: str, goal: str, *,
+                           pane_id: str | None, terminal_id: str | None,
+                           agent: str | None, session_id: str | None) -> None:
+        from core.review_git import checkout_identity
+        from core.review_tasks import checkout_key, save_task
+        if checkout_key(*checkout_identity(root)) != checkout:
+            raise ValueError("The checkout changed. Refresh before saving the task.")
+        if self.store is None:
+            raise RuntimeError("The local archive is still opening")
+        try:
+            save_task(self.store, root, checkout, goal, pane_id=pane_id, terminal_id=terminal_id,
+                      agent=agent, session_id=session_id)
+        finally:
+            self.store.close()
 
     def resolve_session(self, session_id: str, agent: str | None = None) -> SessionKey:
         def read(store: TraceStore) -> SessionKey:

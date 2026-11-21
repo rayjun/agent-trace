@@ -4,6 +4,9 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 import shlex
+import sqlite3
+import subprocess
+import sys
 from typing import Any
 
 from rich.text import Text
@@ -12,18 +15,51 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, DataTable, Footer, Static, TextArea
+from textual.widgets import Button, DataTable, Footer, Input, Static, TextArea
 from textual.worker import Worker
 
 from core.repo_review import repository_diff, repository_markdown
+from core.review_tasks import NEXT_STEP, task_review_state
+from herdr_review import PaneReview, herdr_request, task_source
 from panel.text import sane
 
 Evidence = tuple[str, str, str | None, str | None]
 
 
+class TaskEditor(ModalScreen[tuple[str, bool] | None]):
+    BINDINGS = [Binding("escape", "dismiss", "Cancel")]
+
+    def __init__(self, goal: str) -> None:
+        super().__init__()
+        self.goal = goal
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="task-editor"):
+            yield Static("Worktree task goal")
+            yield Input(self.goal, id="task-goal", max_length=240, placeholder="What should this worktree deliver?")
+            with Horizontal(id="task-editor-actions"):
+                yield Button("Save", id="task-save", variant="primary")
+                if self.goal:
+                    yield Button("Save and bind here", id="task-bind")
+                yield Button("Cancel", id="task-cancel")
+
+    def on_mount(self) -> None:
+        self.query_one(Input).focus()
+
+    @on(Input.Submitted)
+    @on(Button.Pressed)
+    def submit(self, event: Input.Submitted | Button.Pressed) -> None:
+        event.stop()
+        button = event.button.id if isinstance(event, Button.Pressed) else None
+        if button == "task-cancel":
+            self.dismiss()
+        elif goal := self.query_one(Input).value.strip():
+            self.dismiss((goal, button == "task-bind"))
+
+
 class RepositoryScreen(ModalScreen[Evidence | None]):
     BINDINGS = [
-        Binding("escape", "dismiss", "Sessions"),
+        Binding("escape", "back", "Close review"),
         Binding("r", "refresh", "Refresh"),
         Binding("d", "view('files')", "Changes"),
         Binding("c", "view('checks')", "Checks"),
@@ -32,12 +68,22 @@ class RepositoryScreen(ModalScreen[Evidence | None]):
         Binding("h", "handoff", "Copy handoff"),
         Binding("o", "source", "Open trace"),
         Binding("x", "copy_check", "Copy check command"),
+        Binding("n", "edit_task", "Task"),
+        Binding("v", "run_check", "Run check"),
+        Binding("a", "task_agent", "Return to agent"),
+        Binding("f", "copy_repair", "Copy repair request"),
     ]
 
-    def __init__(self, root: Path, backend: Any) -> None:
+    def __init__(self, root: Path, backend: Any, *, pane: PaneReview | None = None,
+                 continue_task: bool = False) -> None:
         super().__init__()
         self.root = root
         self.backend = backend
+        self.pane = pane
+        self.continue_task = continue_task
+        self.resume_pending = continue_task
+        self._check_process: subprocess.Popen[bytes] | None = None
+        self.chosen_session: tuple[str, str] | None = None
         self.review: dict[str, Any] | None = None
         self.mode = "files"
         self.selection = 0
@@ -48,19 +94,28 @@ class RepositoryScreen(ModalScreen[Evidence | None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="repo-main"):
-            yield Static("Repository review", id="repo-heading")
+            yield Static("Continue task" if self.continue_task else "Repository review", id="repo-heading")
             yield Static(sane(str(self.root)), id="repo-location", markup=False)
+            if self.pane:
+                yield Static(sane(self.pane.pane_id), id="repo-context", markup=False)
             yield Static("Reading Git changes and check evidence…", id="repo-result", markup=False)
+            if self.continue_task:
+                yield Static("Reading saved task…", id="repo-task", markup=False)
             with Horizontal(id="repo-controls"):
                 yield Button("Changes", id="repo-files")
                 yield Button("Checks", id="repo-checks")
                 yield Button("History", id="repo-history")
-                yield Button("Sessions", id="repo-sessions")
+                if self.continue_task:
+                    yield Button("Task", id="repo-edit-task")
+                else:
+                    yield Button("Sessions", id="repo-sessions")
             with Vertical(id="repo-content"):
                 yield DataTable(id="repo-items", cursor_type="row")
                 yield TextArea(read_only=True, soft_wrap=False, show_line_numbers=False,
                                show_cursor=False, id="repo-detail", theme="css")
-            yield Static("Enter opens detail · o opens source trace · h copies handoff",
+            help_text = ("n edits task · v runs check · f copies repair request · a returns to agent"
+                         if self.continue_task else "Enter opens detail · o opens source trace · h copies handoff")
+            yield Static(help_text,
                          id="repo-help", markup=False)
         yield Footer()
 
@@ -71,6 +126,10 @@ class RepositoryScreen(ModalScreen[Evidence | None]):
         self.set_interval(5, self._poll)
 
     def _poll(self) -> None:
+        if self._check_process and self._check_process.poll() is not None:
+            if self._check_process.returncode == 2:
+                self.notify("Check could not verify this snapshot. See Checks for details.", severity="warning")
+            self._check_process = None
         if self._worker is None or self._worker.is_finished:
             self.action_refresh()
 
@@ -82,10 +141,20 @@ class RepositoryScreen(ModalScreen[Evidence | None]):
     async def _refresh(self, revision: int, *, session: str | None = None,
                        agent: str | None = None) -> None:
         try:
-            if self.review and session is None and self.review["session_selected"]:
+            if self.continue_task and session is None:
+                session, agent = self.chosen_session or (None, None)
+            elif self.pane and session is None:
+                session, agent = self.chosen_session or (self.pane.session_id, self.pane.agent)
+                if session is None:
+                    agent = None
+            elif self.review and session is None and self.review["session_selected"]:
                 selected = self.review["selected"]
                 session, agent = selected["session_id"], selected["adapter_id"]
-            review = await asyncio.to_thread(self.backend.repository, self.root, session, agent, self.from_turn)
+            options = {"auto_select_session": False, "allow_missing_session": True} if self.pane else {}
+            if self.continue_task:
+                options["include_task"] = True
+            review = await asyncio.to_thread(self.backend.repository, self.root, session, agent, self.from_turn,
+                                             **options)
         except Exception as exc:
             if revision == self.revision and self.is_mounted:
                 self.query_one("#repo-result", Static).update(sane(f"Review unavailable · {exc}"))
@@ -96,6 +165,23 @@ class RepositoryScreen(ModalScreen[Evidence | None]):
         self.review = review
         identity = " · ".join([self.root.name, review["branch"] or "detached", (review["head"] or "unborn")[:12]])
         self.query_one("#repo-location", Static).update(sane(identity))
+        if self.pane:
+            task = review.get("task")
+            source_pane, source_agent, source_session = (
+                (task["pane_id"], task["agent"], task["session_id"]) if task
+                else (self.pane.pane_id, self.pane.agent, self.pane.session_id))
+            source_label = " · ".join(part for part in (source_pane, source_agent) if part)
+            selected = review["selected"]
+            if selected:
+                binding = "Selected session" if self.chosen_session else ("Task session" if task else "Pane session")
+                message = f"{binding} · {selected['adapter_id']} · {selected['session_id'][-22:]}"
+            elif self.chosen_session or (source_session and (task or not self.continue_task)):
+                message = "Session unavailable in this worktree · choose in History (t)"
+            elif source_session:
+                message = "Pane session will be saved with the task"
+            else:
+                message = "No native session ID · choose in History (t)"
+            self.query_one("#repo-context", Static).update(sane(" · ".join(filter(None, (source_label, message)))))
         state = review["state"]
         color = {"failed": "#fda4af", "passed": "#86efac"}.get(state, "#ffd78a")
         text = f"{review['label']} · {len(review['files'])} changed files"
@@ -104,6 +190,25 @@ class RepositoryScreen(ModalScreen[Evidence | None]):
         if review["unavailable"] or review["policy_error"]:
             text += " · " + (review["unavailable"] or review["policy_error"])
         self.query_one("#repo-result", Static).update(Text(sane(text), style=color))
+        if self.continue_task:
+            task = review["task"]
+            step = task_review_state(review)
+            message = f"{task['goal']} · {NEXT_STEP[step]}" if task else "No saved task · press n to set a goal"
+            if task:
+                live_source = await asyncio.to_thread(task_source, self.root, task)
+                if revision != self.revision or not self.is_mounted:
+                    return
+                if live_source and live_source.status == "blocked":
+                    message = f"{task['goal']} · Agent is waiting · press a to return"
+            self.query_one("#repo-task", Static).update(sane(message))
+            if task and self.resume_pending:
+                self.resume_pending = False
+                if review["checks"]:
+                    self.mode = "checks"
+                    self.selection = next((i for i, check in enumerate(review["checks"])
+                                           if check["state"] == step), 0)
+                    self._populate()
+                    return
         if not unchanged:
             self._populate()
 
@@ -145,10 +250,13 @@ class RepositoryScreen(ModalScreen[Evidence | None]):
             "files": "Select a file and press Enter to see its diff." if items else "The worktree has no changes.",
             "checks": "Select a check and press Enter to see its recorded output." if items else
                       "Run agenttrace check NAME -- PROGRAM [ARG ...] to verify this code snapshot.",
-            "history": "Select a turn from the current session, or select another session below." if items else
-                       "No indexed sessions match this worktree. Refresh capture with agenttrace review --refresh.",
+            "history": ("Select a turn from the current session, or select another session below."
+                        if self.review and self.review["selected"] else "Select a session to see its history.")
+                       if items else "No indexed sessions match this worktree.",
         }
         self._detail(messages[self.mode])
+        if self.continue_task and self.mode == "checks" and items:
+            self._show_check(items[self.selection][1])
         table.focus()
 
     def _detail(self, value: str) -> None:
@@ -168,13 +276,7 @@ class RepositoryScreen(ModalScreen[Evidence | None]):
             self._detail("Reading diff…")
             self.run_worker(self._load_diff(item["path"]), group="repo-diff", exclusive=True, exit_on_error=False)
         elif self.mode == "checks":
-            self._detail(f"{item['name']} · {item['state']}\n"
-                         f"Run #{item.get('id') or '—'} · exit {item.get('exit_code')}\n"
-                         f"Snapshot {(item.get('fingerprint') or 'unavailable')[:12]}\n"
-                         f"{shlex.join(item.get('argv') or [])}\n\n"
-                         f"{item.get('output') or 'No recorded output.'}")
-            if item.get("adapter_id") and item.get("session_id"):
-                self.evidence = (item["adapter_id"], item["session_id"], item.get("trace_id"), None)
+            self._show_check(item)
         elif "turn" in item:
             turn = item["turn"]
             checks = turn["checks"]
@@ -190,10 +292,23 @@ class RepositoryScreen(ModalScreen[Evidence | None]):
         else:
             session = item["session"]
             self.from_turn = None
-            self.revision += 1
-            self._worker = self.run_worker(
-                self._refresh(self.revision, session=session["session_id"], agent=session["adapter_id"]),
-                group="repo-read", exclusive=True, exit_on_error=False)
+            if self.pane:
+                self.chosen_session = (session["session_id"], session["adapter_id"])
+                self.action_refresh()
+            else:
+                self.revision += 1
+                self._worker = self.run_worker(
+                    self._refresh(self.revision, session=session["session_id"], agent=session["adapter_id"]),
+                    group="repo-read", exclusive=True, exit_on_error=False)
+
+    def _show_check(self, check: dict[str, Any]) -> None:
+        self._detail(f"{check['name']} · {check['state']}\n"
+                     f"Run #{check.get('id') or '—'} · exit {check.get('exit_code')}\n"
+                     f"Snapshot {(check.get('fingerprint') or 'unavailable')[:12]}\n"
+                     f"{shlex.join(check.get('argv') or [])}\n\n"
+                     f"{check.get('output') or 'No recorded output.'}")
+        if check.get("adapter_id") and check.get("session_id"):
+            self.evidence = (check["adapter_id"], check["session_id"], check.get("trace_id"), None)
 
     async def _load_diff(self, path: str) -> None:
         version, row = self.revision, self.selection
@@ -209,6 +324,12 @@ class RepositoryScreen(ModalScreen[Evidence | None]):
     def action_source(self) -> None:
         if self.evidence:
             self.dismiss(self.evidence)
+
+    def action_back(self) -> None:
+        if self.pane:
+            self.app.exit()
+        else:
+            self.dismiss()
 
     def action_history_boundary(self) -> None:
         if self.mode != "history" or not self.evidence or not self.evidence[2]:
@@ -230,7 +351,10 @@ class RepositoryScreen(ModalScreen[Evidence | None]):
         if self.mode != "checks" or not 0 <= table.cursor_row < len(items):
             return
         check = items[table.cursor_row][1]
-        command = ["agenttrace", "check", "--repo", str(self.root), check["name"]]
+        command = ["agenttrace", "check", "--repo", str(self.root)]
+        if self.pane and self.review and (selected := self.review["selected"]):
+            command += ["--agent", selected["adapter_id"], "--session", selected["session_id"]]
+        command.append(check["name"])
         # Only copy the application command for configured checks. Captured
         # arguments can be redacted, incomplete or no longer appropriate.
         if not check["configured"]:
@@ -239,11 +363,99 @@ class RepositoryScreen(ModalScreen[Evidence | None]):
         self.app.copy_to_clipboard(shlex.join(command))
         self.notify("Check command copied")
 
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action in ("edit_task", "run_check", "task_agent", "copy_repair") and not self.continue_task:
+            return False
+        return super().check_action(action, parameters)
+
+    def action_edit_task(self) -> None:
+        if self.continue_task and self.review:
+            task = self.review["task"]
+            self.app.push_screen(TaskEditor(task["goal"] if task else ""), self._save_task)
+
+    async def _save_task(self, answer: tuple[str, bool] | None) -> None:
+        if not answer or not self.review or not self.pane:
+            return
+        goal, rebind = answer
+        task = self.review["task"]
+        if task and not rebind:
+            pane_id, terminal_id = task["pane_id"], task["terminal_id"]
+            agent, session = task["agent"], task["session_id"]
+        else:
+            session, agent = self.chosen_session or (self.pane.session_id, self.pane.agent)
+            pane_id, terminal_id = self.pane.pane_id, self.pane.terminal_id
+        try:
+            await asyncio.to_thread(self.backend.save_worktree_task, self.root, self.review["checkout"], goal,
+                                    pane_id=pane_id, terminal_id=terminal_id, agent=agent, session_id=session)
+        except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
+            self.notify(sane(str(exc)), severity="error")
+            return
+        self.notify("Task saved for this checkout")
+        self.resume_pending = True
+        self.action_refresh()
+
+    async def action_task_agent(self) -> None:
+        task = self.review.get("task") if self.review else None
+        if task and (source := await asyncio.to_thread(task_source, self.root, task)):
+            try:
+                await asyncio.to_thread(herdr_request, "agent", "focus", source.pane_id)
+            except ValueError as exc:
+                self.notify(str(exc), severity="warning")
+            else:
+                self.app.exit()
+        else:
+            self.notify("Source agent unavailable. Use History or bind this task to the current pane.",
+                        severity="warning")
+
+    def _selected_check(self) -> dict[str, Any] | None:
+        row = self.query_one(DataTable).cursor_row
+        checks = self.review["checks"] if self.review and self.mode == "checks" else []
+        return checks[row] if 0 <= row < len(checks) else None
+
+    def action_run_check(self) -> None:
+        check = self._selected_check()
+        if not self.continue_task or not self.review or not check or not check["configured"]:
+            self.notify("Select a check defined in .agenttrace-review.json", severity="warning")
+            return
+        if self._check_process and self._check_process.poll() is None:
+            self.notify("A check is already running", severity="warning")
+            return
+        command = [sys.executable, str(Path(__file__).with_name("agenttrace.py")), "check",
+                   "--db", str(self.backend.db.resolve()), "--repo", str(self.root)]
+        if selected := self.review["selected"]:
+            command += ["--agent", selected["adapter_id"], "--session", selected["session_id"]]
+        command.append(check["name"])
+        try:
+            self._check_process = subprocess.Popen(command, cwd=self.root, stdin=subprocess.DEVNULL,
+                                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                                    start_new_session=True)
+        except OSError as exc:
+            self.notify(sane(str(exc)), severity="error")
+            return
+        self.notify(f"Running {check['name']} · safe to close this popup")
+
+    def action_copy_repair(self) -> None:
+        check = self._selected_check()
+        task = self.review.get("task") if self.review else None
+        if task and check and check["state"] == "failed":
+            message = sane(
+                f"Continue this task: {task['goal']}\n"
+                f"Investigate the failed check {check['name']} (exit {check['exit_code']}).\n"
+                f"Command: {shlex.join(check.get('argv') or [])}\n"
+                f"Snapshot: {check['fingerprint']}\n\n{check.get('output') or 'No recorded output.'}")
+            self._detail(message)
+            self.app.copy_to_clipboard(message)
+            self.notify("Repair request copied")
+        else:
+            self.notify("Select a current failed check for this task", severity="warning")
+
     @on(Button.Pressed)
     def pressed(self, event: Button.Pressed) -> None:
         event.stop()
         mode = (event.button.id or "").removeprefix("repo-")
         if mode == "sessions":
             self.dismiss()
+        elif mode == "edit-task":
+            self.action_edit_task()
         elif mode in {"files", "checks", "history"}:
             self.action_view(mode)

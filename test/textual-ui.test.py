@@ -13,6 +13,7 @@ import tempfile
 import threading
 from typing import Any
 import unittest
+from unittest.mock import patch
 
 if importlib.util.find_spec("textual") is None:
     print("SKIP Textual UI: install requirements-tui.txt to run the optional dashboard tests")
@@ -21,10 +22,167 @@ if importlib.util.find_spec("textual") is None:
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "cli"), str(ROOT / "common")]
 from agenttrace_tui import BODY_LIMIT, NodeRef, TraceApp, body_text, readable_body, span_forest  # noqa: E402
+from herdr_review import PaneReview, pane_review  # noqa: E402
 from textual.widgets import Button, DataTable, Input, Select, Static, TabbedContent, TextArea, Tree  # noqa: E402
 
 
 class RepositoryUITests(unittest.IsolatedAsyncioTestCase):
+    async def test_waiting_agent_does_not_close_task_popup_until_requested(self):
+        from core.review_git import checkout_identity
+        from core.review_tasks import checkout_key, save_task
+        from core.storage.sqlite_store import TraceStore
+        from tui_data import LocalBackend
+        from tui_repository import RepositoryScreen
+
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
+            root = parent / "example"
+            root.mkdir()
+            subprocess.run(["git", "init", "-q", root], check=True)
+            source = PaneReview(root, "w99:p1", "codex", None, "fixture", "blocked")
+            store = TraceStore(parent / "review.db")
+            try:
+                save_task(store, root, checkout_key(*checkout_identity(root)), "Answer the agent",
+                          pane_id=source.pane_id, terminal_id=source.terminal_id,
+                          agent=source.agent, session_id=source.session_id)
+            finally:
+                store.close()
+            app = TraceApp(LocalBackend(store.path, [], index=False), repository=root, open_repository=True,
+                           herdr_target=source, continue_task=True)
+            with patch("tui_repository.task_source", return_value=source), patch("tui_repository.herdr_request") as api:
+                async with app.run_test(size=(92, 30)) as pilot:
+                    for _ in range(60):
+                        if isinstance(app.screen, RepositoryScreen) and "press a to return" in str(
+                                app.screen.query_one("#repo-task", Static).render()):
+                            break
+                        await pilot.pause(.1)
+                    self.assertTrue(app.is_running)
+                    self.assertIn("Agent is waiting", str(app.screen.query_one("#repo-task", Static).render()))
+                    api.assert_not_called()
+                    await pilot.press("a")
+                    api.assert_called_once_with("agent", "focus", "w99:p1")
+                    self.assertFalse(app.is_running)
+
+    async def test_task_resumes_failed_check_then_reruns_after_worktree_change(self):
+        from core.repo_review import record_check, repository_review
+        from core.storage.sqlite_store import TraceStore
+        from tui_data import LocalBackend
+        from tui_repository import RepositoryScreen
+
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
+            root = parent / "example"
+            root.mkdir()
+            subprocess.run(["git", "init", "-q", root], check=True)
+            source = root / "example.txt"
+            source.write_text("broken")
+            command = [sys.executable, "-c",
+                       "from pathlib import Path; assert Path('example.txt').read_text() == 'fixed', 'repair needed'"]
+            (root / ".agenttrace-review.json").write_text(json.dumps({"checks": {"test": command}}))
+            store = TraceStore(parent / "review.db")
+            self.addCleanup(store.close)
+
+            async def wait_for(pilot, condition):
+                for _ in range(60):
+                    if condition():
+                        return
+                    await pilot.pause(.1)
+                self.fail("The task did not reach its expected state")
+
+            def make_app(pane):
+                return TraceApp(LocalBackend(store.path, [], index=False), repository=root, open_repository=True,
+                                herdr_target=PaneReview(root, pane, "codex", None, "fixture-terminal"),
+                                continue_task=True)
+
+            with patch("tui_repository.task_source", return_value=None):
+                app = make_app("w99:p1")
+                async with app.run_test(size=(92, 30)) as pilot:
+                    await wait_for(pilot, lambda: isinstance(app.screen, RepositoryScreen) and app.screen.review)
+                    await pilot.press("n")
+                    app.screen.query_one("#task-goal", Input).value = "Repair example validation"
+                    await pilot.press("enter")
+                    await wait_for(pilot, lambda: isinstance(app.screen, RepositoryScreen) and app.screen.review["task"])
+                    self.assertEqual(app.screen.review["task"]["pane_id"], "w99:p1")
+                    await pilot.press("escape")
+                self.assertEqual(record_check(store, root, "test", [])["state"], "failed")
+
+                app = make_app("w99:p2")
+                async with app.run_test(size=(92, 30)) as pilot:
+                    await wait_for(pilot, lambda: isinstance(app.screen, RepositoryScreen)
+                                   and "repair needed" in app.screen.query_one(TextArea).text)
+                    screen = app.screen
+                    self.assertEqual(screen.review["task"]["pane_id"], "w99:p1")
+                    self.assertIn("Repair example validation", str(screen.query_one("#repo-task", Static).render()))
+                    source.write_text("fixed")
+                    await pilot.press("r")
+                    await wait_for(pilot, lambda: screen.review["state"] == "stale")
+                    self.assertIn("Rerun checks", str(screen.query_one("#repo-task", Static).render()))
+                    await pilot.press("v", "escape")
+                    self.assertFalse(app.is_running)
+                for _ in range(60):
+                    if repository_review(store, root)["state"] == "passed":
+                        break
+                    await asyncio.sleep(.1)
+                self.assertEqual(repository_review(store, root)["state"], "passed")
+                ref = subprocess.check_output(["git", "symbolic-ref", "HEAD"], cwd=root, text=True).strip()
+                subprocess.run(["git", "symbolic-ref", "HEAD", "refs/heads/other"], cwd=root, check=True)
+                self.assertIsNone(repository_review(store, root, include_task=True)["task"])
+                subprocess.run(["git", "symbolic-ref", "HEAD", ref], cwd=root, check=True)
+                self.assertEqual(repository_review(store, root, include_task=True)["task"]["goal"],
+                                 "Repair example validation")
+
+    async def test_herdr_uses_only_the_pane_session_until_a_session_is_selected(self):
+        from core.storage.sqlite_store import TraceStore
+        from tui_data import LocalBackend
+        from tui_repository import RepositoryScreen
+
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
+            root = parent / "example"
+            root.mkdir()
+            subprocess.run(["git", "init", "-q", root], check=True)
+            (root / "example.txt").write_text("working copy\n")
+            store = TraceStore(parent / "review.db")
+            try:
+                with store.transaction():
+                    store._conn().executemany(
+                        "INSERT INTO sessions(session_id, adapter_id, cwd, first_ts, last_ts) VALUES (?, ?, ?, ?, ?)",
+                        [
+                            ("newer", "codex", str(root), "2026-01-02", "2026-01-02"),
+                            ("exact", "codex", str(root), "2026-01-01", "2026-01-01"),
+                            ("other", "codex", str(parent), "2026-01-03", "2026-01-03"),
+                        ],
+                    )
+            finally:
+                store.close()
+
+            for native in ("exact", None, "syncing", "other"):
+                with self.subTest(native=native):
+                    target = PaneReview(root, "w6:p1", "codex", native)
+                    app = TraceApp(LocalBackend(store.path, [], index=False), repository=root,
+                                   open_repository=True, herdr_target=target)
+                    async with app.run_test(size=(82, 24)) as pilot:
+                        for _ in range(60):
+                            if isinstance(app.screen, RepositoryScreen) and app.screen.review:
+                                break
+                            await pilot.pause(.1)
+                        self.assertIsInstance(screen := app.screen, RepositoryScreen)
+                        self.assertIsNotNone(screen.review)
+                        selected = screen.review["selected"]
+                        self.assertEqual(selected["session_id"] if selected else None,
+                                         native if native == "exact" else None)
+                        self.assertEqual(screen.review["files"][0]["path"], "example.txt")
+                        self.assertIn("Pane session" if native == "exact" else "choose in History",
+                                      str(screen.query_one("#repo-context", Static).render()))
+                        await pilot.press("t", "enter")
+                        for _ in range(60):
+                            if screen.review["selected"] and screen.review["selected"]["session_id"] == "newer":
+                                break
+                            await pilot.pause(.1)
+                        self.assertEqual(screen.review["selected"]["session_id"], "newer")
+                        await pilot.press("escape")
+                        self.assertFalse(app.is_running)
+
     async def test_open_diff_and_refresh_check_after_worktree_edit(self):
         from core.repo_review import record_check
         from core.storage.sqlite_store import TraceStore
@@ -67,6 +225,36 @@ class RepositoryUITests(unittest.IsolatedAsyncioTestCase):
                 await wait_for(lambda: "out of date" in str(screen.query_one("#repo-result", Static).render()))
                 await pilot.press("escape", "w")
                 self.assertIsInstance(app.screen, RepositoryScreen)
+
+
+class HerdrPaneTests(unittest.TestCase):
+    def test_popup_prefers_source_pane_and_foreground_worktree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            subprocess.run(["git", "init", "-q", root], check=True)
+            child = root / "src"
+            child.mkdir()
+            pane = {"pane_id": "w6:p1", "foreground_cwd": str(child), "cwd": "/", "agent": "pi"}
+            expected = str(root / "session.jsonl")
+            env = {"HERDR_ACTIVE_PANE_ID": "w6:p1", "HERDR_PANE_ID": "w3:p2", "HERDR_BIN_PATH": "/bin/herdr"}
+            real_run = subprocess.run
+            for ref, session in [
+                ({"agent": "pi", "kind": "path", "value": expected}, expected),
+                ({"agent": "pi", "kind": "id", "value": "guessed"}, None),
+                ({"agent": "codex", "kind": "id", "value": "stale"}, None),
+                (None, None),
+            ]:
+                with self.subTest(ref=ref):
+                    pane["agent_session"] = ref
+
+                    def run(command, **kwargs):
+                        if command[0] == "/bin/herdr":
+                            self.assertEqual(command, ["/bin/herdr", "pane", "get", "w6:p1"])
+                            return subprocess.CompletedProcess(command, 0, json.dumps({"result": {"pane": pane}}))
+                        return real_run(command, **kwargs)
+
+                    with patch.dict(os.environ, env), patch("herdr_review.subprocess.run", side_effect=run):
+                        self.assertEqual(pane_review(), PaneReview(root, "w6:p1", "pi", session))
 
 
 class PaginatedBackend:

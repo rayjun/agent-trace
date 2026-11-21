@@ -15,6 +15,7 @@ from typing import Any, BinaryIO
 from core import query
 from core.review import _informational, _snapshot, session_history
 from core.review_git import GitReviewError, Worktree, file_diff, worktree, worktree_status
+from core.review_tasks import checkout_key, worktree_task
 from core.schema.model import now_iso
 from core.storage.sqlite_store import TraceStore
 from core.workspace import _common
@@ -81,12 +82,16 @@ def _related_sessions(store: TraceStore, root: Path, *, agent: str | None,
     )]
 
 
+class WorktreeSessionUnavailable(ValueError):
+    """The requested session is missing or belongs to another worktree."""
+
+
 def _session(store: TraceStore, root: Path, sid: str, agent: str | None) -> dict[str, Any]:
     adapter = query._session_agent(store, sid, agent)
     row = store.one("SELECT adapter_id, session_id, cwd, last_ts FROM sessions WHERE adapter_id=? AND session_id=?",
                     (adapter, sid))
     if row is None or not row["cwd"] or not Path(row["cwd"]).resolve().is_relative_to(root):
-        raise ValueError("Choose an indexed session from this worktree")
+        raise WorktreeSessionUnavailable("Choose an indexed session from this worktree")
     return dict(row)
 
 
@@ -142,7 +147,8 @@ def _public_argv(argv: list[str]) -> list[str]:
 
 def repository_review(store: TraceStore, root: Path, *, required: list[str] | None = None,
                       session: str | None = None, agent: str | None = None,
-                      from_turn: str | None = None) -> dict[str, Any]:
+                      from_turn: str | None = None, auto_select_session: bool = True,
+                      allow_missing_session: bool = False, include_task: bool = False) -> dict[str, Any]:
     policy_error = None
     try:
         expected = _configuration(root)
@@ -160,16 +166,29 @@ def repository_review(store: TraceStore, root: Path, *, required: list[str] | No
         raise ValueError("Choose a session before selecting its starting turn")
     with _snapshot(store):
         checks, state = _evidence(store, tree, expected, required or [])
+        checkout = checkout_key(tree.branch, tree.head)
+        task = worktree_task(store, tree.root, checkout) if include_task else None
+        if task and session is None and task["session_id"]:
+            session, agent = task["session_id"], task["agent"]
         sessions = _related_sessions(store, tree.root, agent=agent if session is None else None)
-        selected = _session(store, tree.root, session, agent) if session is not None else (
-            sessions[0] if sessions else None)
+        selected = sessions[0] if session is None and auto_select_session and sessions else None
+        if session is not None:
+            try:
+                selected = _session(store, tree.root, session, agent)
+            except WorktreeSessionUnavailable:
+                if not allow_missing_session:
+                    raise
         history = session_history(store, selected["session_id"], agent=selected["adapter_id"],
                                   from_turn=from_turn) if selected else {"turns": [], "total": 0, "limited": False}
     if policy_error and state != "failed":
         state = "unknown"
-    return {"kind": "repository", **asdict(tree), "root": str(tree.root), "state": state,
-            "label": LABEL[state], "checks": checks, "sessions": sessions, "selected": selected,
-            "history": history, "session_selected": session is not None, "policy_error": policy_error}
+    review = {"kind": "repository", **asdict(tree), "root": str(tree.root), "state": state,
+              "label": LABEL[state], "checks": checks, "sessions": sessions, "selected": selected,
+              "history": history, "session_selected": session is not None and selected is not None,
+              "policy_error": policy_error}
+    if include_task:
+        review.update(task=task, checkout=checkout)
+    return review
 
 
 def _process(argv: list[str], root: Path, output: bytearray, terminal: BinaryIO | None) -> int:

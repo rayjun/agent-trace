@@ -41,6 +41,14 @@ def repository_root(cwd: Path) -> Path | None:
     return Path(os.fsdecode(root)).resolve()
 
 
+def checkout_identity(root: Path) -> tuple[str | None, str | None]:
+    branch = _git(root, "symbolic-ref", "--quiet", "--short", "HEAD", allowed=(0, 1))
+    if branch:
+        return branch.decode(errors="replace").strip(), None
+    head = _git(root, "rev-parse", "--verify", "HEAD", allowed=(0, 128)).strip()
+    return None, head.decode() if head else None
+
+
 def _entries(root: Path) -> tuple[bytes, bytes, bytes]:
     head = _git(root, "rev-parse", "--verify", "HEAD", allowed=(0, 128)).strip()
     index = _git(root, "ls-files", "--stage", "-z")

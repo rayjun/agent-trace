@@ -103,10 +103,15 @@ Screen.narrow #work-summary { height: 5; }
 RepositoryScreen { background: #101722; }
 #repo-main { height: 1fr; padding: 0 1; }
 #repo-heading { height: 1; color: #7dd3fc; text-style: bold; }
-#repo-location, #repo-result, #repo-help { height: auto; max-height: 2; }
-#repo-location, #repo-help { color: #a5b4c9; }
+#repo-location, #repo-context, #repo-result, #repo-help, #repo-task { height: auto; max-height: 2; }
+#repo-location, #repo-context, #repo-help { color: #a5b4c9; }
+#repo-task { color: #b6a0fa; text-style: bold; }
 #repo-controls { height: 3; margin: 1 0; }
 #repo-controls Button { min-width: 11; margin-right: 1; }
 #repo-content { height: 1fr; }
 #repo-items { height: 2fr; border: round #374966; }
 #repo-detail { height: 3fr; border: round #374966; }
+TaskEditor { align: center middle; background: #0a101a 65%; }
+#task-editor { width: 75%; min-width: 34; height: auto; padding: 1 2; background: #151b28; border: round #b6a0fa; }
+#task-editor-actions { height: 3; margin-top: 1; }
+#task-editor-actions Button { margin-right: 1; }

@@ -52,6 +52,59 @@ agenttrace review --repo . --session ID --agent codex --from-turn TRACE_ID --mar
 Codex 直接读原生日志，无需安装采集 hook。Hermes、Pi 可安装对应适配器。执行树、指标和
 评估仍可用于深入排查。设计取舍见 [产品决策](docs/decisions.md)。
 
+### 在 Herdr 中复核
+
+用 `./install.sh cli` 安装 CLI，并安装 `requirements-tui.txt` 中的 Textual 依赖。
+把这段[弹窗配置](https://herdr.dev/tui/docs/configuration/#custom-command-keybindings)
+放入 `~/.config/herdr/config.toml`，然后运行 `herdr server reload-config`。
+
+```toml
+[[keys.command]]
+key = "prefix+alt+r"
+type = "popup"
+command = "exec agenttrace herdr review"
+description = "Review the active pane's worktree"
+width = "90%"
+height = "85%"
+```
+
+在 agent pane 里按 Herdr 前缀键（默认为 Ctrl+B），再按 Alt+R。弹窗显示该 pane
+所在工作树的 Git diff 和当前快照的检查状态。Herdr 提供原生会话 ID 且索引能在本工作树
+找到它时，History 会定位到该会话。否则按 `t` 选择一条已索引的会话。
+在复核页按 Esc，或在弹窗内按 Ctrl+Q，即可回到原 pane。
+也可以在 Herdr shell 中直接执行 `agenttrace herdr review`。
+
+#### 继续工作树任务
+
+打开 `agenttrace herdr continue` 后按 `n` 保存任务目标。切换到同一工作树的另一个
+pane 或重新启动后，可以接着处理。用 **Save and bind here** 将已有任务交给当前 Agent。
+存在原生会话 ID 时，会定位到对应会话的历史。来源 Agent 在等待回复时，弹窗会提示按
+`a` 回到它的 pane。
+有检查记录时，弹窗会打开相关检查及其输出。按 `v` 在后台运行选中的已配置检查，
+按 `f` 复制当前失败的修复请求，按 `a` 回到来源 Agent。
+
+将下面的配置合入 Herdr 后，按 Ctrl+B 再按 Alt+T 继续任务。已有 `tab_bar_right`
+配置时，把命令项追加到列表，再将任务字段加到现有侧栏行。
+
+```toml
+[ui]
+tab_bar_right = [{ type = "command", command = "agenttrace herdr task-status", interval_seconds = 12, timeout_seconds = 8 }]
+
+[ui.sidebar.spaces]
+rows = [["state_icon", "workspace"], ["branch", "git_status"], ["$review_goal"], ["$review_step"]]
+
+[[keys.command]]
+key = "prefix+alt+t"
+type = "popup"
+command = "exec agenttrace herdr continue"
+description = "Continue the active worktree task"
+width = "90%"
+height = "85%"
+```
+
+侧栏定期刷新已打开的工作树，检查记录在代码变更后会显示为过期。若为 `continue`
+指定了自定义数据库，`task-status` 也要使用同一路径。
+
 ## 架构
 
 ```mermaid

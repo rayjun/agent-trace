@@ -24,6 +24,7 @@ from textual.widgets.tree import TreeNode
 
 from panel.text import sane
 from agenttrace_common import flatten_content
+from herdr_review import PaneReview
 from tui_data import PAGE_SIZE, LocalBackend, SessionKey
 from tui_repository import Evidence, RepositoryScreen
 
@@ -206,7 +207,7 @@ class TraceApp(App):
 
     def get_driver_class(self) -> type[Driver]:
         driver = super().get_driver_class()
-        if os.environ.get("HERDR_ENV") == "1":
+        if self.herdr_target or os.environ.get("HERDR_ENV") == "1":
             from textual.drivers.linux_driver import LinuxDriver
             if driver is LinuxDriver:
                 from tui_terminal import HerdrDriver
@@ -215,12 +216,15 @@ class TraceApp(App):
 
     def __init__(self, backend: Any, *, agent: str | None = None,
                  session: str | None = None, interval: float = 2.5,
-                 repository: Path | None = None, open_repository: bool = False) -> None:
+                 repository: Path | None = None, open_repository: bool = False,
+                 herdr_target: PaneReview | None = None, continue_task: bool = False) -> None:
+        self.herdr_target = herdr_target
         super().__init__()
         self.backend = backend
         self.interval = interval
         self.repository_root = repository
         self.open_repository = open_repository
+        self.continue_task = continue_task
         self.agent_filter = agent
         self.initial_session = session
         self.live = True
@@ -932,7 +936,9 @@ class TraceApp(App):
     def action_repository(self) -> None:
         if self.repository_root is None or not self.ready:
             return
-        self.push_screen(RepositoryScreen(self.repository_root, self.backend), self._repository_source)
+        self.push_screen(RepositoryScreen(self.repository_root, self.backend, pane=self.herdr_target,
+                                          continue_task=self.continue_task),
+                         self._repository_source)
 
     def _repository_source(self, source: Evidence | None) -> None:
         if source is None:
@@ -1024,5 +1030,6 @@ def run(args: Any) -> int:
         return 2
     open_repo = not args.archive and (args.repo is not None or not any((args.session, args.agent, args.no_index)))
     TraceApp(backend, agent=args.agent, session=args.session, interval=args.interval,
-             repository=root, open_repository=open_repo).run()
+             repository=root, open_repository=open_repo, herdr_target=getattr(args, "herdr_target", None),
+             continue_task=getattr(args, "herdr_cmd", None) == "continue").run()
     return 0

@@ -586,6 +586,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_tui.add_argument("--no-index", action="store_true", help="browse the existing index without scanning source files")
     _dirs(p_tui)
 
+    p_herdr = sub.add_parser("herdr", help="open worktree review for a Herdr pane")
+    herdr_sub = p_herdr.add_subparsers(dest="herdr_cmd", required=True)
+    for name, help_text in (("review", "review the active pane's Git worktree"),
+                            ("continue", "continue the saved task in the active pane's worktree")):
+        p_herdr_view = herdr_sub.add_parser(name, help=help_text)
+        p_herdr_view.add_argument("--pane", help="Herdr pane ID (default: the source pane)")
+        p_herdr_view.add_argument("--db", type=Path, default=None)
+        p_herdr_view.add_argument("--interval", type=float, default=2.5, help="refresh interval in seconds")
+        p_herdr_view.add_argument("--no-index", action="store_true", help="use the existing trace index")
+        _dirs(p_herdr_view)
+    p_herdr_status = herdr_sub.add_parser("task-status", help="refresh saved task status in the Herdr sidebar")
+    p_herdr_status.add_argument("--db", type=Path, default=None)
+
     # Platform commands (M2): no shared record filters — they operate on the
     # store, not on raw v1 records.
     p_serve = sub.add_parser("serve", help="local dashboard: indexer + HTTP API + web UI")
@@ -1367,15 +1380,22 @@ def cmd_tui(args) -> int:
         root = Path(__file__).resolve().parent.parent
         runner = root / ".venv" / "bin" / "python"
         if runner.is_file() and Path(sys.prefix).resolve() != runner.parent.parent.resolve():
-            command = [str(runner), str(root / "cli" / "agenttrace.py"), "tui",
-                       "--interval", str(args.interval)]
-            for name in ("db", "agent", "session", "repo"):
+            command = [str(runner), str(root / "cli" / "agenttrace.py")]
+            options: tuple[str, ...]
+            if args.cmd == "herdr":
+                command += ["herdr", args.herdr_cmd, "--pane", args.pane]
+                options = ("db",)
+            else:
+                command += ["tui"]
+                options = ("db", "agent", "session", "repo")
+            command += ["--interval", str(args.interval)]
+            for name in options:
                 value = getattr(args, name, None)
                 if value is not None:
                     command += ["--" + name, str(value)]
             if args.no_index:
                 command.append("--no-index")
-            if args.archive:
+            if getattr(args, "archive", False):
                 command.append("--archive")
             command += [str(d) for d in args.dirs]
             return subprocess.call(command)
@@ -1385,6 +1405,36 @@ def cmd_tui(args) -> int:
               "Then run: .venv/bin/python cli/agenttrace.py tui", file=sys.stderr)
         return 1
     return run(args)
+
+
+def cmd_herdr(args) -> int:
+    from herdr_review import pane_review, publish_tasks
+
+    if args.herdr_cmd == "task-status":
+        db = args.db or Path(os.environ.get("AGENTTRACE_DB") or common.platform_dir() / "agenttrace.db")
+        try:
+            publish_tasks(db.expanduser())
+        except (OSError, ValueError, RuntimeError) as exc:
+            print(exc, file=sys.stderr)
+            return 2
+        return 0
+
+    try:
+        args.herdr_target = pane_review(args.pane)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        if os.environ.get("HERDR_ACTIVE_PANE_ID") and sys.stdin.isatty():
+            print("Press Enter to close this popup.", file=sys.stderr)
+            try:
+                sys.stdin.readline()
+            except KeyboardInterrupt:
+                pass
+        return 2
+    args.pane = args.herdr_target.pane_id
+    args.repo = args.herdr_target.root
+    args.agent = args.session = None
+    args.archive = False
+    return cmd_tui(args)
 
 
 def main(argv=None) -> int:
@@ -1404,9 +1454,11 @@ def main(argv=None) -> int:
             setattr(args, k, v)
     # `adapter list` / `adapter test` do not take trace dirs; only the
     # commands that scan traces declare them.
+    if args.cmd == "herdr" and args.herdr_cmd == "task-status":
+        return cmd_herdr(args)
     if not getattr(args, "dirs", None):
         args.dirs = default_trace_dirs()
-        if args.cmd == "tui" or (args.cmd == "review" and args.refresh):
+        if args.cmd in ("herdr", "tui") or (args.cmd == "review" and args.refresh):
             from tui_sources import codex_trace_dir
             # Keep a not-yet-created capture directory in the scan set. The
             # first native session can then appear without restarting the UI.
@@ -1422,7 +1474,7 @@ def main(argv=None) -> int:
         "serve": cmd_serve, "index": cmd_index, "doctor": cmd_doctor,
         "adapter": cmd_adapter, "otlp": cmd_otlp, "report": cmd_report, "review": cmd_review,
         "session": cmd_session, "check": cmd_check,
-        "tui": cmd_tui,
+        "tui": cmd_tui, "herdr": cmd_herdr,
     }[args.cmd](args)
 
 

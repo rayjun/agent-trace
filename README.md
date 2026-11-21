@@ -63,6 +63,64 @@ Codex reads native rollouts without capture hooks. Install the matching adapter
 for Hermes or Pi. Trace inspection, metrics, datasets and evaluation remain
 available for deeper investigation. See [the product decisions](docs/decisions.md).
 
+### Review from Herdr
+
+Install the CLI with `./install.sh cli` and the Textual dependencies from
+`requirements-tui.txt`. Add this [popup binding](https://herdr.dev/tui/docs/configuration/#custom-command-keybindings)
+to `~/.config/herdr/config.toml`, then run `herdr server reload-config`.
+
+```toml
+[[keys.command]]
+key = "prefix+alt+r"
+type = "popup"
+command = "exec agenttrace herdr review"
+description = "Review the active pane's worktree"
+width = "90%"
+height = "85%"
+```
+
+Press the Herdr prefix (usually Ctrl+B), then Alt+R, from an agent pane. The
+popup shows the pane's Git diff and the checks for the current snapshot. If Herdr
+reports a native session ID that agent-trace can find in this worktree, History
+opens on that session. Otherwise, press `t` and select an indexed session.
+Press Esc from the review or Ctrl+Q anywhere in the popup to return to the pane.
+Run `agenttrace herdr review` inside a Herdr shell for the same view in place.
+
+#### Continue a worktree task
+
+Use `agenttrace herdr continue` to save a goal for the current checkout and
+resume it later, including from another pane. Press `n` to enter or edit the
+goal. **Save and bind here** attaches the task to the current agent. The
+saved session is used when available. If the source agent is blocked, the
+popup tells you to press `a` to return to its pane.
+With review evidence, the popup opens the relevant check and its output.
+Press `v` on a configured check to run it in the background, `f` to copy a
+repair request from a current failure, or `a` to return to the source agent.
+
+To make the task available from Herdr and show its next step in the sidebar,
+merge these entries into your Herdr config. Append the command entry to any
+existing `tab_bar_right` list and include the task tokens in your sidebar rows.
+
+```toml
+[ui]
+tab_bar_right = [{ type = "command", command = "agenttrace herdr task-status", interval_seconds = 12, timeout_seconds = 8 }]
+
+[ui.sidebar.spaces]
+rows = [["state_icon", "workspace"], ["branch", "git_status"], ["$review_goal"], ["$review_step"]]
+
+[[keys.command]]
+key = "prefix+alt+t"
+type = "popup"
+command = "exec agenttrace herdr continue"
+description = "Continue the active worktree task"
+width = "90%"
+height = "85%"
+```
+
+The sidebar refreshes tasks for open worktrees and rechecks whether recorded
+results match the current code. A custom database passed to `continue` also
+needs to be passed to `task-status`.
+
 ## Architecture
 
 ```mermaid

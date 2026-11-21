@@ -64,6 +64,18 @@ CREATE TABLE IF NOT EXISTS review_check_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_review_check_root ON review_check_runs (root, name, id DESC);
 
+-- User-authored task context outlives the terminal and trace index rebuilds.
+CREATE TABLE IF NOT EXISTS worktree_tasks (
+  root TEXT NOT NULL,
+  checkout TEXT NOT NULL,
+  goal TEXT NOT NULL,
+  pane_id TEXT,
+  terminal_id TEXT,
+  agent TEXT,
+  session_id TEXT,
+  PRIMARY KEY (root, checkout)
+);
+
 -- Durable redo queue: archive commits never leave an unrecorded projection gap.
 CREATE TABLE IF NOT EXISTS projection_pending (
   event_id TEXT PRIMARY KEY
