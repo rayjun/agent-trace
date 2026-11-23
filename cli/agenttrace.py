@@ -586,6 +586,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_tui.add_argument("--no-index", action="store_true", help="browse the existing index without scanning source files")
     _dirs(p_tui)
 
+    p_work = sub.add_parser("work", help="open the current worktree task and its next action")
+    p_work.add_argument("--repo", type=Path, default=None, help="open a specified Git worktree")
+    p_work.add_argument("--db", type=Path, default=None)
+    p_work.add_argument("--interval", type=float, default=2.5, help="refresh interval in seconds")
+    p_work.add_argument("--no-index", action="store_true", help="use the existing trace index")
+    p_work.set_defaults(archive=False)
+    _dirs(p_work)
+
     p_herdr = sub.add_parser("herdr", help="open worktree review for a Herdr pane")
     herdr_sub = p_herdr.add_subparsers(dest="herdr_cmd", required=True)
     for name, help_text in (("review", "review the active pane's Git worktree"),
@@ -1386,8 +1394,8 @@ def cmd_tui(args) -> int:
                 command += ["herdr", args.herdr_cmd, "--pane", args.pane]
                 options = ("db",)
             else:
-                command += ["tui"]
-                options = ("db", "agent", "session", "repo")
+                command += [args.cmd]
+                options = ("db", "repo") if args.cmd == "work" else ("db", "agent", "session", "repo")
             command += ["--interval", str(args.interval)]
             for name in options:
                 value = getattr(args, name, None)
@@ -1458,7 +1466,7 @@ def main(argv=None) -> int:
         return cmd_herdr(args)
     if not getattr(args, "dirs", None):
         args.dirs = default_trace_dirs()
-        if args.cmd in ("herdr", "tui") or (args.cmd == "review" and args.refresh):
+        if args.cmd in ("herdr", "tui", "work") or (args.cmd == "review" and args.refresh):
             from tui_sources import codex_trace_dir
             # Keep a not-yet-created capture directory in the scan set. The
             # first native session can then appear without restarting the UI.
@@ -1474,7 +1482,7 @@ def main(argv=None) -> int:
         "serve": cmd_serve, "index": cmd_index, "doctor": cmd_doctor,
         "adapter": cmd_adapter, "otlp": cmd_otlp, "report": cmd_report, "review": cmd_review,
         "session": cmd_session, "check": cmd_check,
-        "tui": cmd_tui, "herdr": cmd_herdr,
+        "tui": cmd_tui, "work": cmd_tui, "herdr": cmd_herdr,
     }[args.cmd](args)
 
 

@@ -1025,11 +1025,13 @@ def run(args: Any) -> int:
     backend = LocalBackend(db.expanduser(), args.dirs, index=not args.no_index,
                            interval=args.interval, capture=True)
     root = repository_root((args.repo or Path.cwd()).expanduser())
-    if args.repo and root is None:
-        print("--repo requires a Git worktree")
+    task_view = getattr(args, "cmd", None) == "work" or getattr(args, "herdr_cmd", None) == "continue"
+    if (args.repo or task_view) and root is None:
+        print("A Git worktree is required")
         return 2
-    open_repo = not args.archive and (args.repo is not None or not any((args.session, args.agent, args.no_index)))
+    open_repo = task_view or (not args.archive and
+                              (args.repo is not None or not any((args.session, args.agent, args.no_index))))
     TraceApp(backend, agent=args.agent, session=args.session, interval=args.interval,
              repository=root, open_repository=open_repo, herdr_target=getattr(args, "herdr_target", None),
-             continue_task=getattr(args, "herdr_cmd", None) == "continue").run()
+             continue_task=task_view).run()
     return 0

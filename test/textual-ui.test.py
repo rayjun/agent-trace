@@ -27,6 +27,93 @@ from textual.widgets import Button, DataTable, Input, Select, Static, TabbedCont
 
 
 class RepositoryUITests(unittest.IsolatedAsyncioTestCase):
+    async def test_repair_preview_sends_once_and_rechecks_snapshot_and_agent(self):
+        from dataclasses import replace
+        from core.repo_review import record_check
+        from core.review_git import checkout_identity
+        from core.review_tasks import checkout_key, save_task
+        from core.storage.sqlite_store import TraceStore
+        from tui_data import LocalBackend
+        from tui_repository import RepairDialog, RepositoryScreen
+
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
+            root = parent / "example"
+            root.mkdir()
+            subprocess.run(["git", "init", "-q", root], check=True)
+            file = root / "example.txt"
+            file.write_text("broken")
+            source = PaneReview(root, "w99:p1", "codex", "source-session", "fixture", "idle")
+            store = TraceStore(parent / "review.db")
+            try:
+                save_task(store, root, checkout_key(*checkout_identity(root)), "Repair the preview harness",
+                          pane_id=source.pane_id, terminal_id=source.terminal_id,
+                          agent=source.agent, session_id=source.session_id)
+                check = record_check(store, root, "test", [sys.executable, "-c", "raise SystemExit(1)"])
+                self.assertEqual(check["state"], "failed")
+            finally:
+                store.close()
+            opener = replace(source, pane_id="w99:p2", session_id="different-session")
+            app = TraceApp(LocalBackend(store.path, [], index=False), repository=root, open_repository=True,
+                           herdr_target=opener, continue_task=True)
+            with (
+                patch("tui_repository.task_source", return_value=source) as find_source,
+                patch("tui_repository.herdr_request") as api,
+            ):
+                async with app.run_test(size=(100, 32)) as pilot:
+                    for _ in range(60):
+                        if isinstance(app.screen, RepositoryScreen) and not app.screen.query_one("#repo-next", Button).disabled:
+                            break
+                        await pilot.pause(.1)
+                    await pilot.click("#repo-next")
+
+                    async def preview():
+                        await pilot.press("f")
+                        self.assertIsInstance(dialog := app.screen, RepairDialog)
+                        return dialog
+
+                    dialog = await preview()
+                    self.assertIn("w99:p1", str(dialog.query_one("#repair-status", Static).render()))
+                    message = dialog.query_one("#repair-message", TextArea).text
+                    self.assertIn("Repair the preview harness", message)
+                    await pilot.press("escape")
+                    api.assert_not_called()
+
+                    dialog = await preview()
+                    file.write_text("changed")
+                    await pilot.click("#repair-send")
+                    self.assertIn("failed check changed", str(dialog.query_one("#repair-status", Static).render()))
+                    api.assert_not_called()
+                    file.write_text("broken")
+                    await pilot.press("escape")
+
+                    dialog = await preview()
+                    find_source.return_value = replace(source, session_id="new-session")
+                    await pilot.click("#repair-send")
+                    self.assertIn("source agent changed", str(dialog.query_one("#repair-status", Static).render()))
+                    api.assert_not_called()
+                    await pilot.press("escape")
+
+                    find_source.return_value = replace(source, status="blocked")
+                    dialog = await preview()
+                    self.assertTrue(dialog.query_one("#repair-send", Button).disabled)
+                    self.assertFalse(dialog.query_one("#repair-copy", Button).disabled)
+                    await pilot.press("escape")
+
+                    find_source.return_value = source
+                    dialog = await preview()
+                    await pilot.click("#repair-send")
+                    api.assert_called_once_with("agent", "prompt", "w99:p1", message)
+                    self.assertTrue(dialog.query_one("#repair-send", Button).disabled)
+                    self.assertIn("Sent to w99:p1", str(dialog.query_one("#repair-status", Static).render()))
+                    await pilot.press("escape", "g")
+                    for _ in range(60):
+                        if "Repair request sent" in app.screen.query_one("#repo-detail", TextArea).text:
+                            break
+                        await pilot.pause(.1)
+                    self.assertIn("Repair request sent", app.screen.query_one("#repo-detail", TextArea).text)
+                    self.assertEqual(str(app.screen.query_one("#repo-next", Button).label), "Follow up on repair")
+
     async def test_waiting_agent_does_not_close_task_popup_until_requested(self):
         from core.review_git import checkout_identity
         from core.review_tasks import checkout_key, save_task
@@ -52,12 +139,12 @@ class RepositoryUITests(unittest.IsolatedAsyncioTestCase):
             with patch("tui_repository.task_source", return_value=source), patch("tui_repository.herdr_request") as api:
                 async with app.run_test(size=(92, 30)) as pilot:
                     for _ in range(60):
-                        if isinstance(app.screen, RepositoryScreen) and "press a to return" in str(
+                        if isinstance(app.screen, RepositoryScreen) and "Answer agent" in str(
                                 app.screen.query_one("#repo-task", Static).render()):
                             break
                         await pilot.pause(.1)
                     self.assertTrue(app.is_running)
-                    self.assertIn("Agent is waiting", str(app.screen.query_one("#repo-task", Static).render()))
+                    self.assertIn("Answer agent", str(app.screen.query_one("#repo-task", Static).render()))
                     api.assert_not_called()
                     await pilot.press("a")
                     api.assert_called_once_with("agent", "focus", "w99:p1")
@@ -67,7 +154,7 @@ class RepositoryUITests(unittest.IsolatedAsyncioTestCase):
         from core.repo_review import record_check, repository_review
         from core.storage.sqlite_store import TraceStore
         from tui_data import LocalBackend
-        from tui_repository import RepositoryScreen
+        from tui_repository import ArchiveTaskDialog, RepositoryScreen
 
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory).resolve()
@@ -91,7 +178,7 @@ class RepositoryUITests(unittest.IsolatedAsyncioTestCase):
 
             def make_app(pane):
                 return TraceApp(LocalBackend(store.path, [], index=False), repository=root, open_repository=True,
-                                herdr_target=PaneReview(root, pane, "codex", None, "fixture-terminal"),
+                                herdr_target=PaneReview(root, pane, "codex", None, "fixture-terminal") if pane else None,
                                 continue_task=True)
 
             with patch("tui_repository.task_source", return_value=None):
@@ -103,11 +190,19 @@ class RepositoryUITests(unittest.IsolatedAsyncioTestCase):
                     await pilot.press("enter")
                     await wait_for(pilot, lambda: isinstance(app.screen, RepositoryScreen) and app.screen.review["task"])
                     self.assertEqual(app.screen.review["task"]["pane_id"], "w99:p1")
+                    await pilot.press("j")
+                    app.screen.query_one("#task-goal", Input).value = "Fix the example and then rerun the test"
+                    await pilot.press("enter")
+                    await wait_for(pilot, lambda: isinstance(app.screen, RepositoryScreen)
+                                   and "rerun the test" in app.screen.query_one(TextArea).text)
                     await pilot.press("escape")
                 self.assertEqual(record_check(store, root, "test", [])["state"], "failed")
 
                 app = make_app("w99:p2")
                 async with app.run_test(size=(92, 30)) as pilot:
+                    await wait_for(pilot, lambda: isinstance(app.screen, RepositoryScreen)
+                                   and "rerun the test" in app.screen.query_one(TextArea).text)
+                    await pilot.click("#repo-next")
                     await wait_for(pilot, lambda: isinstance(app.screen, RepositoryScreen)
                                    and "repair needed" in app.screen.query_one(TextArea).text)
                     screen = app.screen
@@ -130,6 +225,24 @@ class RepositoryUITests(unittest.IsolatedAsyncioTestCase):
                 subprocess.run(["git", "symbolic-ref", "HEAD", ref], cwd=root, check=True)
                 self.assertEqual(repository_review(store, root, include_task=True)["task"]["goal"],
                                  "Repair example validation")
+                app = make_app(None)
+                async with app.run_test(size=(92, 30)) as pilot:
+                    await wait_for(pilot, lambda: isinstance(app.screen, RepositoryScreen)
+                                   and "rerun the test" in app.screen.query_one(TextArea).text)
+                    await pilot.press("c", "z")
+                    self.assertIsInstance(app.screen, ArchiveTaskDialog)
+                    self.assertIn("Required checks passed", app.screen.summary)
+                    await pilot.click("#archive-confirm")
+                    await wait_for(pilot, lambda: isinstance(app.screen, RepositoryScreen)
+                                   and "Task archived" in app.screen.query_one(TextArea).text)
+                    self.assertIsNone(app.screen.review["task"])
+                    self.assertIn("Required checks passed", app.screen.query_one(TextArea).text)
+                    await pilot.click("#repo-next")
+                    app.screen.query_one("#task-goal", Input).value = "Next task"
+                    await pilot.press("enter")
+                    await wait_for(pilot, lambda: isinstance(app.screen, RepositoryScreen)
+                                   and app.screen.review["task"] and app.screen.review["task"]["goal"] == "Next task")
+                    self.assertEqual(app.screen.review["activity"]["checkpoint"], "")
 
     async def test_herdr_uses_only_the_pane_session_until_a_session_is_selected(self):
         from core.storage.sqlite_store import TraceStore

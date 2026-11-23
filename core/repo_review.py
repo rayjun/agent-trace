@@ -15,7 +15,7 @@ from typing import Any, BinaryIO
 from core import query
 from core.review import _informational, _snapshot, session_history
 from core.review_git import GitReviewError, Worktree, file_diff, worktree, worktree_status
-from core.review_tasks import checkout_key, worktree_task
+from core.review_tasks import checkout_key, task_activity, worktree_task
 from core.schema.model import now_iso
 from core.storage.sqlite_store import TraceStore
 from core.workspace import _common
@@ -168,6 +168,7 @@ def repository_review(store: TraceStore, root: Path, *, required: list[str] | No
         checks, state = _evidence(store, tree, expected, required or [])
         checkout = checkout_key(tree.branch, tree.head)
         task = worktree_task(store, tree.root, checkout) if include_task else None
+        activity = task_activity(store, tree.root, checkout) if include_task else None
         if task and session is None and task["session_id"]:
             session, agent = task["session_id"], task["agent"]
         sessions = _related_sessions(store, tree.root, agent=agent if session is None else None)
@@ -187,7 +188,7 @@ def repository_review(store: TraceStore, root: Path, *, required: list[str] | No
               "history": history, "session_selected": session is not None and selected is not None,
               "policy_error": policy_error}
     if include_task:
-        review.update(task=task, checkout=checkout)
+        review.update(task=task, checkout=checkout, activity=activity)
     return review
 
 
@@ -301,10 +302,14 @@ def repository_markdown(review: dict[str, Any]) -> str:
 
     lines = ["# Repository review", "", review["label"], "",
              quote(f"Repository {review['root']}\nHEAD {review['head'] or 'unborn'}\n"
-                   f"Snapshot {review['fingerprint'] or 'unavailable'}"),
-             "", "## Changed files", "",
-             quote("\n".join(f"{f['index']}{f['worktree']} {f['path']}" for f in review["files"])),
-             "", "## Local checks", ""]
+                   f"Snapshot {review['fingerprint'] or 'unavailable'}")]
+    if task := review.get("task"):
+        lines.extend(["", "## Worktree task", "", quote(task["goal"])])
+        if checkpoint := review["activity"]["checkpoint"]:
+            lines.extend(["", quote("Checkpoint: " + checkpoint)])
+    lines.extend(["", "## Changed files", "",
+                  quote("\n".join(f"{f['index']}{f['worktree']} {f['path']}" for f in review["files"])),
+                  "", "## Local checks", ""])
     if not review["staged_matches_worktree"]:
         lines.append("The working tree contains changes outside the Git index. Checks cover the working copy.")
     if review.get("policy_error"):

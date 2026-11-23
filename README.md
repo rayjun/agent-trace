@@ -2,12 +2,26 @@
 
 [English](README.md) · [中文](README.zh-CN.md)
 
-**Review coding-agent work with recorded evidence.**
+**Pick up coding-agent work where you left off.**
 
-For developers moving between **Codex CLI, Hermes and Pi**, agent-trace is a
-local work-review desk: find the recent task, separate the agent's conclusion
-from the checks it actually ran, open the failing call, and carry a sourced
-handoff into the next session. Data stays on your machine.
+agent-trace is a local workbench for **Codex CLI, Hermes and Pi**. Each Git
+worktree and branch has an active task with a goal, a checkpoint, and the next
+action based on current check evidence. Follow a recorded failure back to the
+source, review the changes, or archive the task with its final verification state.
+
+## Open the workbench
+
+```bash
+bash install.sh cli
+agenttrace work
+```
+
+Start a task from the Overview. Use **Checkpoint** to leave the next session a
+note. The primary action opens the relevant changes or checks, or returns to
+the bound Agent in Herdr when it needs attention. Use `z` to preview and archive
+the task. Archived tasks and repair delivery status appear in Recent activity.
+The [Herdr shortcut](#continue-a-worktree-task) opens the same workbench with
+the source pane available.
 
 ## Review the current repository
 
@@ -88,14 +102,17 @@ Run `agenttrace herdr review` inside a Herdr shell for the same view in place.
 
 #### Continue a worktree task
 
-Use `agenttrace herdr continue` to save a goal for the current checkout and
-resume it later, including from another pane. Press `n` to enter or edit the
+Use `agenttrace herdr continue` to open the workbench from the current pane.
+The saved task can also be resumed from another pane. Press `n` to enter or edit the
 goal. **Save and bind here** attaches the task to the current agent. The
 saved session is used when available. If the source agent is blocked, the
 popup tells you to press `a` to return to its pane.
-With review evidence, the popup opens the relevant check and its output.
-Press `v` on a configured check to run it in the background, `f` to copy a
-repair request from a current failure, or `a` to return to the source agent.
+On the Overview, the primary action opens the relevant check and its output.
+Press `v` on a configured check to run it in the background, or `a` to return to
+the source agent. On a current failure, press `f` to preview the repair request.
+Choose **Send to agent** to submit it to the saved source when it is ready, or
+**Copy** to take it to another session. Sending rechecks the task, failed
+snapshot, and destination shown in the preview.
 
 To make the task available from Herdr and show its next step in the sidebar,
 merge these entries into your Herdr config. Append the command entry to any

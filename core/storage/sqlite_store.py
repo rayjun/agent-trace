@@ -76,6 +76,18 @@ CREATE TABLE IF NOT EXISTS worktree_tasks (
   PRIMARY KEY (root, checkout)
 );
 
+CREATE TABLE IF NOT EXISTS worktree_task_events (
+  id INTEGER PRIMARY KEY,
+  root TEXT NOT NULL,
+  checkout TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  goal TEXT NOT NULL,
+  detail TEXT NOT NULL,
+  check_id INTEGER,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_task_events_checkout ON worktree_task_events (root, checkout, id DESC);
+
 -- Durable redo queue: archive commits never leave an unrecorded projection gap.
 CREATE TABLE IF NOT EXISTS projection_pending (
   event_id TEXT PRIMARY KEY

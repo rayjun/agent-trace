@@ -111,7 +111,16 @@ RepositoryScreen { background: #101722; }
 #repo-content { height: 1fr; }
 #repo-items { height: 2fr; border: round #374966; }
 #repo-detail { height: 3fr; border: round #374966; }
-TaskEditor { align: center middle; background: #0a101a 65%; }
+TaskEditor, ArchiveTaskDialog { align: center middle; background: #0a101a 65%; }
 #task-editor { width: 75%; min-width: 34; height: auto; padding: 1 2; background: #151b28; border: round #b6a0fa; }
 #task-editor-actions { height: 3; margin-top: 1; }
 #task-editor-actions Button { margin-right: 1; }
+#repo-task-actions { height: 3; margin-bottom: 1; }
+#repo-task-actions Button { margin-right: 1; }
+RepairDialog { align: center middle; background: #0a101a 65%; }
+#repair-dialog { width: 90%; height: 90%; padding: 1 2; background: #151b28; border: round #b6a0fa; }
+#repair-title { height: 1; color: #b6a0fa; text-style: bold; }
+#repair-status { height: auto; max-height: 3; color: #a5b4c9; margin-bottom: 1; }
+#repair-message { height: 1fr; border: round #374966; }
+#repair-actions { height: 3; align-horizontal: right; }
+#repair-actions Button { margin-left: 1; }

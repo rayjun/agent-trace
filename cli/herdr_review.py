@@ -89,7 +89,7 @@ def publish_tasks(db: Path) -> None:
     """Refresh visible worktree statuses using Herdr's scheduled status command."""
     from core.repo_review import repository_review
     from core.review_git import checkout_identity
-    from core.review_tasks import NEXT_STEP, checkout_key, task_review_state, worktree_task
+    from core.review_tasks import checkout_key, next_task_action, worktree_task
     from core.storage.sqlite_store import TraceStore
 
     if not db.is_file() or not (os.environ.get("HERDR_ACTIVE_PANE_ID") or os.environ.get("HERDR_ENV") == "1"):
@@ -122,11 +122,11 @@ def publish_tasks(db: Path) -> None:
                 try:
                     task = worktree_task(store, root, checkout_key(*checkout_identity(root)))
                     if task:
-                        review = repository_review(store, root, auto_select_session=False)
-                        if checkout_key(review["branch"], review["head"]) == task["checkout"]:
+                        review = repository_review(store, root, auto_select_session=False,
+                                                   allow_missing_session=True, include_task=True)
+                        if review["task"] == task:
                             source = task_source(root, task)
-                            step = ("Answer agent" if source and source.status == "blocked"
-                                    else NEXT_STEP[task_review_state(review)])
+                            _, step = next_task_action(review, source.status if source else None)
                             summaries[root] = (str(task["goal"])[:36], step)
                 except (OSError, RuntimeError, ValueError):
                     continue

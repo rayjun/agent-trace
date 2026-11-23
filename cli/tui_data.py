@@ -130,17 +130,43 @@ class LocalBackend:
             include_task=include_task))
 
     def save_worktree_task(self, root: Path, checkout: str, goal: str, *,
+                           expected_task: dict[str, Any] | None,
                            pane_id: str | None, terminal_id: str | None,
                            agent: str | None, session_id: str | None) -> None:
         from core.review_git import checkout_identity
-        from core.review_tasks import checkout_key, save_task
+        from core.review_tasks import checkout_key, save_task, worktree_task
         if checkout_key(*checkout_identity(root)) != checkout:
             raise ValueError("The checkout changed. Refresh before saving the task.")
         if self.store is None:
             raise RuntimeError("The local archive is still opening")
         try:
-            save_task(self.store, root, checkout, goal, pane_id=pane_id, terminal_id=terminal_id,
-                      agent=agent, session_id=session_id)
+            with self.store.transaction():
+                if worktree_task(self.store, root, checkout) != expected_task:
+                    raise ValueError("The task changed. Reopen it and try again.")
+                save_task(self.store, root, checkout, goal, pane_id=pane_id, terminal_id=terminal_id,
+                          agent=agent, session_id=session_id)
+        finally:
+            self.store.close()
+
+    def record_task_event(self, task: dict[str, Any], kind: str, detail: str,
+                          check_id: int | None = None) -> int:
+        from core.review_git import checkout_identity
+        from core.review_tasks import checkout_key, record_task_event
+        if checkout_key(*checkout_identity(Path(task["root"]))) != task["checkout"]:
+            raise ValueError("The checkout changed. Reopen the task and try again.")
+        if self.store is None:
+            raise RuntimeError("The local archive is still opening")
+        try:
+            return record_task_event(self.store, task, kind, detail, check_id)
+        finally:
+            self.store.close()
+
+    def resolve_repair_event(self, event: int, *, sent: bool) -> None:
+        from core.review_tasks import resolve_repair_event
+        if self.store is None:
+            raise RuntimeError("The local archive is still opening")
+        try:
+            resolve_repair_event(self.store, event, sent=sent)
         finally:
             self.store.close()
 
