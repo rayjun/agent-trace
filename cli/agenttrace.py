@@ -587,7 +587,9 @@ def build_parser() -> argparse.ArgumentParser:
     _dirs(p_tui)
 
     p_work = sub.add_parser("work", help="open the current worktree task and its next action")
-    p_work.add_argument("--repo", type=Path, default=None, help="open a specified Git worktree")
+    work_scope = p_work.add_mutually_exclusive_group()
+    work_scope.add_argument("--repo", type=Path, default=None, help="open a specified Git worktree")
+    work_scope.add_argument("--all", action="store_true", help="browse active tasks across worktrees")
     p_work.add_argument("--db", type=Path, default=None)
     p_work.add_argument("--interval", type=float, default=2.5, help="refresh interval in seconds")
     p_work.add_argument("--no-index", action="store_true", help="use the existing trace index")
@@ -1405,6 +1407,8 @@ def cmd_tui(args) -> int:
                 command.append("--no-index")
             if getattr(args, "archive", False):
                 command.append("--archive")
+            if getattr(args, "all", False):
+                command.append("--all")
             command += [str(d) for d in args.dirs]
             return subprocess.call(command)
         print("The Textual dashboard needs optional dependencies. Install with:\n"

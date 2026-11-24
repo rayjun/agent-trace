@@ -26,6 +26,8 @@ from panel.text import sane
 from agenttrace_common import flatten_content
 from herdr_review import PaneReview
 from tui_data import PAGE_SIZE, LocalBackend, SessionKey
+from core.review_tasks import TaskItem
+from tui_inbox import TaskInbox
 from tui_repository import Evidence, RepositoryScreen
 
 CYAN = "#7dd3fc"
@@ -199,6 +201,7 @@ class TraceApp(App):
         Binding("h", "handoff", "Handoff"),
         Binding("m", "metrics", "Metrics", show=False),
         Binding("w", "repository", "Worktree"),
+        Binding("i", "task_inbox", "Tasks"),
         Binding("1", "panel('sessions')", "Sessions"),
         Binding("2", "panel('traces')", "Trace"),
         Binding("3", "panel('detail')", "Details"),
@@ -217,13 +220,15 @@ class TraceApp(App):
     def __init__(self, backend: Any, *, agent: str | None = None,
                  session: str | None = None, interval: float = 2.5,
                  repository: Path | None = None, open_repository: bool = False,
-                 herdr_target: PaneReview | None = None, continue_task: bool = False) -> None:
+                 herdr_target: PaneReview | None = None, continue_task: bool = False,
+                 open_inbox: bool = False) -> None:
         self.herdr_target = herdr_target
         super().__init__()
         self.backend = backend
         self.interval = interval
         self.repository_root = repository
         self.open_repository = open_repository
+        self.open_inbox = open_inbox
         self.continue_task = continue_task
         self.agent_filter = agent
         self.initial_session = session
@@ -339,6 +344,10 @@ class TraceApp(App):
                 return
             self.ready = True
             self.query_one("#opening").display = False
+            if self.open_inbox:
+                self.open_inbox = False
+                self.call_after_refresh(self.action_task_inbox, True)
+                return
             await self._refresh()
             if self.open_repository:
                 self.open_repository = False
@@ -367,6 +376,8 @@ class TraceApp(App):
             self.screen.set_class(self._active_panel == panel, "view-" + panel)
 
     def _tick(self) -> None:
+        if isinstance(self.screen, TaskInbox):
+            return
         if self.ready and self.live and not self._refreshing:
             self.run_worker(self._refresh(), group="refresh", exit_on_error=False)
         elif self.ready and self.live and self._last_success and (
@@ -940,6 +951,20 @@ class TraceApp(App):
                                           continue_task=self.continue_task),
                          self._repository_source)
 
+    def action_task_inbox(self, standalone: bool = False) -> None:
+        if not self.ready or isinstance(self.screen, TaskInbox):
+            return
+        if isinstance(self.screen, RepositoryScreen) and self.screen.inbox_parent:
+            self.screen.dismiss()
+            return
+        self.push_screen(TaskInbox(self.backend, self._resume_inbox_task, standalone=standalone))
+
+    def _resume_inbox_task(self, item: TaskItem) -> None:
+        pane = self.herdr_target
+        self.push_screen(RepositoryScreen(item.root, self.backend, pane=pane if pane and pane.root == item.root else None,
+                                          continue_task=True, inbox_parent=True, expected_task=item),
+                         self._repository_source)
+
     def _repository_source(self, source: Evidence | None) -> None:
         if source is None:
             return
@@ -1024,14 +1049,16 @@ def run(args: Any) -> int:
     db = args.db or Path(os.environ.get("AGENTTRACE_DB") or platform_dir() / "agenttrace.db")
     backend = LocalBackend(db.expanduser(), args.dirs, index=not args.no_index,
                            interval=args.interval, capture=True)
-    root = repository_root((args.repo or Path.cwd()).expanduser())
+    open_inbox = bool(getattr(args, "all", False) and getattr(args, "cmd", None) == "work")
+    root = None if open_inbox else repository_root((args.repo or Path.cwd()).expanduser())
     task_view = getattr(args, "cmd", None) == "work" or getattr(args, "herdr_cmd", None) == "continue"
-    if (args.repo or task_view) and root is None:
+    if (args.repo or (task_view and not open_inbox)) and root is None:
         print("A Git worktree is required")
         return 2
-    open_repo = task_view or (not args.archive and
-                              (args.repo is not None or not any((args.session, args.agent, args.no_index))))
+    open_repo = not open_inbox and (
+        task_view or (not args.archive and (args.repo is not None or not any((args.session, args.agent, args.no_index))))
+    )
     TraceApp(backend, agent=args.agent, session=args.session, interval=args.interval,
              repository=root, open_repository=open_repo, herdr_target=getattr(args, "herdr_target", None),
-             continue_task=task_view).run()
+             continue_task=task_view, open_inbox=open_inbox).run()
     return 0

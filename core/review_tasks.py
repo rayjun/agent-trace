@@ -1,6 +1,7 @@
 """One resumable review task per worktree and checkout."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,35 @@ NEXT_STEP = {
 }
 
 
+@dataclass(frozen=True)
+class TaskItem:
+    root: Path
+    checkout: str
+    goal: str
+    checkpoint: str
+    generation: int
+
+    @property
+    def checkout_label(self) -> str:
+        branch, _, name = self.checkout.partition(":")
+        return name if branch == "branch" else f"detached at {name[:12] or 'unborn'}"
+
+
+def active_tasks(store: TraceStore) -> list[TaskItem]:
+    rows = store.query(
+        """SELECT t.root, t.checkout, t.goal,
+                  (SELECT MAX(id) FROM worktree_task_events
+                   WHERE root=t.root AND checkout=t.checkout) AS recent
+           FROM worktree_tasks t ORDER BY recent DESC, t.root, t.checkout""")
+    tasks = []
+    for row in rows:
+        scope = row["root"], row["checkout"]
+        generation = _archive_boundary(store, scope)
+        tasks.append(TaskItem(Path(row["root"]), row["checkout"], row["goal"],
+                              _checkpoint(store, scope, generation), generation))
+    return tasks
+
+
 def task_review_state(review: dict[str, Any]) -> str:
     state: str = review["state"]
     if state == "unverified":
@@ -33,27 +63,39 @@ def checkout_key(branch: str | None, head: str | None) -> str:
 def worktree_task(store: TraceStore, root: Path, checkout: str) -> dict[str, Any] | None:
     row = store.one(
         """SELECT t.*, COALESCE((SELECT MAX(id) FROM worktree_task_events
-                  WHERE root=t.root AND checkout=t.checkout), 0) AS revision
+                  WHERE root=t.root AND checkout=t.checkout), 0) AS revision,
+                  COALESCE((SELECT MAX(id) FROM worktree_task_events
+                  WHERE root=t.root AND checkout=t.checkout AND kind='archived'), 0) AS generation
            FROM worktree_tasks t WHERE root=? AND checkout=?""", (str(root), checkout))
     return dict(row) if row else None
 
 
-def task_activity(store: TraceStore, root: Path, checkout: str) -> dict[str, Any]:
-    scope = (str(root), checkout)
+def _archive_boundary(store: TraceStore, scope: tuple[str, str]) -> int:
     boundary = store.one(
         "SELECT COALESCE(MAX(id), 0) FROM worktree_task_events WHERE root=? AND checkout=? AND kind='archived'",
         scope)
-    after = boundary[0] if boundary else 0
+    return boundary[0] if boundary else 0
+
+
+def _checkpoint(store: TraceStore, scope: tuple[str, str], after: int | None = None) -> str:
+    if after is None:
+        after = _archive_boundary(store, scope)
     note = store.one(
         "SELECT detail FROM worktree_task_events WHERE root=? AND checkout=? AND kind='checkpoint' AND id>?"
         " ORDER BY id DESC LIMIT 1", (*scope, after))
+    return note["detail"] if note else ""
+
+
+def task_activity(store: TraceStore, root: Path, checkout: str) -> dict[str, Any]:
+    scope = (str(root), checkout)
+    after = _archive_boundary(store, scope)
     repairs = store.query(
         "SELECT DISTINCT check_id FROM worktree_task_events "
         "WHERE root=? AND checkout=? AND kind='repair_sent' AND id>?", (*scope, after))
     return {
         "events": [dict(row) for row in store.query(
             "SELECT * FROM worktree_task_events WHERE root=? AND checkout=? ORDER BY id DESC LIMIT 8", scope)],
-        "checkpoint": note["detail"] if note else "",
+        "checkpoint": _checkpoint(store, scope, after),
         "sent_checks": [row["check_id"] for row in repairs],
     }
 

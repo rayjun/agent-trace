@@ -148,7 +148,8 @@ def _public_argv(argv: list[str]) -> list[str]:
 def repository_review(store: TraceStore, root: Path, *, required: list[str] | None = None,
                       session: str | None = None, agent: str | None = None,
                       from_turn: str | None = None, auto_select_session: bool = True,
-                      allow_missing_session: bool = False, include_task: bool = False) -> dict[str, Any]:
+                      allow_missing_session: bool = False, include_task: bool = False,
+                      include_history: bool = True) -> dict[str, Any]:
     policy_error = None
     try:
         expected = _configuration(root)
@@ -169,16 +170,19 @@ def repository_review(store: TraceStore, root: Path, *, required: list[str] | No
         checkout = checkout_key(tree.branch, tree.head)
         task = worktree_task(store, tree.root, checkout) if include_task else None
         activity = task_activity(store, tree.root, checkout) if include_task else None
-        if task and session is None and task["session_id"]:
-            session, agent = task["session_id"], task["agent"]
-        sessions = _related_sessions(store, tree.root, agent=agent if session is None else None)
-        selected = sessions[0] if session is None and auto_select_session and sessions else None
-        if session is not None:
-            try:
-                selected = _session(store, tree.root, session, agent)
-            except WorktreeSessionUnavailable:
-                if not allow_missing_session:
-                    raise
+        sessions: list[dict[str, Any]] = []
+        selected = None
+        if include_history:
+            if task and session is None and task["session_id"]:
+                session, agent = task["session_id"], task["agent"]
+            sessions = _related_sessions(store, tree.root, agent=agent if session is None else None)
+            selected = sessions[0] if session is None and auto_select_session and sessions else None
+            if session is not None:
+                try:
+                    selected = _session(store, tree.root, session, agent)
+                except WorktreeSessionUnavailable:
+                    if not allow_missing_session:
+                        raise
         history = session_history(store, selected["session_id"], agent=selected["adapter_id"],
                                   from_turn=from_turn) if selected else {"turns": [], "total": 0, "limited": False}
     if policy_error and state != "failed":

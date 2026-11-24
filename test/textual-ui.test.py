@@ -27,6 +27,75 @@ from textual.widgets import Button, DataTable, Input, Select, Static, TabbedCont
 
 
 class RepositoryUITests(unittest.IsolatedAsyncioTestCase):
+    async def test_inbox_filters_resumes_and_rechecks_checkout_before_opening(self):
+        from core.repo_review import record_check
+        from core.review_git import checkout_identity
+        from core.review_tasks import checkout_key, record_task_event, save_task, worktree_task
+        from core.storage.sqlite_store import TraceStore
+        from tui_data import LocalBackend
+        from tui_inbox import TaskInbox
+        from tui_repository import RepositoryScreen
+
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
+            first, second = parent / "first", parent / "second"
+            store = TraceStore(parent / "inbox.db")
+            try:
+                for root, goal in ((first, "Update documentation"), (second, "Fix validation")):
+                    root.mkdir()
+                    subprocess.run(["git", "init", "-q", "-b", "main", root], check=True)
+                    checkout = checkout_key(*checkout_identity(root))
+                    save_task(store, root, checkout, goal, pane_id=None, terminal_id=None, agent=None, session_id=None)
+                task = worktree_task(store, second, "branch:main")
+                record_task_event(store, task, "checkpoint", "Investigate the schema error")
+                record_check(store, second, "validation", [sys.executable, "-c", "raise SystemExit(1)"])
+            finally:
+                store.close()
+
+            app = TraceApp(LocalBackend(store.path, [], index=False), open_inbox=True)
+            async with app.run_test(size=(92, 30)) as pilot:
+                async def wait_for(condition):
+                    for _ in range(60):
+                        if condition():
+                            return
+                        await pilot.pause(.1)
+                    self.fail("Task inbox did not reach its expected state")
+
+                await wait_for(lambda: isinstance(app.screen, TaskInbox) and len(app.screen.visible_tasks) == 2)
+                inbox = app.screen
+                await pilot.press("/")
+                inbox.query_one(Input).value = "schema error"
+                await wait_for(lambda: len(inbox.visible_tasks) == 1
+                               and not inbox.query_one("#inbox-resume", Button).disabled)
+                self.assertEqual(inbox.visible_tasks[0].root, second)
+                self.assertIn("Investigate failure", str(inbox.query_one("#inbox-next", Static).render()))
+                await pilot.press("enter", "enter")
+                await wait_for(lambda: isinstance(app.screen, RepositoryScreen) and app.screen.review is not None)
+                self.assertEqual(app.screen.root, second)
+                self.assertIn("schema error", app.screen.query_one(TextArea).text)
+
+                await pilot.press("i")
+                await wait_for(lambda: app.screen is inbox and len(inbox.visible_tasks) == 1)
+                subprocess.run(["git", "symbolic-ref", "HEAD", "refs/heads/other"], cwd=second, check=True)
+                await pilot.press("enter")
+                await wait_for(lambda: "Check out main" in str(inbox.query_one("#inbox-next", Static).render()))
+                self.assertIs(app.screen, inbox)
+                self.assertTrue(inbox.query_one("#inbox-resume", Button).disabled)
+                self.assertEqual(checkout_identity(second)[0], "other")
+
+                subprocess.run(["git", "symbolic-ref", "HEAD", "refs/heads/main"], cwd=second, check=True)
+                task = worktree_task(store, second, "branch:main")
+                try:
+                    record_task_event(store, task, "archived", "Checkpoint archived")
+                    save_task(store, second, "branch:main", "An unrelated task",
+                              pane_id=None, terminal_id=None, agent=None, session_id=None)
+                finally:
+                    store.close()
+                await pilot.press("enter")
+                await wait_for(lambda: "was archived" in str(inbox.query_one("#inbox-next", Static).render()))
+                self.assertIs(app.screen, inbox)
+                await pilot.press("escape")
+
     async def test_repair_preview_sends_once_and_rechecks_snapshot_and_agent(self):
         from dataclasses import replace
         from core.repo_review import record_check

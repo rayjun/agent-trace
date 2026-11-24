@@ -23,6 +23,12 @@ the task. Archived tasks and repair delivery status appear in Recent activity.
 The [Herdr shortcut](#continue-a-worktree-task) opens the same workbench with
 the source pane available.
 
+Press `i` to open the task inbox, or run `agenttrace work --all` from any
+directory. Filter by goal, worktree, branch, or checkpoint. The highlighted
+task shows its checkpoint and current next step. Press Enter to resume it,
+then Esc to return to the inbox. If a checkout is unavailable or its branch
+has changed, the inbox shows what to restore in Git before resuming.
+
 ## Review the current repository
 
 Run these commands from a Git worktree. Replace the example test command with

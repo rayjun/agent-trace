@@ -12,6 +12,7 @@ from typing import Any, Callable, TypeVar
 
 import agenttrace_common as common
 from core import query
+from core.review_tasks import TaskItem
 from core.storage.indexer import Indexer
 from core.storage.sqlite_store import TraceStore
 from tui_sources import CodexSync
@@ -128,6 +129,34 @@ class LocalBackend:
             store, root, session=session, agent=agent, from_turn=from_turn,
             auto_select_session=auto_select_session, allow_missing_session=allow_missing_session,
             include_task=include_task))
+
+    def tasks(self) -> list[TaskItem]:
+        from core.review_tasks import active_tasks
+        return self._read(active_tasks)
+
+    def resume_task(self, item: TaskItem) -> None:
+        from core.review_git import checkout_identity, repository_root
+        from core.review_tasks import checkout_key, worktree_task
+        if repository_root(item.root) != item.root:
+            raise ValueError("Worktree unavailable. Restore the checkout to resume it.")
+        if checkout_key(*checkout_identity(item.root)) != item.checkout:
+            raise ValueError(f"Check out {item.checkout_label} in this worktree to resume the task.")
+        task = self._read(lambda store: worktree_task(store, item.root, item.checkout))
+        if not task or task["generation"] != item.generation:
+            raise ValueError("This task was archived. Refresh the inbox to see current tasks.")
+
+    def task_next_step(self, item: TaskItem) -> str:
+        from core.repo_review import repository_review
+        from core.review_tasks import next_task_action
+        from herdr_review import task_source
+        self.resume_task(item)
+        review = self._read(lambda store: repository_review(
+            store, item.root, include_task=True, include_history=False))
+        task = review["task"]
+        if review["checkout"] != item.checkout or not task or task["generation"] != item.generation:
+            raise ValueError("The task or checkout changed. Refresh the inbox.")
+        source = task_source(item.root, task)
+        return next_task_action(review, source.status if source else None)[1]
 
     def save_worktree_task(self, root: Path, checkout: str, goal: str, *,
                            expected_task: dict[str, Any] | None,

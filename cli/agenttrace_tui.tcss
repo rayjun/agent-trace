@@ -124,3 +124,12 @@ RepairDialog { align: center middle; background: #0a101a 65%; }
 #repair-message { height: 1fr; border: round #374966; }
 #repair-actions { height: 3; align-horizontal: right; }
 #repair-actions Button { margin-left: 1; }
+
+TaskInbox { background: #101722; }
+#inbox { height: 1fr; padding: 1 2 0 2; }
+#inbox-heading { height: 1; color: #7dd3fc; text-style: bold; }
+#inbox-search { height: 3; margin: 1 0; }
+#inbox-items { height: 1fr; border: round #374966; }
+#inbox-context { height: auto; max-height: 4; margin-top: 1; color: #a5b4c9; }
+#inbox-next { height: auto; max-height: 2; color: #b6a0fa; }
+#inbox-actions { height: 3; margin-top: 1; }
