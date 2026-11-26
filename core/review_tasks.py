@@ -35,17 +35,21 @@ class TaskItem:
 
 def active_tasks(store: TraceStore) -> list[TaskItem]:
     rows = store.query(
-        """SELECT t.root, t.checkout, t.goal,
-                  (SELECT MAX(id) FROM worktree_task_events
-                   WHERE root=t.root AND checkout=t.checkout) AS recent
-           FROM worktree_tasks t ORDER BY recent DESC, t.root, t.checkout""")
-    tasks = []
-    for row in rows:
-        scope = row["root"], row["checkout"]
-        generation = _archive_boundary(store, scope)
-        tasks.append(TaskItem(Path(row["root"]), row["checkout"], row["goal"],
-                              _checkpoint(store, scope, generation), generation))
-    return tasks
+        """WITH tasks AS (
+               SELECT t.root, t.checkout, t.goal,
+                      (SELECT MAX(id) FROM worktree_task_events
+                       WHERE root=t.root AND checkout=t.checkout) AS recent,
+                      COALESCE((SELECT MAX(id) FROM worktree_task_events
+                       WHERE root=t.root AND checkout=t.checkout AND kind='archived'), 0) AS generation
+               FROM worktree_tasks t
+           )
+           SELECT t.root, t.checkout, t.goal, t.generation,
+                  COALESCE((SELECT detail FROM worktree_task_events
+                   WHERE root=t.root AND checkout=t.checkout AND kind='checkpoint' AND id>t.generation
+                   ORDER BY id DESC LIMIT 1), '') AS checkpoint
+           FROM tasks t ORDER BY t.recent DESC, t.root, t.checkout""")
+    return [TaskItem(Path(row["root"]), row["checkout"], row["goal"], row["checkpoint"], row["generation"])
+            for row in rows]
 
 
 def task_review_state(review: dict[str, Any]) -> str:

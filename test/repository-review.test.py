@@ -10,6 +10,7 @@ import sys
 from tempfile import TemporaryDirectory
 import threading
 import unittest
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import ProxyHandler, build_opener
 
@@ -17,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "common")]
 from core.repo_review import record_check, repository_review  # noqa: E402
 from core.review_git import GitReviewError, file_diff, worktree  # noqa: E402
+from core.review_tasks import active_tasks, record_task_event, save_task, worktree_task  # noqa: E402
 from core.schema.model import CanonicalEvent  # noqa: E402
 from core.storage.indexer import Indexer  # noqa: E402
 from core.storage.sqlite_store import TraceStore  # noqa: E402
@@ -47,6 +49,38 @@ class RepositoryTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(ROOT / "cli/agenttrace.py"), *args],
                               cwd=self.root, env={**os.environ, "AGENTTRACE_DB": str(self.store.path)},
                               capture_output=True, text=True, timeout=20)
+
+    def test_inbox_reads_active_generations_and_checkpoints_in_one_query(self):
+        root, store = self.root, self.store
+        main = "branch:main"
+        other = "branch:other"
+
+        def save(checkout, goal):
+            save_task(store, root, checkout, goal, pane_id=None, terminal_id=None, agent=None, session_id=None)
+
+        def event(checkout, kind, detail):
+            task = worktree_task(store, root, checkout)
+            assert task is not None
+            return record_task_event(store, task, kind, detail)
+
+        save(main, "Old task")
+        event(main, "checkpoint", "Old checkpoint")
+        generation = event(main, "archived", "")
+        save(main, "First active task")
+        save(other, "Other active task")
+        event(other, "checkpoint", "Current checkpoint")
+        event(other, "checkpoint", "Newest checkpoint")
+        save("branch:inactive", "Inactive task")
+        event("branch:inactive", "archived", "")
+        with patch.object(store, "one", wraps=store.one) as one, \
+             patch.object(store, "query", wraps=store.query) as query:
+            items = active_tasks(store)
+        self.assertEqual([(t.checkout, t.goal, t.checkpoint, t.generation) for t in items], [
+            (other, "Other active task", "Newest checkpoint", 0),
+            (main, "First active task", "", generation),
+        ])
+        one.assert_not_called()
+        query.assert_called_once()
 
     def test_cli_gate_and_staged_unstaged_preview_use_current_snapshot(self):
         self.file.write_text("staged\n")

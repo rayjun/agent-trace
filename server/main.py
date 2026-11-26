@@ -613,19 +613,23 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, file.read_bytes(), types[suffix])
 
     def _serve_sse(self) -> None:
+        state = self.state
+        with state.cond:
+            seen = state.version
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
+        self.send_header("Connection", "close")
         self.end_headers()
         try:
             self.wfile.write(b"retry: 3000\n\n")
             self.wfile.flush()
-            seen = self.state.version
             while True:
-                with self.state.cond:
-                    self.state.cond.wait(timeout=15.0)
-                    version = self.state.version
+                with state.cond:
+                    state.cond.wait_for(lambda: state._stop.is_set() or state.version != seen, timeout=15.0)
+                    if state._stop.is_set():
+                        return
+                    version = state.version
                 if version != seen:
                     seen = version
                     self.wfile.write(

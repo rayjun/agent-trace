@@ -30,7 +30,7 @@ sys.path.insert(0, str(ROOT))
 
 from core.storage.indexer import Indexer  # noqa: E402
 from core.storage.sqlite_store import TraceStore  # noqa: E402
-from server.main import make_server  # noqa: E402
+from server.main import Handler, make_server  # noqa: E402
 
 fails: list[str] = []
 
@@ -61,8 +61,10 @@ store = TraceStore(td / "srv.db")
 indexer = Indexer(store, [traces_dir])
 server = make_server(store, indexer, host="127.0.0.1", port=0,
                      token="test-token", scan_interval=0.2)
+server.daemon_threads = False
 port = server.server_address[1]
-threading.Thread(target=server.serve_forever, daemon=True).start()
+server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+server_thread.start()
 
 BASE = f"http://127.0.0.1:{port}"
 
@@ -219,59 +221,58 @@ check("reindex rebuilds without duplicating",
       code == 200 and body["ok"] is True
       and store.one("SELECT COUNT(*) AS n FROM events")["n"] == 2)
 
-# SSE: connect, then make a change, expect a change frame
-sse_result: dict[str, str] = {}
+send_headers = Handler.end_headers
 
 
-def read_sse() -> None:
-    try:
-        r = _NO_PROXY.open(BASE + "/api/stream?token=test-token",
-                                   timeout=5)
-        # read1: return as soon as ANY bytes arrive — read(64) would park
-        # until the buffer fills, which a heartbeat stream never does.
-        sse_result["first"] = r.read1(64).decode("utf-8", "replace")
-    except Exception as exc:  # noqa: BLE001 - report whatever happened
-        sse_result["first"] = f"ERROR: {exc}"
-
-
-sse_thread = threading.Thread(target=read_sse, daemon=True)
-sse_thread.start()
-import time  # noqa: E402
-
-time.sleep(0.3)  # let the SSE client subscribe
-(traces_dir / "a.jsonl").open("a", encoding="utf-8").write(json.dumps({
-    "v": 1, "ts": "2026-10-17T10:00:02.000Z", "agent": "hermes",
-    "event": "note", "session_id": "s1", "note": "late"}) + "\n")
-report = indexer.scan_once()
-if report.changed:
+def publish_during_headers(handler: Handler) -> None:
+    send_headers(handler)
     with server.state.cond:
         server.state.version += 1
         server.state.cond.notify_all()
-sse_thread.join(timeout=5)
-check("SSE greets and stays open",
-      "retry:" in sse_result.get("first", ""), sse_result.get("first", "")[:60])
+
+
+with mock_patch.object(Handler, "end_headers", publish_during_headers):
+    with _NO_PROXY.open(BASE + "/api/stream?token=test-token", timeout=2) as stream:
+        check("SSE sends retry before changes", stream.readline() == b"retry: 3000\n" and stream.readline() == b"\n")
+        with server.state.cond:
+            during_headers_version = server.state.version
+        try:
+            check("SSE delivers changes published while sending headers",
+                  stream.readline() == b'data: {"type":"change","version":%d}\n' % during_headers_version
+                  and stream.readline() == b"\n")
+        except TimeoutError:
+            check("SSE delivers changes published while sending headers", False, "client still waiting")
+
+with _NO_PROXY.open(BASE + "/api/stream?token=test-token", timeout=5) as stream:
+    check("SSE greets and stays open", stream.readline() == b"retry: 3000\n" and stream.readline() == b"\n")
+    with (traces_dir / "a.jsonl").open("a", encoding="utf-8") as source:
+        source.write(json.dumps({
+            "v": 1, "ts": "2026-10-17T10:00:02.000Z", "agent": "hermes",
+            "event": "note", "session_id": "s1", "note": "late"}) + "\n")
+    report = indexer.scan_once()
+    check("scan detects appended event", report.changed)
+    if report.changed:
+        with server.state.cond:
+            server.state.version += 1
+            version = server.state.version
+            server.state.cond.notify_all()
+        try:
+            check("SSE delivers change without waiting for a heartbeat",
+                  stream.readline() == b'data: {"type":"change","version":%d}\n' % version)
+        except TimeoutError:
+            check("SSE delivers change without waiting for a heartbeat", False, "client still waiting")
 
 # A handler exception must answer 500 and LEAVE THE SERVER RUNNING. It used to
 # escape into socketserver's default handler, which printed the traceback to
 # stderr and then (in a detached process) lost it, so the only evidence was a
 # `-----` separator in the log and a page that could not connect.
-class _BrokenStore:
-    def __getattr__(self, name):
-        def boom(*_a, **_kw):
-            raise RuntimeError(f"store.{name} exploded")
-        return boom
-
-
-_real_store = server.state.store
-server.state.store = _BrokenStore()
-code, body = req("/api/overview?token=test-token")
-check("a handler exception answers 500 instead of killing the server",
-      code == 500 and isinstance(body, dict) and body.get("error"),
-      f"{code} {str(body)[:120]}")
+with mock_patch.object(store, "one", side_effect=RuntimeError("store.one exploded")):
+    code, body = req("/api/overview?token=test-token")
+    check("a handler exception answers 500 instead of killing the server",
+          code == 500 and isinstance(body, dict) and bool(body.get("error")),
+          f"{code} {str(body)[:120]}")
 check("the server is still serving after that exception",
-      req("/api/health?token=test-token")[0] == 500
-      or req("/api/health?token=test-token")[0] == 200)
-server.state.store = _real_store
+      req("/api/health?token=test-token")[0] == 200)
 code, _ = req("/api/overview?token=test-token")
 check("...and works again once the fault is gone", code == 200, str(code))
 
@@ -289,9 +290,17 @@ with mock_patch("server.main.get_trace", return_value={"trace_id": encoded_trace
     check("trace route decodes identifiers exactly once", code == 200 and isinstance(body, dict) and body["trace_id"] == encoded_trace_id)
     check("trace lookup preserves literal percent escapes", lookup.call_args.args[1] == encoded_trace_id)
 
-server.state.stop()
+with _NO_PROXY.open(BASE + "/api/stream?token=test-token", timeout=2) as stream:
+    check("stream sends an initial retry frame", stream.readline() == b"retry: 3000\n")
+    check("retry frame is terminated", stream.readline() == b"\n")
+    server.state.stop()
+    try:
+        check("stop closes the active stream", stream.readline() == b"")
+    except TimeoutError:
+        check("stop closes the active stream", False, "client still waiting")
 server.shutdown()
 server.server_close()
+server_thread.join()
 store.close()
 
 print()
