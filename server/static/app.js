@@ -26,6 +26,14 @@ async function api(path) {
   return res.json();
 }
 
+async function readBatch(...paths) {
+  const results = await Promise.allSettled(paths.map(api));
+  return results.map(result => {
+    if (result.status === "rejected") throw result.reason;
+    return result.value;
+  });
+}
+
 async function post(path, body) {
   const sep = path.includes("?") ? "&" : "?";
   const res = await fetch(`/api/${path}${sep}token=${encodeURIComponent(TOKEN)}`, {
@@ -93,6 +101,11 @@ let reviewRevision = 0;
 let repositoryRevision = 0;
 let repositoryRenderKey = "";
 
+function renderGuard() {
+  const route = currentRender, hash = location.hash;
+  return () => route === currentRender && hash === location.hash;
+}
+
 function router() {
   const hash = location.hash || (window.__AGENTTRACE_WORKTREE__ ? "#/worktree" : "#/review");
   // The route is the part BEFORE the query. Splitting the whole hash on "/" made
@@ -112,15 +125,32 @@ function router() {
   });
   const fn = routes[name] || renderOverview;
   const requestedHash = location.hash;
-  currentRender = () => fn(arg).catch(e => {
-    if (location.hash !== requestedHash) return;
-    // Say WHICH route failed and what it was given: a bare "error" gave no clue
-    // that the id arriving here was still escaped.
-    app.innerHTML = `<div class="panel"><h1>error</h1>
-      <pre class="body">${esc(e.message)}</pre>
-      <p class="dim">route ${esc(name)} — ${esc(String(arg))}</p></div>`;
-  });
-  currentRender();
+  let running = false, pending = false;
+  const isCurrent = () => currentRender === render && location.hash === requestedHash;
+  async function render() {
+    if (!isCurrent()) return;
+    if (running) { pending = true; return; }
+    running = true;
+    try {
+      do {
+        pending = false;
+        try {
+          await fn(arg);
+        } catch (e) {
+          if (!isCurrent()) return;
+          // Say WHICH route failed and what it was given: a bare "error" gave no clue
+          // that the id arriving here was still escaped.
+          app.innerHTML = `<div class="panel"><h1>error</h1>
+            <pre class="body">${esc(e.message)}</pre>
+            <p class="dim">route ${esc(name)} — ${esc(String(arg))}</p></div>`;
+        }
+      } while (pending && isCurrent());
+    } finally {
+      running = false;
+    }
+  }
+  currentRender = render;
+  return render();
 }
 
 function decodeArg(raw) {
@@ -139,8 +169,9 @@ window.addEventListener("hashchange", router);
 /* ------------------------------------------------------------------ */
 
 async function renderOverview() {
-  const [ov, traces] = await Promise.all([
-    api("overview"), api("traces?limit=8")]);
+  const isCurrent = renderGuard();
+  const [ov, traces] = await readBatch("overview", "traces?limit=8");
+  if (!isCurrent()) return;
   app.innerHTML = `
     <div class="cards">
       <div class="card"><div class="num">${ov.traces}</div><div class="lbl">traces</div></div>
@@ -197,6 +228,7 @@ function bindTraceRows() {
 }
 
 async function renderTraces() {
+  const isCurrent = renderGuard();
   const params = new URLSearchParams(location.hash.split("?")[1] || "");
   const agent = params.get("agent") || "";
   const status = params.get("status") || "";
@@ -204,6 +236,7 @@ async function renderTraces() {
   if (agent) q.push(`agent=${encodeURIComponent(agent)}`);
   if (status) q.push(`status=${encodeURIComponent(status)}`);
   const data = await api(`traces?${q.join("&")}`);
+  if (!isCurrent()) return;
   const adapters = [...new Set(data.traces.map(t => t.adapter_id))].sort();
   app.innerHTML = `
     <div class="panel">
@@ -262,10 +295,12 @@ function buildRows(spans) {
 }
 
 async function renderTraceDetail(traceId, selectedSpan) {
+  const isCurrent = renderGuard();
   const params = new URLSearchParams(location.hash.split("?")[1] || "");
   const namespace = new URLSearchParams();
   for (const key of ["agent", "session"]) if (params.has(key)) namespace.set(key, params.get(key));
   const t = await api(`traces/${encodeURIComponent(traceId)}?${namespace}`);
+  if (!isCurrent()) return;
   selectedSpan = selectedSpan || params.get("span");
   const rows = buildRows(t.spans);
   const t0 = t.start, t1 = t.end;
@@ -403,7 +438,9 @@ function bindTabs() {
 /* ------------------------------------------------------------------ */
 
 async function renderSessions() {
+  const isCurrent = renderGuard();
   const data = await api("sessions?limit=100");
+  if (!isCurrent()) return;
   app.innerHTML = `<div class="panel"><h1>sessions</h1>
     <p class="dim">A session is a conversation; click one to see every turn with
     its own duration. (A single trace is ONE turn, which is why a trace page shows
@@ -432,7 +469,9 @@ async function renderSessions() {
 /* ------------------------------------------------------------------ */
 
 async function renderSessionDetail(id) {
+  const isCurrent = renderGuard();
   const d = await api(`sessions/${encodeURIComponent(id)}`);
+  if (!isCurrent()) return;
   if (d.error) { app.innerHTML = `<div class="panel"><h1>error</h1><pre class="body">${esc(d.error)}</pre></div>`; return; }
   const max = Math.max(1, ...d.turns.map(t => t.duration_ms || 0));
   const total = Math.max(1, d.work_ms || 1);
@@ -520,7 +559,9 @@ async function renderSessionDetail(id) {
 }
 
 async function renderAdapters() {
+  const isCurrent = renderGuard();
   const data = await api("adapters");
+  if (!isCurrent()) return;
   // Coverage first: an adapter can be installed, verified and enabled while
   // capturing NOTHING, because a live hook is loaded at process start and an
   // agent already running when it was installed writes nothing until it
@@ -591,9 +632,46 @@ function coverageRow(a) {
 /* datasets / experiments (M3)                                         */
 /* ------------------------------------------------------------------ */
 
+const fieldRoutes = new WeakMap();
+
+function renderFormPage(html, ...ids) {
+  const saved = new Map();
+  for (const id of ids) {
+    const field = document.getElementById(id);
+    if (field && fieldRoutes.get(field) === currentRender) {
+      saved.set(id, { value: field.value, focused: field === document.activeElement,
+                      start: field.selectionStart, end: field.selectionEnd });
+    }
+  }
+  app.innerHTML = html;
+  for (const id of ids) {
+    const field = document.getElementById(id);
+    if (!field) continue;
+    fieldRoutes.set(field, currentRender);
+    const state = saved.get(id);
+    if (!state) continue;
+    if (!field.options || Array.from(field.options).some(option => option.value === state.value)) {
+      field.value = state.value;
+    }
+    if (state.focused) {
+      field.focus({ preventScroll: true });
+      if (Number.isInteger(state.start)) field.setSelectionRange(state.start, state.end);
+    }
+  }
+}
+
+function clearSubmittedFields(fields) {
+  const live = fields.map(([id]) => document.getElementById(id));
+  if (live.every((field, index) => field && field.value === fields[index][1])) {
+    for (const field of live) field.value = "";
+  }
+}
+
 async function renderDatasets() {
+  const isCurrent = renderGuard();
   const data = await api("datasets");
-  app.innerHTML = `<div class="panel"><h1>datasets</h1>
+  if (!isCurrent()) return;
+  renderFormPage(`<div class="panel"><h1>datasets</h1>
     <form id="new-ds" class="filters">
       <input id="ds-name" placeholder="name" required>
       <input id="ds-desc" placeholder="description" size="40">
@@ -604,13 +682,13 @@ async function renderDatasets() {
       <tr class="clickable" data-ds="${esc(d.dataset_id)}">
         <td>${esc(d.name)}</td><td>v${d.version}</td><td>${d.examples}</td>
         <td class="mono dim">${esc(fmtDay(d.created_at))}</td></tr>`).join("")}
-    </tbody></table></div>`;
+    </tbody></table></div>`, "ds-name", "ds-desc");
   document.getElementById("new-ds").addEventListener("submit", async e => {
     e.preventDefault();
     const d = await post("datasets", {
       name: document.getElementById("ds-name").value,
       description: document.getElementById("ds-desc").value});
-    location.hash = `#/dataset/${d.dataset_id}`;
+    if (isCurrent()) location.hash = `#/dataset/${d.dataset_id}`;
   });
   document.querySelectorAll("tr[data-ds]").forEach(row => {
     row.addEventListener("click", () => { location.hash = `#/dataset/${row.dataset.ds}`; });
@@ -618,8 +696,10 @@ async function renderDatasets() {
 }
 
 async function renderDatasetDetail(id) {
+  const isCurrent = renderGuard();
   const d = await api(`datasets/${encodeURIComponent(id)}`);
-  app.innerHTML = `
+  if (!isCurrent()) return;
+  renderFormPage(`
     <div class="panel">
       <h1>${esc(d.name)} <span class="badge kind">v${d.version}</span></h1>
       <p class="dim">${esc(d.description || "")}</p>
@@ -638,24 +718,28 @@ async function renderDatasetDetail(id) {
         <td class="mono dim">${esc(e.expected ? JSON.stringify(e.expected).slice(0, 60) : "—")}</td>
         <td class="mono dim">${e.metadata && e.metadata.source_trace_id
           ? `<a href="#/trace/${esc(e.metadata.source_trace_id)}">${esc(e.metadata.source_trace_id.slice(0, 20))}…</a>` : "—"}</td>
-        </tr>`).join("")}</tbody></table></div>`;
+        </tr>`).join("")}</tbody></table></div>`, "ft-trace", "ft-expected");
   document.getElementById("from-trace").addEventListener("submit", async e => {
     e.preventDefault();
     let expected = null;
-    const raw = document.getElementById("ft-expected").value.trim();
+    const fields = ["ft-trace", "ft-expected"].map(field => [field, document.getElementById(field).value]);
+    const raw = fields[1][1].trim();
     if (raw) { try { expected = JSON.parse(raw); } catch { alert("expected is not valid JSON"); return; } }
     try {
       await post(`datasets/${encodeURIComponent(id)}/from_trace`,
-        {trace_id: document.getElementById("ft-trace").value.trim(), expected});
-      renderDatasetDetail(id);
-    } catch (err) { alert(String(err)); }
+        {trace_id: fields[0][1].trim(), expected});
+      if (!isCurrent()) return;
+      clearSubmittedFields(fields);
+      await currentRender?.();
+    } catch (err) { if (isCurrent()) alert(String(err)); }
   });
 }
 
 async function renderExperiments() {
-  const [exps, datasets, evaluators] = await Promise.all([
-    api("experiments"), api("datasets"), api("evaluators")]);
-  app.innerHTML = `<div class="panel"><h1>experiments</h1>
+  const isCurrent = renderGuard();
+  const [exps, datasets, evaluators] = await readBatch("experiments", "datasets", "evaluators");
+  if (!isCurrent()) return;
+  renderFormPage(`<div class="panel"><h1>experiments</h1>
     <form id="new-exp" class="filters">
       <input id="ex-name" placeholder="name" required>
       <select id="ex-ds">${datasets.datasets.map(d =>
@@ -671,7 +755,7 @@ async function renderExperiments() {
         <td>${esc(e.name)}</td><td>${badge(e.status === "done" ? "ok" : "unknown").replace("ok", e.status).replace("unknown", e.status)}</td>
         <td>${e.runs}</td><td class="mono dim">${esc(e.dataset_id.slice(0, 12))}</td>
         <td class="mono dim">${esc(fmtDay(e.created_at))}</td></tr>`).join("")}
-    </tbody></table></div>`;
+    </tbody></table></div>`, "ex-name", "ex-ds", "ex-model");
   document.getElementById("new-exp").addEventListener("submit", async e => {
     e.preventDefault();
     const model = document.getElementById("ex-model").value.trim();
@@ -682,7 +766,7 @@ async function renderExperiments() {
         .filter(v => v.kind !== "llm_judge")   // judge is opt-in: it costs a model call
         .map(v => v.evaluator_id),
       agent_config: model ? {model} : {}});
-    location.hash = `#/experiment/${exp.experiment_id}`;
+    if (isCurrent()) location.hash = `#/experiment/${exp.experiment_id}`;
   });
   document.querySelectorAll("tr[data-exp]").forEach(row => {
     row.addEventListener("click", () => { location.hash = `#/experiment/${row.dataset.exp}`; });
@@ -690,10 +774,12 @@ async function renderExperiments() {
 }
 
 async function renderExperimentDetail(id) {
+  const isCurrent = renderGuard();
   const e = await api(`experiments/${encodeURIComponent(id)}`);
+  if (!isCurrent()) return;
   const runs = e.runs || [];
   const evalIds = Object.keys(e.evaluator_ids || {});
-  app.innerHTML = `
+  renderFormPage(`
     <div class="panel">
       <h1>${esc(e.name)} <span class="badge kind">${esc(e.status)}</span></h1>
       <dl class="kv">
@@ -732,16 +818,18 @@ async function renderExperimentDetail(id) {
           `<div class="ev-row"><span class="mono dim">${esc(s.evaluator_id)}</span>
            <span>${esc(s.evidence[0])}${s.confidence < 1 ? ` <span class="dim">(confidence ${s.confidence})</span>` : ""}</span></div>`
         ).join("")).join("") || '<p class="dim">run the experiment to see evidence</p>'}
-    </div>`;
+    </div>`, "at-example", "at-trace");
   document.getElementById("run-exp").addEventListener("click", async () => {
     await post(`experiments/${encodeURIComponent(id)}/run`, {});
-    renderExperimentDetail(id);
+    if (isCurrent()) await currentRender?.();
   });
   document.getElementById("attach-run").addEventListener("click", async () => {
+    const fields = ["at-example", "at-trace"].map(field => [field, document.getElementById(field).value]);
     await post(`experiments/${encodeURIComponent(id)}/attach`, {
-      example_id: document.getElementById("at-example").value.trim(),
-      trace_id: document.getElementById("at-trace").value.trim()});
-    renderExperimentDetail(id);
+      example_id: fields[0][1].trim(), trace_id: fields[1][1].trim()});
+    if (!isCurrent()) return;
+    clearSubmittedFields(fields);
+    await currentRender?.();
   });
 }
 
@@ -753,12 +841,20 @@ function connectSse() {
   const dot = document.getElementById("live");
   const src = new EventSource(`/api/stream?token=${encodeURIComponent(TOKEN)}`);
   let timer = null;
-  src.onopen = () => { dot.className = "live on"; dot.title = "live updates: connected"; };
-  src.onerror = () => { dot.className = "live off"; dot.title = "live updates: reconnecting"; };
-  src.onmessage = () => {
-    clearTimeout(timer);
-    timer = setTimeout(() => currentRender && currentRender(), 500);
+  const refresh = () => {
+    if (timer !== null) return;
+    timer = setTimeout(() => {
+      timer = null;
+      currentRender?.();
+    }, 500);
   };
+  src.onopen = () => {
+    dot.className = "live on";
+    dot.title = "live updates: connected";
+    refresh();
+  };
+  src.onerror = () => { dot.className = "live off"; dot.title = "live updates: reconnecting"; };
+  src.onmessage = refresh;
 }
 
 if (!TOKEN) {
@@ -808,15 +904,14 @@ function reviewCard(review, detail = false) {
   </article>`;
 }
 async function renderWorkReview() {
+  const isCurrent = renderGuard();
   const revision = ++reviewRevision, hash = location.hash;
-  // Preserve an in-progress filter edit during live updates.
-  if (document.activeElement?.closest?.("#review-filters")) return;
   const q = new URLSearchParams(hash.split("?")[1] || "");
   const data = await api(`review?${q}`);
-  if (revision !== reviewRevision || location.hash !== hash) return;
+  if (revision !== reviewRevision || !isCurrent()) return;
   const single = q.has("session");
   const reviews = single ? [data] : (data.reviews || []);
-  app.innerHTML = `<section class="work-heading"><div><h1>Review agent work</h1>
+  renderFormPage(`<section class="work-heading"><div><h1>Review agent work</h1>
     <p class="dim">What happened, what was checked, and where to look next.</p></div>
     ${single ? '<a href="#/review">← All work</a><button id="download-handoff">Download handoff</button>' : ""}</section>
     ${single ? "" : `<form id="review-filters" class="filters">
@@ -828,7 +923,8 @@ async function renderWorkReview() {
       <p>Run an agent task, then <code>agenttrace index</code>. If a session is missing, run <code>agenttrace doctor</code> to check capture.</p>
       <a href="#/adapters">Inspect capture health</a></div>`}
     ${!single ? `<div class="work-pages">${Number(data.offset) > 0 ? '<button id="review-prev">← Newer</button>' : ""}
-      ${data.has_more ? '<button id="review-next">Older →</button>' : ""}</div>` : ""}`;
+      ${data.has_more ? '<button id="review-next">Older →</button>' : ""}</div>` : ""}`,
+    ...(single ? [] : ["review-search", "review-agent"]));
   document.getElementById("review-filters")?.addEventListener("submit", event => {
     event.preventDefault();
     const filters = new URLSearchParams();
@@ -858,11 +954,12 @@ function worktreeHref(q, updates) {
 }
 
 async function renderRepository() {
+  const isCurrent = renderGuard();
   const hash = location.hash;
   const revision = ++repositoryRevision;
   const q = new URLSearchParams(hash.split("?")[1] || "");
   const data = await api("worktree?" + q);
-  if (revision !== repositoryRevision || hash !== location.hash) return;
+  if (revision !== repositoryRevision || !isCurrent()) return;
   const renderKey = hash + JSON.stringify(data);
   if (repositoryRenderKey === renderKey && app.querySelector("#refresh-repository")) return;
   repositoryRenderKey = renderKey;

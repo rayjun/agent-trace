@@ -229,7 +229,7 @@ agenttrace tui --db /path/to/index.db /path/to/traces
 
 ## Dashboard
 
-`agenttrace serve --daemon` 会索引所有已知 trace 目录，在 `http://127.0.0.1:8741` 提供服务，启动日志里给出一次性 token。新 trace 通过 SSE 实时推送。
+`agenttrace serve --daemon` 会索引所有已知 trace 目录，在 `http://127.0.0.1:8741` 提供服务，启动日志里给出一次性 token。新 trace 通过 SSE 实时推送。面板在连接或重连后会重新读取当前数据，合并连续更新，并忽略已经离开的页面返回的响应。
 
 **Work review** 是默认入口：按项目／会话搜索、按 agent 筛选、翻页查看最近任务和检查证据；打开会话可下载交接摘要。
 

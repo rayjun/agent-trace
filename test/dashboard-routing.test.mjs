@@ -13,26 +13,43 @@
 
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { test } from "node:test";
 
 const src = readFileSync(new URL("../server/static/app.js", import.meta.url), "utf8");
 
-function load(hash) {
+function load(hash, { request, defer = setTimeout, cancel = clearTimeout } = {}) {
   const els = {};
   const mk = (id) => (els[id] ||= {
     id, innerHTML: "", dataset: {}, style: {}, value: "", textContent: "",
     classList: { add() {}, remove() {}, toggle() {} },
-    addEventListener() {}, querySelectorAll: () => [], querySelector: () => null,
-    closest: () => null, focus() {},
+    listeners: {},
+    addEventListener(name, fn) { this.listeners[name] = fn; },
+    querySelectorAll: () => [], querySelector: () => null,
+    closest: () => null,
+    focus() { document.activeElement = this; },
+    setSelectionRange(start, end) { this.selectionStart = start; this.selectionEnd = end; },
   });
   const calls = [];
-  globalThis.document = {
+  const document = {
     getElementById: (id) => mk(id),
     querySelectorAll: () => [],
     querySelector: () => null,
   };
-  globalThis.window = { __AGENTTRACE_TOKEN__: "t", addEventListener() {} };
-  globalThis.location = { search: "?token=t", hash };
-  globalThis.EventSource = class { close() {} };
+  let html = "";
+  Object.defineProperty(mk("app"), "innerHTML", {
+    get: () => html,
+    set(value) {
+      for (const [, id] of html.matchAll(/id="([^"]+)"/g)) {
+        if (document.activeElement === els[id]) document.activeElement = null;
+        delete els[id];
+      }
+      html = value;
+    },
+  });
+  const window = { __AGENTTRACE_TOKEN__: "t", addEventListener() {} };
+  const location = { search: "?token=t", hash };
+  let stream;
+  class EventSource { constructor() { stream = this; } }
   // Minimal valid payloads per endpoint: a renderer that throws on an EMPTY
   // dataset would fail here too, which is the fresh-install case.
   const shapes = [
@@ -53,26 +70,27 @@ function load(hash) {
     [/\/api\/experiments/, { experiments: [] }],
     [/\/api\/evaluators/, { evaluators: [] }],
   ];
-  globalThis.fetch = async (url) => {
+  const fetch = async (url, options) => {
     const asked = String(url);
     calls.push(asked);
+    await request?.(asked, options);
     const hit = shapes.find(([re]) => re.test(asked));
     return { ok: true, status: 200,
              json: async () => (hit ? hit[1] : {}), text: async () => "" };
   };
-  const body = src
-    .replace("const TOKEN = new URLSearchParams(location.search).get(\"token\")\n  || window.__AGENTTRACE_TOKEN__ || \"\";", "const TOKEN = \"t\";")
-    .replace(/^router\(\);\s*$/m, "")
-    .replace(/^connectSse\(\);\s*$/m, "")
-    + "\nreturn { router };";
-  const { router } = new Function(body)();
-  return { router, calls, els };
+  const body = src.replace(/\n  router\(\);\n  connectSse\(\);/, "\n")
+    + "\nreturn { router, connectSse };";
+  const { router, connectSse } = new Function(
+    "document", "window", "location", "EventSource", "fetch", "setTimeout", "clearTimeout", body
+  )(document, window, location, EventSource, fetch, defer, cancel);
+  connectSse();
+  return { router, calls, els, location, stream, document };
 }
 
 async function routeFor(hash) {
   const { router, calls, els } = load(hash);
-  router();
-  await new Promise((r) => setTimeout(r, 60));
+  await router();
+  await flush();
   return { calls, html: els.app.innerHTML };
 }
 
@@ -123,6 +141,188 @@ for (const [hash, api] of [
   const { calls } = await routeFor("#/nonsense");
   assert.ok(calls.some((u) => u.includes("/api/overview")),
     `unknown route should fall back to the overview: ${calls}`);
+}
+
+function flush() { return new Promise(resolve => setImmediate(resolve)); }
+
+function liveDashboard(request, hash = "#/overview") {
+  const timers = new Map();
+  let nextId = 0;
+  const ui = load(hash, {
+    request,
+    defer(fn, ms) {
+      assert.equal(ms, 500);
+      timers.set(++nextId, fn);
+      return nextId;
+    },
+    cancel(id) { timers.delete(id); },
+  });
+  return {
+    ...ui, timers,
+    async tick() {
+      const entry = timers.entries().next().value;
+      assert.ok(entry, "expected a scheduled refresh");
+      timers.delete(entry[0]);
+      entry[1]();
+      await flush();
+    },
+  };
+}
+
+test("opening and reconnecting the stream each catch up without a change frame", async () => {
+  const ui = liveDashboard();
+  await ui.router();
+  await flush();
+  assert.equal(ui.calls.length, 2);
+  ui.stream.onopen();
+  await ui.tick();
+  assert.equal(ui.calls.length, 4);
+  ui.stream.onerror();
+  assert.equal(ui.els.live.className, "live off");
+  ui.stream.onopen();
+  await ui.tick();
+  assert.equal(ui.calls.length, 6);
+  assert.equal(ui.els.live.className, "live on");
+});
+
+test("a burst cannot postpone refresh and slow reads get just one follow-up", async () => {
+  let release;
+  const blocked = new Promise(resolve => { release = resolve; });
+  const ui = liveDashboard(() => blocked);
+  ui.router();
+  assert.equal(ui.calls.length, 2);
+  try {
+    ui.stream.onmessage();
+    const original = [...ui.timers.keys()];
+    for (let i = 0; i < 20; i++) ui.stream.onmessage();
+    assert.deepEqual([...ui.timers.keys()], original);
+    await ui.tick();
+    ui.stream.onmessage();
+    await ui.tick();
+    assert.equal(ui.calls.length, 2);
+  } finally {
+    release();
+  }
+  await flush();
+  assert.equal(ui.calls.length, 4);
+});
+
+test("a slow response from the previous route cannot overwrite the current page", async () => {
+  let release;
+  const blocked = new Promise(resolve => { release = resolve; });
+  const ui = liveDashboard(url => url.includes("/api/overview") ? blocked : undefined);
+  ui.router();
+  ui.stream.onmessage();
+  await ui.tick();
+  ui.location.hash = "#/sessions";
+  await ui.router();
+  await flush();
+  assert.match(ui.els.app.innerHTML, /<h1>sessions<\/h1>/);
+  release();
+  await flush();
+  assert.match(ui.els.app.innerHTML, /<h1>sessions<\/h1>/);
+  assert.equal(ui.calls.filter(url => url.includes("/api/overview")).length, 1);
+});
+
+test("returning to the same hash still rejects errors from the previous visit", async () => {
+  let reject;
+  const first = new Promise((_, fail) => { reject = fail; });
+  let sessionsRequests = 0;
+  const { router, location, els } = load("#/sessions", {
+    request(url) {
+      if (url.includes("/api/sessions?") && sessionsRequests++ === 0) return first;
+    },
+  });
+  router();
+  location.hash = "#/overview";
+  await router();
+  location.hash = "#/sessions";
+  await router();
+  await flush();
+  assert.match(els.app.innerHTML, /<h1>sessions<\/h1>/);
+  reject(new Error("obsolete request failed"));
+  await flush();
+  assert.match(els.app.innerHTML, /<h1>sessions<\/h1>/);
+});
+
+test("reconnect refreshes Work Review while preserving a focused filter and caret", async () => {
+  const ui = liveDashboard(undefined, "#/review");
+  await ui.router();
+  const filter = ui.els["review-search"];
+  filter.value = "draft search";
+  filter.setSelectionRange(2, 4);
+  filter.closest = () => ui.els["review-filters"];
+  filter.focus();
+  ui.stream.onopen();
+  await ui.tick();
+  const updated = ui.els["review-search"];
+  assert.equal(ui.calls.length, 2);
+  assert.notEqual(updated, filter);
+  assert.equal(updated.value, "draft search");
+  assert.equal(ui.document.activeElement, updated);
+  assert.deepEqual([updated.selectionStart, updated.selectionEnd], [2, 4]);
+});
+
+test("reconnect preserves blurred dataset drafts without carrying them across visits", async () => {
+  const ui = liveDashboard(undefined, "#/datasets");
+  await ui.router();
+  ui.els["ds-name"].value = "new dataset";
+  ui.els["ds-desc"].value = "unsaved description";
+  ui.stream.onopen();
+  await ui.tick();
+  assert.equal(ui.els["ds-name"].value, "new dataset");
+  assert.equal(ui.els["ds-desc"].value, "unsaved description");
+  ui.location.hash = "#/sessions";
+  await ui.router();
+  ui.location.hash = "#/datasets";
+  await ui.router();
+  assert.equal(ui.els["ds-name"].value, "");
+});
+
+test("a failed batch does not release its slot while a sibling read is pending", async () => {
+  let fail, release;
+  const rejected = new Promise((_, reject) => { fail = reject; });
+  const blocked = new Promise(resolve => { release = resolve; });
+  let firstOverview = true, firstTraces = true;
+  const ui = liveDashboard(url => {
+    if (firstOverview && url.includes("/api/overview")) { firstOverview = false; return rejected; }
+    if (firstTraces && url.includes("/api/traces?")) { firstTraces = false; return blocked; }
+  });
+  ui.router();
+  ui.stream.onmessage();
+  await ui.tick();
+  fail(new Error("overview failed"));
+  await flush();
+  assert.equal(ui.calls.length, 2);
+  release();
+  await flush();
+  assert.equal(ui.calls.length, 4);
+  assert.match(ui.els.app.innerHTML, /recent traces/);
+});
+
+for (const [hash, control, event] of [
+  ["#/dataset/d", "from-trace", "submit"],
+  ["#/experiment/e", "run-exp", "click"],
+  ["#/experiment/e", "attach-run", "click"],
+  ["#/datasets", "new-ds", "submit"],
+  ["#/experiments", "new-exp", "submit"],
+]) {
+  test(`${control} completing after navigation leaves the new page alone`, async () => {
+    let release;
+    const blocked = new Promise(resolve => { release = resolve; });
+    const ui = liveDashboard((_, options) => options?.method === "POST" ? blocked : undefined, hash);
+    await ui.router();
+    const submitted = ui.els[control].listeners[event]({ preventDefault() {} });
+    ui.location.hash = "#/sessions";
+    await ui.router();
+    const callCount = ui.calls.length;
+    release();
+    await submitted;
+    await flush();
+    assert.equal(ui.calls.length, callCount);
+    assert.equal(ui.location.hash, "#/sessions");
+    assert.match(ui.els.app.innerHTML, /<h1>sessions<\/h1>/);
+  });
 }
 
 console.log("PASS — dashboard routing: query strings, escaped session ids, "

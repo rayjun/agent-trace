@@ -282,7 +282,8 @@ open of an old archive may take longer while projections migrate in the backgrou
 
 `agenttrace serve --daemon` indexes every known trace dir and serves
 `http://127.0.0.1:8741` with a one-time token in the startup line. Updates
-arrive live over SSE.
+arrive live over SSE. The dashboard refreshes after connecting or reconnecting,
+coalesces bursts of updates, and ignores responses from pages you have left.
 
 **Work review** is the default: a filterable, paginated inbox of tasks, agent
 conclusions and recorded checks. Open a review for output excerpts and a
