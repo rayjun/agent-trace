@@ -295,6 +295,10 @@ workspace, raw JSON) · **Sessions → Session detail** (each turn's duration, i
 share of agent time, and where the gaps were) · **Datasets / Experiments** ·
 **Adapters** (declared capabilities vs. observed data, ingest health, gaps).
 
+In Trace detail, selecting a span uses the loaded snapshot without another
+request. Live refresh keeps the selected span and detail tab for the current
+trace view.
+
 A trace is **one turn** — that is what "one task execution" means — which is why
 per-conversation time lives on the session page.
 

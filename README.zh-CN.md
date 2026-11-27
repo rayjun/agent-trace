@@ -235,6 +235,8 @@ agenttrace tui --db /path/to/index.db /path/to/traces
 
 **Archive metrics**（错误、token、延迟）· **Traces**（搜索与筛选）· **Trace detail**（执行树 + waterfall、span 的输入/输出/错误、工作区、原始 JSON）· **Sessions → Session detail**（每一轮的耗时、占 agent 时间的比例、空档在哪里）· **Datasets / Experiments** · **Adapters**（声明能力 vs 实际观测、采集健康度、缺口）。
 
+在 Trace detail 中切换 span 直接使用已加载的数据，不会重新请求整条 trace；实时刷新会保留当前选中的 span 和详情标签页。
+
 一个 trace 是**一轮** —— 这就是「一次任务执行」的含义 —— 所以"每次对话耗时"在 session 页面上。
 
 ## 增量索引与恢复

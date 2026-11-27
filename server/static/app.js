@@ -124,6 +124,7 @@ function router() {
       (a.dataset.route === "traces" && name === "trace"));
   });
   const fn = routes[name] || renderOverview;
+  const view = fn === renderTraceDetail ? {} : undefined;
   const requestedHash = location.hash;
   let running = false, pending = false;
   const isCurrent = () => currentRender === render && location.hash === requestedHash;
@@ -135,7 +136,7 @@ function router() {
       do {
         pending = false;
         try {
-          await fn(arg);
+          await fn(arg, view);
         } catch (e) {
           if (!isCurrent()) return;
           // Say WHICH route failed and what it was given: a bare "error" gave no clue
@@ -294,15 +295,23 @@ function buildRows(spans) {
   return rows;
 }
 
-async function renderTraceDetail(traceId, selectedSpan) {
+async function renderTraceDetail(traceId, view = {}) {
   const isCurrent = renderGuard();
   const params = new URLSearchParams(location.hash.split("?")[1] || "");
   const namespace = new URLSearchParams();
   for (const key of ["agent", "session"]) if (params.has(key)) namespace.set(key, params.get(key));
   const t = await api(`traces/${encodeURIComponent(traceId)}?${namespace}`);
   if (!isCurrent()) return;
-  selectedSpan = selectedSpan || params.get("span");
   const rows = buildRows(t.spans);
+  const spans = new Map(t.spans.map(span => [span.span_id, span]));
+  view.span ??= params.get("span") || rows[0]?.span.span_id;
+  view.tab ??= "input";
+  const selectedDetail = () => {
+    const span = spans.get(view.span);
+    return span ? spanDetail(span, view.tab) : view.span
+      ? `<p class="dim">span ${esc(view.span)} is not in this trace snapshot</p>`
+      : `<p class="dim">no spans in this trace snapshot</p>`;
+  };
   const t0 = t.start, t1 = t.end;
   const total = Math.max(1, (Date.parse(t1) || 0) - (Date.parse(t0) || 0));
   const leftPct = s => Math.max(0, ((Date.parse(s.start || s.end) - Date.parse(t0)) / total) * 100);
@@ -310,8 +319,6 @@ async function renderTraceDetail(traceId, selectedSpan) {
     const a = Date.parse(s.start || s.end), b = Date.parse(s.end || s.start);
     return Math.max(0.5, ((b - a) / total) * 100);
   };
-  const sel = selectedSpan || (rows[0] && rows[0].span.span_id);
-  const selSpan = t.spans.find(s => s.span_id === sel);
 
   app.innerHTML = `
     <div class="panel">
@@ -329,7 +336,7 @@ async function renderTraceDetail(traceId, selectedSpan) {
     <div class="panel">
       <h2>waterfall</h2>
       ${rows.map(({ span, depth }) => `
-        <div class="wf-row ${span.span_id === sel ? "selected" : ""}" data-span="${esc(span.span_id)}">
+        <div class="wf-row ${span.span_id === view.span ? "selected" : ""}" data-span="${esc(span.span_id)}">
           <div class="wf-name" style="padding-left:${depth * 16}px">
             ${kindDot(span.kind)}<span>${esc(span.name)}</span>
             ${span.synthetic ? '<span class="note">synthetic</span>' : ""}
@@ -349,14 +356,23 @@ async function renderTraceDetail(traceId, selectedSpan) {
         <span class="mono">${esc(e.name)}</span>
         <span class="dim">${esc(summarizeAttrs(e.attributes))}</span></div>`).join("")}
     </div>` : ""}
-    <div class="panel" id="span-detail">${selSpan ? spanDetail(selSpan) : ""}</div>`;
+    <div class="panel" id="span-detail">${selectedDetail()}</div>`;
 
-  document.querySelectorAll(".wf-row").forEach(row => {
+  const detail = document.getElementById("span-detail");
+  const isDisplayed = () => isCurrent() && document.getElementById("span-detail") === detail;
+  const bindDetailTabs = () => bindTabs(detail, isDisplayed, tab => { view.tab = tab; });
+  const waterfall = document.querySelectorAll(".wf-row");
+  waterfall.forEach(row => {
     row.addEventListener("click", () => {
-      renderTraceDetail(traceId, row.dataset.span).catch(console.error);
+      const span = row.dataset.span;
+      if (!isDisplayed() || !spans.has(span) || span === view.span) return;
+      view.span = span;
+      waterfall.forEach(node => node.classList.toggle("selected", node.dataset.span === span));
+      detail.innerHTML = selectedDetail();
+      bindDetailTabs();
     });
   });
-  bindTabs();
+  bindDetailTabs();
 }
 
 function workspaceBlock(ws) {
@@ -396,7 +412,9 @@ function summarizeAttrs(attrs) {
   return parts.join(" · ");
 }
 
-function spanDetail(s) {
+const SPAN_TABS = ["input", "output", "error", "attributes", "raw"];
+
+function spanDetail(s, activeTab) {
   return `
     <h2>${kindDot(s.kind)} ${esc(s.name)} ${badge(s.status)}</h2>
     <dl class="kv">
@@ -407,11 +425,11 @@ function spanDetail(s) {
       <dt>tokens in/out/cache</dt><dd class="mono">${fmtTok(s.tokens.input)} / ${fmtTok(s.tokens.output)} / ${fmtTok(s.tokens.cache_read)}</dd>
     </dl>
     <div class="tabs" style="margin-top:10px">
-      ${["input", "output", "error", "attributes", "raw"].map((tab, i) =>
-        `<button data-tab="${tab}" class="${i === 0 ? "active" : ""}">${tab}</button>`).join("")}
+      ${SPAN_TABS.map(tab =>
+        `<button data-tab="${tab}" class="${tab === activeTab ? "active" : ""}">${tab}</button>`).join("")}
     </div>
-    ${["input", "output", "error", "attributes", "raw"].map((tab, i) => `
-      <pre class="body tab-pane" data-pane="${tab}" style="display:${i === 0 ? "block" : "none"}"
+    ${SPAN_TABS.map(tab => `
+      <pre class="body tab-pane" data-pane="${tab}" style="display:${tab === activeTab ? "block" : "none"}"
 >${esc(pretty(tab === "raw" ? s : s[tab]))}</pre>`).join("")}`;
 }
 
@@ -420,15 +438,17 @@ function pretty(v) {
   return typeof v === "string" ? v : JSON.stringify(v, null, 2);
 }
 
-function bindTabs() {
-  document.querySelectorAll(".tabs button").forEach(btn => {
+function bindTabs(host, isDisplayed, onSelect) {
+  if (!host) return;
+  const buttons = host.querySelectorAll(".tabs button");
+  const panes = host.querySelectorAll(".tab-pane");
+  buttons.forEach(btn => {
     btn.addEventListener("click", () => {
-      const host = btn.closest(".panel");
-      host.querySelectorAll(".tabs button").forEach(b => b.classList.remove("active"));
-      btn.classList.add("active");
-      host.querySelectorAll(".tab-pane").forEach(p => {
-        p.style.display = p.dataset.pane === btn.dataset.tab ? "block" : "none";
-      });
+      if (!isDisplayed() || !host.contains(btn)) return;
+      const tab = btn.dataset.tab;
+      onSelect(tab);
+      buttons.forEach(b => b.classList.toggle("active", b === btn));
+      panes.forEach(p => { p.style.display = p.dataset.pane === tab ? "block" : "none"; });
     });
   });
 }

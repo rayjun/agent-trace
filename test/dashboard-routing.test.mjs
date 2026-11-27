@@ -17,14 +17,15 @@ import { test } from "node:test";
 
 const src = readFileSync(new URL("../server/static/app.js", import.meta.url), "utf8");
 
-function load(hash, { request, defer = setTimeout, cancel = clearTimeout } = {}) {
+function load(hash, { request, defer = setTimeout, cancel = clearTimeout, queryAll = () => [] } = {}) {
   const els = {};
   const mk = (id) => (els[id] ||= {
     id, innerHTML: "", dataset: {}, style: {}, value: "", textContent: "",
     classList: { add() {}, remove() {}, toggle() {} },
     listeners: {},
     addEventListener(name, fn) { this.listeners[name] = fn; },
-    querySelectorAll: () => [], querySelector: () => null,
+    querySelectorAll: selector => queryAll(selector, id), querySelector: () => null,
+    contains(node) { return this.querySelectorAll(".tabs button").includes(node); },
     closest: () => null,
     focus() { document.activeElement = this; },
     setSelectionRange(start, end) { this.selectionStart = start; this.selectionEnd = end; },
@@ -32,7 +33,7 @@ function load(hash, { request, defer = setTimeout, cancel = clearTimeout } = {})
   const calls = [];
   const document = {
     getElementById: (id) => mk(id),
-    querySelectorAll: () => [],
+    querySelectorAll: selector => queryAll(selector),
     querySelector: () => null,
   };
   let html = "";
@@ -73,10 +74,10 @@ function load(hash, { request, defer = setTimeout, cancel = clearTimeout } = {})
   const fetch = async (url, options) => {
     const asked = String(url);
     calls.push(asked);
-    await request?.(asked, options);
+    const payload = await request?.(asked, options);
     const hit = shapes.find(([re]) => re.test(asked));
     return { ok: true, status: 200,
-             json: async () => (hit ? hit[1] : {}), text: async () => "" };
+             json: async () => payload ?? (hit ? hit[1] : {}), text: async () => "" };
   };
   const body = src.replace(/\n  router\(\);\n  connectSse\(\);/, "\n")
     + "\nreturn { router, connectSse };";
@@ -145,11 +146,11 @@ for (const [hash, api] of [
 
 function flush() { return new Promise(resolve => setImmediate(resolve)); }
 
-function liveDashboard(request, hash = "#/overview") {
+function liveDashboard(request, hash = "#/overview", queryAll) {
   const timers = new Map();
   let nextId = 0;
   const ui = load(hash, {
-    request,
+    request, queryAll,
     defer(fn, ms) {
       assert.equal(ms, 500);
       timers.set(++nextId, fn);
@@ -324,6 +325,101 @@ for (const [hash, control, event] of [
     assert.match(ui.els.app.innerHTML, /<h1>sessions<\/h1>/);
   });
 }
+
+function traceFixture(hash, beforeRead) {
+  const controls = (key, values) => values.map(value => {
+    const node = {
+      dataset: { [key]: value }, style: {}, selected: false,
+      classList: { toggle(_, enabled) { node.selected = enabled; } },
+      addEventListener(_, fn) { this.click = fn; },
+    };
+    return node;
+  });
+  const rows = controls("span", ["first", "second/2"]);
+  let tabs, panes;
+  function replaceTabs() {
+    tabs = controls("tab", ["input", "output"]);
+    panes = controls("pane", ["input", "output"]);
+  }
+  replaceTabs();
+  const makeSpan = (span_id, output) => ({
+    span_id, name: span_id, kind: "llm", tokens: {}, output, start: "2026-11-27T00:00:00Z",
+  });
+  const snapshot = { trace_id: "shared", tokens: {}, events: [],
+    spans: [makeSpan("first", "first output"), makeSpan("second/2", "second output")] };
+  const ui = liveDashboard(async url => {
+    if (!url.includes("/api/traces/")) return;
+    await beforeRead?.();
+    return structuredClone(snapshot);
+  }, hash,
+    (selector, id) => selector === ".wf-row" ? rows
+      : id === "span-detail" && selector === ".tabs button" ? tabs
+      : id === "span-detail" && selector === ".tab-pane" ? panes : []);
+  return { ...ui, rows, get tabs() { return tabs; }, get panes() { return panes; },
+    snapshot, makeSpan, replaceTabs };
+}
+
+test("span clicks read from the current snapshot and a pending refresh keeps the newest span and tab", async () => {
+  let release;
+  const blocked = new Promise(resolve => { release = resolve; });
+  let reads = 0;
+  const ui = traceFixture("#/trace/shared?agent=codex&session=%2Fsessions%2Fa",
+    () => ++reads === 2 ? blocked : undefined);
+  await ui.router();
+  ui.stream.onmessage();
+  await ui.tick();
+  assert.equal(reads, 2);
+  const detail = ui.els["span-detail"];
+  const detachedInput = ui.tabs[0];
+  let detailHtml = detail.innerHTML;
+  Object.defineProperty(detail, "innerHTML", {
+    get: () => detailHtml,
+    set(value) { detailHtml = value; ui.replaceTabs(); },
+  });
+  ui.rows[1].click();
+  ui.tabs[1].click();
+  assert.match(detail.innerHTML, /<h2>.*second\/2/);
+  assert.equal(ui.rows[1].selected, true);
+  assert.equal(ui.panes[1].style.display, "block");
+  assert.equal(detail.contains(detachedInput), false);
+  detachedInput.click();
+  assert.equal(ui.calls.length, 2, "only the scheduled refresh reads the API");
+  ui.snapshot.spans[1].output = "updated second output";
+  release();
+  await flush();
+  assert.match(ui.els.app.innerHTML, /wf-row selected" data-span="second\/2"/);
+  assert.match(ui.els.app.innerHTML, /data-pane="output" style="display:block"\s*>updated second output/);
+  for (const call of ui.calls) {
+    const params = new URLSearchParams(call.split("?")[1]);
+    assert.equal(params.get("agent"), "codex");
+    assert.equal(params.get("session"), "/sessions/a");
+  }
+  ui.location.hash = "#/trace/shared?agent=pi&session=%2Fsessions%2Fb";
+  await ui.router();
+  assert.match(ui.els.app.innerHTML, /wf-row selected" data-span="first"/);
+  assert.match(ui.els.app.innerHTML, /data-pane="input" style="display:block"/);
+});
+
+test("a deep-linked span omitted from the waterfall still opens its detail", async () => {
+  const ui = traceFixture("#/trace/shared?span=second%2F2");
+  ui.snapshot.spans[0].parent_span_id = "second/2";
+  ui.snapshot.spans[1].parent_span_id = "first";
+  await ui.router();
+  assert.doesNotMatch(ui.els.app.innerHTML, /wf-row |not in this trace snapshot/);
+  assert.match(ui.els.app.innerHTML, /<h2>.*second\/2/);
+});
+
+test("a missing deep-linked span remains selected if it later appears, without falling back to another span", async () => {
+  const ui = traceFixture("#/trace/shared?span=later%2F3");
+  await ui.router();
+  assert.match(ui.els.app.innerHTML, /span later\/3 is not in this trace snapshot/);
+  assert.doesNotMatch(ui.els.app.innerHTML, /wf-row selected/);
+  ui.snapshot.spans.push(ui.makeSpan("later/3", "late output"));
+  ui.stream.onmessage();
+  await ui.tick();
+  assert.match(ui.els.app.innerHTML, /wf-row selected" data-span="later\/3"/);
+  assert.match(ui.els.app.innerHTML, /late output/);
+});
 
 console.log("PASS — dashboard routing: query strings, escaped session ids, "
   + "trace/dataset/experiment routes, unknown-route fallback");
