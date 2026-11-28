@@ -28,6 +28,9 @@ directory. Filter by goal, worktree, branch, or checkpoint. The highlighted
 task shows its checkpoint and current next step. Press Enter to resume it,
 then Esc to return to the inbox. If a checkout is unavailable or its branch
 has changed, the inbox shows what to restore in Git before resuming.
+Use **Archived** or Ctrl+T to find archived tasks and copy a handoff with
+the recorded verification, last checkpoint, and repair delivery history.
+Archived handoffs can be opened after the worktree has been removed.
 
 ## Review the current repository
 

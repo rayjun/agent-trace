@@ -12,7 +12,7 @@ from typing import Any, Callable, TypeVar
 
 import agenttrace_common as common
 from core import query
-from core.review_tasks import TaskItem
+from core.review_tasks import ArchivedTask, TaskItem
 from core.storage.indexer import Indexer
 from core.storage.sqlite_store import TraceStore
 from tui_sources import CodexSync
@@ -133,6 +133,14 @@ class LocalBackend:
     def tasks(self) -> list[TaskItem]:
         from core.review_tasks import active_tasks
         return self._read(active_tasks)
+
+    def archived_tasks(self) -> list[ArchivedTask]:
+        from core.review_tasks import archived_tasks
+        return self._read(archived_tasks)
+
+    def archived_handoff(self, task: ArchivedTask) -> str:
+        from core.review_tasks import archived_handoff
+        return self._read(lambda store: archived_handoff(store, task))
 
     def resume_task(self, item: TaskItem) -> None:
         from core.review_git import checkout_identity, repository_root

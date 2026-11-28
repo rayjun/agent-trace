@@ -18,6 +18,17 @@ NEXT_STEP = {
     "unverified": "Review changes",
 }
 
+ACTIVITY_LABELS = {
+    "started": "Task started", "updated": "Task updated", "checkpoint": "Checkpoint",
+    "repair_pending": "Repair delivery pending", "repair_sent": "Repair request sent",
+    "repair_unknown": "Repair delivery unconfirmed", "archived": "Task archived",
+}
+
+
+def _checkout_label(checkout: str) -> str:
+    branch, _, name = checkout.partition(":")
+    return name if branch == "branch" else f"detached at {name[:12] or 'unborn'}"
+
 
 @dataclass(frozen=True)
 class TaskItem:
@@ -29,8 +40,23 @@ class TaskItem:
 
     @property
     def checkout_label(self) -> str:
-        branch, _, name = self.checkout.partition(":")
-        return name if branch == "branch" else f"detached at {name[:12] or 'unborn'}"
+        return _checkout_label(self.checkout)
+
+
+@dataclass(frozen=True)
+class ArchivedTask:
+    id: int
+    root: Path
+    checkout: str
+    goal: str
+    checkpoint: str
+    summary: str
+    archived_at: str
+    previous_archive: int
+
+    @property
+    def checkout_label(self) -> str:
+        return _checkout_label(self.checkout)
 
 
 def active_tasks(store: TraceStore) -> list[TaskItem]:
@@ -50,6 +76,46 @@ def active_tasks(store: TraceStore) -> list[TaskItem]:
            FROM tasks t ORDER BY t.recent DESC, t.root, t.checkout""")
     return [TaskItem(Path(row["root"]), row["checkout"], row["goal"], row["checkpoint"], row["generation"])
             for row in rows]
+
+
+def archived_tasks(store: TraceStore) -> list[ArchivedTask]:
+    rows = store.query(
+        """WITH archives AS (
+               SELECT id, root, checkout, goal, detail, created_at,
+                      LAG(id, 1, 0) OVER (PARTITION BY root, checkout ORDER BY id) AS previous
+               FROM worktree_task_events WHERE kind='archived'
+           )
+           SELECT a.*, COALESCE((
+               SELECT e.detail FROM worktree_task_events e
+               WHERE e.root=a.root AND e.checkout=a.checkout AND e.kind='checkpoint'
+                 AND e.id>a.previous AND e.id<a.id ORDER BY e.id DESC LIMIT 1
+           ), '') AS checkpoint
+           FROM archives a ORDER BY a.id DESC""")
+    return [ArchivedTask(row["id"], Path(row["root"]), row["checkout"], row["goal"], row["checkpoint"],
+                         row["detail"], row["created_at"], row["previous"]) for row in rows]
+
+
+def archived_handoff(store: TraceStore, task: ArchivedTask) -> str:
+    def quote(value: str) -> str:
+        return "\n".join(f"    {line}" for line in value.splitlines())
+
+    sections = [
+        "# Archived task",
+        quote(f"{task.goal}\n{task.root} · {task.checkout_label}\nArchived {task.archived_at}"),
+        "## Verification at archive\n\n" + quote(task.summary),
+    ]
+    if task.checkpoint:
+        sections.append("## Last checkpoint\n\n" + quote(task.checkpoint))
+    repairs = store.query(
+        """SELECT kind, detail, created_at FROM worktree_task_events
+           WHERE root=? AND checkout=? AND id>? AND id<? AND kind IN
+                 ('repair_pending', 'repair_sent', 'repair_unknown')
+           ORDER BY id""", (str(task.root), task.checkout, task.previous_archive, task.id))
+    if repairs:
+        delivery = "\n".join(f"{row['created_at']} · {ACTIVITY_LABELS[row['kind']]} · {row['detail']}"
+                             for row in repairs)
+        sections.append("## Repair requests\n\n" + quote(delivery))
+    return "\n\n".join(sections) + "\n"
 
 
 def task_review_state(review: dict[str, Any]) -> str:

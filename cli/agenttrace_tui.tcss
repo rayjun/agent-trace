@@ -128,8 +128,20 @@ RepairDialog { align: center middle; background: #0a101a 65%; }
 TaskInbox { background: #101722; }
 #inbox { height: 1fr; padding: 1 2 0 2; }
 #inbox-heading { height: 1; color: #7dd3fc; text-style: bold; }
+#inbox-tabs { height: 3; margin-top: 1; }
+#inbox-tabs Button { margin-right: 1; }
 #inbox-search { height: 3; margin: 1 0; }
 #inbox-items { height: 1fr; border: round #374966; }
 #inbox-context { height: auto; max-height: 4; margin-top: 1; color: #a5b4c9; }
 #inbox-next { height: auto; max-height: 2; color: #b6a0fa; }
 #inbox-actions { height: 3; margin-top: 1; }
+#inbox-resume { min-width: 16; }
+
+ArchivedTaskDialog { align: center middle; background: #0a101a 65%; }
+#archived-task-dialog {
+    width: 90%; height: 90%; padding: 1 2; background: #151b28; border: round #b6a0fa;
+}
+#archived-task-heading { height: 1; color: #b6a0fa; text-style: bold; margin-bottom: 1; }
+#archive-handoff { height: 1fr; border: round #374966; }
+#archived-task-actions { height: 3; align-horizontal: right; }
+#archived-task-actions Button { margin-left: 1; }

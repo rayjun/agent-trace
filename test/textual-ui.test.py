@@ -27,6 +27,78 @@ from textual.widgets import Button, DataTable, Input, Select, Static, TabbedCont
 
 
 class RepositoryUITests(unittest.IsolatedAsyncioTestCase):
+    async def test_archived_inbox_opens_and_copies_handoff_after_worktree_moves(self):
+        from core.review_tasks import record_task_event, resolve_repair_event, save_task, worktree_task
+        from core.storage.sqlite_store import TraceStore
+        from tui_data import LocalBackend
+        from tui_inbox import ArchivedTaskDialog, TaskInbox
+
+        with tempfile.TemporaryDirectory() as directory:
+            parent = Path(directory).resolve()
+            root = parent / "removed-worktree"
+            subprocess.run(["git", "init", "-q", "-b", "main", root], check=True)
+            db = parent / "archive.db"
+            store = TraceStore(db)
+
+            def save(goal):
+                save_task(store, root, "branch:main", goal, pane_id=None, terminal_id=None,
+                          agent=None, session_id=None)
+
+            def event(kind, detail):
+                task = worktree_task(store, root, "branch:main")
+                return record_task_event(store, task, kind, detail)
+
+            try:
+                save("First review")
+                event("checkpoint", "Keep the earlier reproduction notes")
+                repair = event("repair_pending", "test · codex · w9:p1")
+                resolve_repair_event(store, repair, sent=True)
+                event("archived", "A current check failed\nHEAD 123 · snapshot abc")
+                save("Second review")
+                event("archived", "Required checks passed · 0 changed files")
+                save("Active review")
+                event("checkpoint", "Do not leak this note into earlier tasks")
+            finally:
+                store.close()
+            root.rename(parent / "moved")
+
+            app = TraceApp(LocalBackend(db, [], index=False), open_inbox=True)
+            with patch.object(app, "copy_to_clipboard") as copy:
+                async with app.run_test(size=(92, 30)) as pilot:
+                    async def wait_for(condition):
+                        for _ in range(60):
+                            if condition():
+                                return
+                            await pilot.pause(.1)
+                        self.fail("The archived task view did not reach its expected state")
+
+                    await wait_for(lambda: isinstance(app.screen, TaskInbox) and len(app.screen.visible_tasks) == 1)
+                    inbox = app.screen
+                    self.assertEqual(inbox.visible_tasks[0].goal, "Active review")
+                    await pilot.press("ctrl+t")
+                    await wait_for(lambda: len(inbox.visible_tasks) == 2)
+                    self.assertEqual([(item.goal, item.checkpoint) for item in inbox.visible_tasks], [
+                        ("Second review", ""), ("First review", "Keep the earlier reproduction notes"),
+                    ])
+                    inbox.query_one(Input).value = "earlier reproduction"
+                    await wait_for(lambda: len(inbox.visible_tasks) == 1)
+                    self.assertIn("A current check failed", str(inbox.query_one("#inbox-next", Static).render()))
+                    await pilot.click("#inbox-resume")
+                    await wait_for(lambda: isinstance(app.screen, ArchivedTaskDialog))
+                    text = app.screen.query_one("#archive-handoff", TextArea).text
+                    self.assertIn("HEAD 123 · snapshot abc", text)
+                    self.assertIn("Keep the earlier reproduction notes", text)
+                    self.assertIn("Repair request sent", text)
+                    self.assertNotIn("Do not leak", text)
+                    await pilot.click("#archive-copy")
+                    copy.assert_called_once_with(text)
+                    await pilot.press("escape")
+                    self.assertIs(app.screen, inbox)
+                    await pilot.press("ctrl+t")
+                    inbox.query_one(Input).value = ""
+                    await wait_for(lambda: len(inbox.visible_tasks) == 1
+                                   and inbox.visible_tasks[0].goal == "Active review")
+
     async def test_inbox_filters_resumes_and_rechecks_checkout_before_opening(self):
         from core.repo_review import record_check
         from core.review_git import checkout_identity

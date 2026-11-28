@@ -21,7 +21,7 @@ from textual.widgets import Button, DataTable, Footer, Input, Static, TextArea
 from textual.worker import Worker
 
 from core.repo_review import repository_diff, repository_markdown
-from core.review_tasks import TaskItem, next_task_action, task_review_state
+from core.review_tasks import ACTIVITY_LABELS, TaskItem, next_task_action, task_review_state
 from herdr_review import PaneReview, herdr_request, task_source
 from panel.text import sane
 
@@ -148,11 +148,6 @@ class RepairDialog(ModalScreen[None]):
 
 
 class RepositoryScreen(ModalScreen[Evidence | None]):
-    ACTIVITY_LABELS = {
-        "started": "Task started", "updated": "Task updated", "checkpoint": "Checkpoint",
-        "repair_pending": "Repair delivery pending", "repair_sent": "Repair request sent",
-        "repair_unknown": "Repair delivery unconfirmed", "archived": "Task archived",
-    }
     BINDINGS = [
         Binding("escape", "back", "Close review"),
         Binding("i", "app.task_inbox", "Tasks"),
@@ -409,7 +404,7 @@ class RepositoryScreen(ModalScreen[Evidence | None]):
             lines = ["Recent activity"]
             for event in activity["events"]:
                 stamp = event["created_at"].replace("T", " ")[:16]
-                label = self.ACTIVITY_LABELS[event["kind"]]
+                label = ACTIVITY_LABELS[event["kind"]]
                 value = event["goal"] if event["kind"] in ("started", "updated", "archived") else event["detail"]
                 lines.append(f"{stamp} · {label} · {value or 'cleared'}")
                 if event["kind"] == "archived":
